@@ -13,7 +13,9 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
+use serde::{Deserialize, Serialize};
 use std::io::{stdout, IsTerminal};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Apple Silicon cluster monitor — like nvidia-smi for Mac.
@@ -82,6 +84,44 @@ impl From<&Scan> for DiscoveryMethod {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Config file: ~/.config/apple-smi/config.toml
+// ---------------------------------------------------------------------------
+
+/// Persistent config stored at ~/.config/apple-smi/config.toml
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    hosts: Vec<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("apple-smi")
+        .join("config.toml")
+}
+
+fn load_config() -> AppConfig {
+    let path = config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        Err(_) => AppConfig::default(),
+    }
+}
+
+fn save_config(cfg: &AppConfig) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(contents) = toml::to_string_pretty(cfg) {
+        let _ = std::fs::write(&path, contents);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -102,10 +142,21 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
+    // Resolve hosts: CLI flag > config file > discovery
+    let app_config = load_config();
+    let hosts = if !cli.hosts.is_empty() {
+        cli.hosts
+    } else if !app_config.hosts.is_empty() {
+        app_config.hosts
+    } else {
+        Vec::new() // discovery will find them
+    };
+    let interval = cli.interval;
+
     // Start cluster monitor
     let mut config = ClusterConfig::default()
-        .with_seeds(cli.hosts)
-        .with_poll_interval(Duration::from_secs(cli.interval));
+        .with_seeds(hosts)
+        .with_poll_interval(Duration::from_secs(interval));
 
     if !cli.scan.is_empty() {
         config = config.with_discovery(cli.scan.iter().map(Into::into).collect());
