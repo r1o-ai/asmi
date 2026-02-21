@@ -160,24 +160,24 @@ async fn poll_metrics(
     epoch: &Arc<tokio::sync::watch::Sender<u64>>,
     local_hostname: &str,
 ) {
-    // Build the list of nodes to poll. Start with seed hosts (always
-    // polled by name), then add any scan-discovered nodes not already
-    // covered by seeds. This prevents duplicates when discovery returns
-    // IPs that resolve to the same machines as seed hostnames.
+    // Build the list of nodes to poll. If seed hosts are provided, use
+    // them exclusively — discovery finds the same machines by IP and
+    // causes duplicates. If no seeds, use scan results.
     let hostnames: Vec<String> = {
-        let s = state.read().await;
-        let mut hosts: Vec<String> = config.seed_hosts.clone();
-        let seed_set: std::collections::HashSet<String> =
-            hosts.iter().map(|h| h.to_lowercase()).collect();
-
-        // Add scan-discovered nodes that aren't already seed hosts
-        for r in &s.scan_results {
-            if r.ssh_ok && !seed_set.contains(&r.hostname.to_lowercase()) {
-                hosts.push(r.hostname.clone());
+        if !config.seed_hosts.is_empty() {
+            config.seed_hosts.clone()
+        } else {
+            let s = state.read().await;
+            if !s.scan_results.is_empty() {
+                s.scan_results
+                    .iter()
+                    .filter(|r| r.ssh_ok)
+                    .map(|r| r.hostname.clone())
+                    .collect()
+            } else {
+                s.sorted_hostnames()
             }
         }
-
-        hosts
     };
 
     if hostnames.is_empty() {
