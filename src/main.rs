@@ -176,13 +176,15 @@ async fn main() -> Result<()> {
         original_hook(info);
     }));
 
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut selected: usize = 0;
+    let started = std::time::Instant::now();
 
     loop {
         // Render
         let s = state.read().await;
-        terminal.draw(|f| render(f, &s, selected))?;
+        let elapsed = started.elapsed();
+        terminal.draw(|f| render(f, &s, selected, elapsed))?;
         drop(s);
 
         // Handle input
@@ -221,7 +223,7 @@ async fn main() -> Result<()> {
 }
 
 /// Render the TUI dashboard
-fn render(f: &mut Frame, state: &ClusterState, selected: usize) {
+fn render(f: &mut Frame, state: &ClusterState, selected: usize, elapsed: Duration) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -232,8 +234,50 @@ fn render(f: &mut Frame, state: &ClusterState, selected: usize) {
         .split(f.area());
 
     render_header(f, state, chunks[0]);
-    render_nodes(f, state, selected, chunks[1]);
+
+    if state.snapshots.is_empty() {
+        render_loading(f, state, elapsed, chunks[1]);
+    } else {
+        render_nodes(f, state, selected, chunks[1]);
+    }
+
     render_footer(f, chunks[2]);
+}
+
+fn render_loading(f: &mut Frame, state: &ClusterState, elapsed: Duration, area: Rect) {
+    let secs = elapsed.as_secs();
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let frame = spinner[(secs as usize * 4 + (elapsed.subsec_millis() / 250) as usize) % spinner.len()];
+
+    let scan_count = state.scan_results.len();
+    let status = if scan_count > 0 {
+        format!("{frame}  Discovered {scan_count} nodes, polling metrics...")
+    } else {
+        format!("{frame}  Scanning cluster... ({secs}s)")
+    };
+
+    let content = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            status,
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Seed hosts, Thunderbolt bridges, Tailscale peers...",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Nodes ",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+    let para = Paragraph::new(content).block(block);
+    f.render_widget(para, area);
 }
 
 fn render_header(f: &mut Frame, state: &ClusterState, area: Rect) {
