@@ -13,7 +13,6 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
-use serde::{Deserialize, Serialize};
 use std::io::{stdout, IsTerminal};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -85,41 +84,30 @@ impl From<&Scan> for DiscoveryMethod {
 }
 
 // ---------------------------------------------------------------------------
-// Config file: ~/.config/apple-smi/config.toml
+// Node registry — persists discovered hostnames across runs
 // ---------------------------------------------------------------------------
 
-/// Persistent config stored at ~/.config/apple-smi/config.toml
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct AppConfig {
-    #[serde(default)]
-    hosts: Vec<String>,
-    #[serde(default)]
-    interval: Option<u64>,
-}
-
-fn config_path() -> PathBuf {
+fn registry_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("apple-smi")
-        .join("config.toml")
+        .join("nodes.json")
 }
 
-fn load_config() -> AppConfig {
-    let path = config_path();
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
-        Err(_) => AppConfig::default(),
-    }
+fn load_registry() -> Vec<String> {
+    let path = registry_path();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
-fn save_config(cfg: &AppConfig) {
-    let path = config_path();
+fn save_registry(hostnames: &[String]) {
+    let path = registry_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(contents) = toml::to_string_pretty(cfg) {
-        let _ = std::fs::write(&path, contents);
-    }
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(hostnames).unwrap_or_default());
 }
 
 #[tokio::main]
@@ -142,29 +130,68 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    // Resolve hosts: CLI flag > config file > discovery
-    let app_config = load_config();
-    let hosts = if !cli.hosts.is_empty() {
+    // Resolve seed hosts: CLI --hosts > registry > discovery
+    let seeds = if !cli.hosts.is_empty() {
         cli.hosts
-    } else if !app_config.hosts.is_empty() {
-        app_config.hosts
     } else {
-        Vec::new() // discovery will find them
+        load_registry()
     };
-    let interval = cli.interval;
 
     // Start cluster monitor
     let mut config = ClusterConfig::default()
-        .with_seeds(hosts)
-        .with_poll_interval(Duration::from_secs(interval));
+        .with_seeds(seeds)
+        .with_poll_interval(Duration::from_secs(cli.interval));
 
     if !cli.scan.is_empty() {
         config = config.with_discovery(cli.scan.iter().map(Into::into).collect());
     }
 
-    let mut monitor = ClusterMonitor::new(config);
+    let mut monitor = ClusterMonitor::new(config.clone());
     let state = monitor.state();
     monitor.start();
+
+    // Background task: update registry after scan completes.
+    // Resolves IPs to hostnames via SSH so the registry stores names.
+    {
+        let state = monitor.state();
+        let monitor_config = config.clone();
+        let mut rx = monitor.subscribe();
+        tokio::spawn(async move {
+            // Wait for scan to complete (a few epochs)
+            for _ in 0..3 {
+                if rx.changed().await.is_err() { return; }
+            }
+            let s = state.read().await;
+            let raw: Vec<String> = s.scan_results
+                .iter()
+                .filter(|r| r.ssh_ok)
+                .map(|r| r.hostname.clone())
+                .collect();
+            drop(s);
+
+            if raw.is_empty() { return; }
+
+            // Resolve IPs to hostnames via SSH
+            let mut resolved = Vec::new();
+            for host in &raw {
+                if host.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    // Looks like an IP — resolve via SSH
+                    if let Ok(r) = apple_smi_core::ssh_run(host, "hostname -s 2>/dev/null", &monitor_config).await {
+                        let name = r.stdout.trim().to_string();
+                        if !name.is_empty() && !resolved.contains(&name) {
+                            resolved.push(name);
+                            continue;
+                        }
+                    }
+                }
+                if !resolved.contains(host) {
+                    resolved.push(host.clone());
+                }
+            }
+
+            save_registry(&resolved);
+        });
+    }
 
     if !watch {
         // One-shot: wait for first scan + metrics, print, exit
