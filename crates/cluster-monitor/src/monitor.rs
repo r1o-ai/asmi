@@ -160,18 +160,20 @@ async fn poll_metrics(
     epoch: &Arc<tokio::sync::watch::Sender<u64>>,
     local_hostname: &str,
 ) {
-    // Read current known hostnames
+    // Read current known hostnames — prefer scan results, fall back to
+    // existing snapshots, then seed hosts (so first poll doesn't wait for scan)
     let hostnames: Vec<String> = {
         let s = state.read().await;
-        // Use scan results if available, otherwise use existing snapshots
         if !s.scan_results.is_empty() {
             s.scan_results
                 .iter()
                 .filter(|r| r.ssh_ok)
                 .map(|r| r.hostname.clone())
                 .collect()
-        } else {
+        } else if !s.snapshots.is_empty() {
             s.sorted_hostnames()
+        } else {
+            config.seed_hosts.clone()
         }
     };
 
