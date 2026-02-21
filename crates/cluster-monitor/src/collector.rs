@@ -26,10 +26,11 @@ const CMD_VMSTAT_SYSCTL: &str = "vm_stat; echo '---MEMSIZE---'; sysctl -n hw.mem
 const CMD_PS_MLX: &str =
     "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch' | grep -v grep";
 
-/// Detect JACCL by checking env vars of running MLX processes (macOS).
-/// ps eww shows environment alongside command for matching PIDs.
+/// Detect JACCL/distributed by checking `mlx.launch` wrapper processes.
+/// Only `mlx.launch --backend jaccl` is a reliable signal — env vars
+/// can persist from previous runs and cause false positives on single-node.
 const CMD_JACCL_ENV: &str =
-    "ps eww -o pid,command -p $(pgrep -f 'mlx_lm|mlx\\.launch' 2>/dev/null | head -5 | tr '\\n' ',')0 2>/dev/null | grep -o 'MLX_JACCL_[A-Z]*' | sort -u";
+    "ps aux | grep 'mlx\\.launch.*--backend' | grep -v grep | head -5";
 
 /// Build the footprint command for a given PID.
 fn footprint_cmd(pid: u32) -> String {
@@ -113,15 +114,25 @@ pub async fn collect_node_metrics(
         }
     };
 
-    // 5. Detect JACCL env vars — tag processes without explicit --backend
-    let jaccl_active = match &jaccl_res {
-        Ok(r) if r.has_output() => r.stdout.contains("MLX_JACCL"),
-        _ => false,
+    // 5. Detect distributed backend from mlx.launch wrapper processes.
+    // Only tag child processes (mlx_lm.server/share) when a matching
+    // mlx.launch with --backend is running on the same node.
+    let dist_backend = match &jaccl_res {
+        Ok(r) if r.has_output() => {
+            if r.stdout.contains("--backend jaccl") {
+                Some(DistributedBackend::Jaccl)
+            } else if r.stdout.contains("--backend ring") {
+                Some(DistributedBackend::Ring)
+            } else {
+                None
+            }
+        }
+        _ => None,
     };
-    if jaccl_active {
+    if let Some(backend) = dist_backend {
         for proc in &mut processes {
             if proc.distributed.is_none() {
-                proc.distributed = Some(DistributedBackend::Jaccl);
+                proc.distributed = Some(backend);
             }
         }
     }
