@@ -1,0 +1,113 @@
+enabled
+---
+    device          	   node GUID
+    ------          	----------------
+    rdma_en2        	d0b5e9ab23cfac05
+    rdma_en3        	d1b5e9ab23cfac05
+    rdma_en4        	d2b5e9ab23cfac05
+    rdma_en5        	d3b5e9ab23cfac05
+    rdma_en6        	d4b5e9ab23cfac05
+    rdma_en7        	d5b5e9ab23cfac05
+---
+hca_id:	rdma_en2
+	transport:			Thunderbolt (100)
+	node_guid:			d0b5:e9ab:23cf:ac05
+	sys_image_guid:			0000:0000:0000:0000
+	vendor_id:			0x0000
+	vendor_part_id:			0
+	hw_ver:				0x0
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_DOWN (1)
+			max_mtu:		4096 (5)
+			active_mtu:		4096 (5)
+			sm_lid:			0
+			port_lid:		1
+			port_lmc:		0x00
+			link_layer:		Thunderbolt
+
+hca_id:	rdma_en3
+	transport:			Thunderbolt (100)
+	node_guid:			d1b5:e9ab:23cf:ac05
+	sys_image_guid:			0000:0000:0000:0000
+	vendor_id:			0x0000
+	vendor_part_id:			0
+	hw_ver:				0x0
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_ACTIVE (4)
+			max_mtu:		4096 (5)
+			active_mtu:		4096 (5)
+			sm_lid:			0
+			port_lid:		2
+			port_lmc:		0x00
+			link_layer:		Thunderbolt
+
+hca_id:	rdma_en4
+	transport:			Thunderbolt (100)
+	node_guid:			d2b5:e9ab:23cf:ac05
+	sys_image_guid:			0000:0000:0000:0000
+	vendor_id:			0x0000
+	vendor_part_id:			0
+	hw_ver:				0x0
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_ACTIVE (4)
+			max_mtu:		4096 (5)
+			active_mtu:		4096 (5)
+			sm_lid:			0
+			port_lid:		3
+			port_lmc:		0x00
+			link_layer:		Thunderbolt
+
+hca_id:	rdma_en5
+	transport:			Thunderbolt (100)
+	node_guid:			d3b5:e9ab:23cf:ac05
+	sys_image_guid:			0000:0000:0000:0000
+	vendor_id:			0x0000
+	vendor_part_id:			0
+	hw_ver:				0x0
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_ACTIVE (4)
+			max_mtu:		4096 (5)
+			active_mtu:		4096 (5)
+			sm_lid:			0
+			port_lid:		4
+			port_lmc:		0x00
+			link_layer:		Thunderbolt
+
+hca_id:	rdma_en6
+	transport:			Thunderbolt (100)
+	node_guid:			d4b5:e9ab:23cf:ac05
+	sys_image_guid:			0000:0000:0000:0000
+	vendor_id:			0x0000
+	vendor_part_id:			0
+	hw_ver:				0x0
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_DOWN (1)
+			max_mtu:		4096 (5)
+			active_mtu:		4096 (5)
+			sm_lid:			0
+			port_lid:		5
+			port_lmc:		0x00
+			link_layer:		Thunderbolt
+
+hca_id:	rdma_en7
+	transport:			Thunderbolt (100)
+	node_guid:			d5b5:e9ab:23cf:ac05
+	sys_image_guid:			0000:0000:0000:0000
+	vendor_id:			0x0000
+	vendor_part_id:			0
+	hw_ver:				0x0
+	phys_port_cnt:			1
+		port:	1
+			state:			PORT_DOWN (1)
+			max_mtu:		4096 (5)
+			active_mtu:		4096 (5)
+			sm_lid:			0
+			port_lid:		6
+			port_lmc:		0x00
+			link_layer:		Thunderbolt
+

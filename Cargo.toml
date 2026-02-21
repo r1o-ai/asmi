@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/cluster-monitor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["MA"]
+
+[package]
+name = "apple-smi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apple Silicon cluster monitor — like nvidia-smi for Mac"
+
+[[bin]]
+name = "apple-smi"
+path = "src/main.rs"
+
+[[bin]]
+name = "asmi"
+path = "src/asmi.rs"
+
+[[bin]]
+name = "mlx-smi"
+path = "src/mlx_smi.rs"
+
+[dependencies]
+apple-smi-core = { path = "crates/cluster-monitor" }
+ratatui = "0.30"
+crossterm = "0.29"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5.60", features = ["derive"] }

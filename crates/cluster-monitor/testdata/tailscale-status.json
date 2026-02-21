@@ -1,0 +1,894 @@
+Warning: client version "1.94.1-td885b3477" != tailscaled server version "1.94.1-t62c6f1cd7-g09fea6572"
+{
+  "Version": "1.94.1-t62c6f1cd7-g09fea6572",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": [
+    "100.125.18.51",
+    "fd7a:115c:a1e0::c101:1282"
+  ],
+  "Self": {
+    "ID": "n5Y3wSjcLh11CNTRL",
+    "PublicKey": "nodekey:ee5387e1cf4abb03d181fb1a5d02a48f275c11aaf587f54cfe0e742922af9c63",
+    "HostName": "m3u2",
+    "DNSName": "m3u2.tail6315a0.ts.net.",
+    "OS": "macOS",
+    "UserID": 640598314922965,
+    "TailscaleIPs": [
+      "100.125.18.51",
+      "fd7a:115c:a1e0::c101:1282"
+    ],
+    "AllowedIPs": [
+      "100.125.18.51/32",
+      "fd7a:115c:a1e0::c101:1282/128"
+    ],
+    "Addrs": [
+      "73.138.106.64:41641",
+      "73.138.106.64:60493",
+      "[2603:3020:2493:be00:2df7:c40b:bcae:13cf]:41641",
+      "10.1.10.84:41641",
+      "192.168.60.1:41641",
+      "192.168.64.1:41641",
+      "192.168.107.0:41641",
+      "192.168.117.0:41641",
+      "192.168.139.3:41641",
+      "192.168.147.0:41641",
+      "192.168.156.0:41641",
+      "192.168.194.0:41641",
+      "[2603:3020:2493:be00:1062:3346:3869:3c60]:41641",
+      "[2603:3020:2493:be00:e93d:1001:4fea:5205]:41641"
+    ],
+    "CurAddr": "",
+    "Relay": "mia",
+    "PeerRelay": "",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "2025-12-17T01:52:20.603654762Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "Active": false,
+    "PeerAPIURL": [
+      "http://100.125.18.51:46036",
+      "http://[fd7a:115c:a1e0::c101:1282]:41466"
+    ],
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "Capabilities": [
+      "HTTPS://TAILSCALE.COM/s/DEPRECATED-NODE-CAPS#see-https://github.com/tailscale/tailscale/issues/11508",
+      "funnel",
+      "https",
+      "https://tailscale.com/cap/file-sharing",
+      "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000",
+      "https://tailscale.com/cap/is-admin",
+      "https://tailscale.com/cap/is-owner",
+      "https://tailscale.com/cap/mac-ui-v2",
+      "https://tailscale.com/cap/ssh",
+      "https://tailscale.com/cap/tailnet-lock",
+      "probe-udp-lifetime",
+      "ssh-behavior-v1",
+      "ssh-env-vars",
+      "store-appc-routes",
+      "tailnet-display-name"
+    ],
+    "CapMap": {
+      "funnel": null,
+      "https": null,
+      "https://tailscale.com/cap/file-sharing": null,
+      "https://tailscale.com/cap/funnel-ports?ports=443,8443,10000": null,
+      "https://tailscale.com/cap/is-admin": null,
+      "https://tailscale.com/cap/is-owner": null,
+      "https://tailscale.com/cap/mac-ui-v2": null,
+      "https://tailscale.com/cap/ssh": null,
+      "https://tailscale.com/cap/tailnet-lock": null,
+      "probe-udp-lifetime": null,
+      "ssh-behavior-v1": null,
+      "ssh-env-vars": null,
+      "store-appc-routes": null,
+      "tailnet-display-name": [
+        "machiabeli.github"
+      ]
+    },
+    "InNetworkMap": true,
+    "InMagicSock": false,
+    "InEngine": false,
+    "KeyExpiry": "2026-06-21T19:14:17Z"
+  },
+  "Health": [],
+  "MagicDNSSuffix": "tail6315a0.ts.net",
+  "CurrentTailnet": {
+    "Name": "machiabeli.github",
+    "MagicDNSSuffix": "tail6315a0.ts.net",
+    "MagicDNSEnabled": true
+  },
+  "CertDomains": [
+    "m3u2.tail6315a0.ts.net"
+  ],
+  "Peer": {
+    "nodekey:0951218f7712fa0ce4b92147a75494f1a0e56ee9f22cfde8e967890af94df374": {
+      "ID": "n3MTzAGMFA11CNTRL",
+      "PublicKey": "nodekey:0951218f7712fa0ce4b92147a75494f1a0e56ee9f22cfde8e967890af94df374",
+      "HostName": "MacBookPro",
+      "DNSName": "tropmc.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.96.65.7",
+        "fd7a:115c:a1e0::dc01:4142"
+      ],
+      "AllowedIPs": [
+        "100.96.65.7/32",
+        "fd7a:115c:a1e0::dc01:4142/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-08-31T03:24:03.211810328Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-01-02T19:33:04.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.96.65.7:63957",
+        "http://[fd7a:115c:a1e0::dc01:4142]:60893"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-02-27T09:28:02Z"
+    },
+    "nodekey:0db35a198064c7540a77f01be1568ffad010f311633439b6634f8672c09a9450": {
+      "ID": "nDDUfxECis11CNTRL",
+      "PublicKey": "nodekey:0db35a198064c7540a77f01be1568ffad010f311633439b6634f8672c09a9450",
+      "HostName": "k3s-m3u1",
+      "DNSName": "k3s-m3u1.tail6315a0.ts.net.",
+      "OS": "linux",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.90.148.81",
+        "fd7a:115c:a1e0::c03b:9451"
+      ],
+      "AllowedIPs": [
+        "100.90.148.81/32",
+        "fd7a:115c:a1e0::c03b:9451/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-02-14T08:05:47.976814425Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-15T23:30:52.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.90.148.81:56328",
+        "http://[fd7a:115c:a1e0::c03b:9451]:64799"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-08-13T08:05:47Z"
+    },
+    "nodekey:0eda1e3a66505c42ee211b1395b80271ddb758f22d46117cc9bf979ce8ce7809": {
+      "ID": "nUQDhjTpQC21CNTRL",
+      "PublicKey": "nodekey:0eda1e3a66505c42ee211b1395b80271ddb758f22d46117cc9bf979ce8ce7809",
+      "HostName": "m4m1",
+      "DNSName": "m4m1.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.78.120.10",
+        "fd7a:115c:a1e0::e801:780b"
+      ],
+      "AllowedIPs": [
+        "100.78.120.10/32",
+        "fd7a:115c:a1e0::e801:780b/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "10.1.10.155:41641",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 3448616,
+      "TxBytes": 2093672,
+      "Created": "2025-11-26T16:24:02.856570073Z",
+      "LastWrite": "2026-02-21T03:59:39.463927166-05:00",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T03:59:11.365633-05:00",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.78.120.10:58168",
+        "http://[fd7a:115c:a1e0::e801:780b]:39251"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-05-25T16:24:02Z"
+    },
+    "nodekey:16025a94d004e7c176e7480e40717bb15f4fd737d52f41913a77227696bb9047": {
+      "ID": "nq83H1RiF921CNTRL",
+      "PublicKey": "nodekey:16025a94d004e7c176e7480e40717bb15f4fd737d52f41913a77227696bb9047",
+      "HostName": "k3s-server",
+      "DNSName": "k3s-server.tail6315a0.ts.net.",
+      "OS": "linux",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.123.144.72",
+        "fd7a:115c:a1e0::963b:9048"
+      ],
+      "AllowedIPs": [
+        "100.123.144.72/32",
+        "fd7a:115c:a1e0::963b:9048/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-02-14T09:06:36.437814773Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-16T03:56:05.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.123.144.72:40219",
+        "http://[fd7a:115c:a1e0::963b:9048]:37083"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-08-13T09:06:36Z"
+    },
+    "nodekey:214b79dbd9663657ed88ec5e46200a86ffc6edd71e02e358e792d4bd3b900700": {
+      "ID": "nmkxtFJssq11CNTRL",
+      "PublicKey": "nodekey:214b79dbd9663657ed88ec5e46200a86ffc6edd71e02e358e792d4bd3b900700",
+      "HostName": "jose’s Mac mini",
+      "DNSName": "joses-mac-mini.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.80.7.1",
+        "fd7a:115c:a1e0::3b01:701"
+      ],
+      "AllowedIPs": [
+        "100.80.7.1/32",
+        "fd7a:115c:a1e0::3b01:701/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-10-31T18:06:21.342246133Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.80.7.1:53747",
+        "http://[fd7a:115c:a1e0::3b01:701]:38260"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-04-29T18:06:21Z"
+    },
+    "nodekey:2a7450ce6bf2963728f53f45ceb478c94b5b4822de699f1466c2b1b0aad5f62d": {
+      "ID": "nbA3TKzMok11CNTRL",
+      "PublicKey": "nodekey:2a7450ce6bf2963728f53f45ceb478c94b5b4822de699f1466c2b1b0aad5f62d",
+      "HostName": "k3s-m3u3",
+      "DNSName": "k3s-m3u3.tail6315a0.ts.net.",
+      "OS": "linux",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.85.246.46",
+        "fd7a:115c:a1e0::aa3b:f62e"
+      ],
+      "AllowedIPs": [
+        "100.85.246.46/32",
+        "fd7a:115c:a1e0::aa3b:f62e/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-02-14T08:52:05.646568098Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-16T07:17:40.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.85.246.46:65213",
+        "http://[fd7a:115c:a1e0::aa3b:f62e]:39063"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-08-13T08:52:05Z"
+    },
+    "nodekey:2dc80d56515783607f3a8c4b606e151bb1479ebb30f23830ade92a68396ed005": {
+      "ID": "nLBcpvtBZz11CNTRL",
+      "PublicKey": "nodekey:2dc80d56515783607f3a8c4b606e151bb1479ebb30f23830ade92a68396ed005",
+      "HostName": "alienMARIO",
+      "DNSName": "alienm.tail6315a0.ts.net.",
+      "OS": "windows",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.110.208.6",
+        "fd7a:115c:a1e0::3901:d01c"
+      ],
+      "AllowedIPs": [
+        "100.110.208.6/32",
+        "fd7a:115c:a1e0::3901:d01c/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "dfw",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-08-31T19:23:02.308296198Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-12-11T05:35:39.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.110.208.6:57106",
+        "http://[fd7a:115c:a1e0::3901:d01c]:43637"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-02-27T19:23:02Z"
+    },
+    "nodekey:2ec2b4f64e37b35a65f934c18286745aa7d477b4244cfa598e310fab357a2e2b": {
+      "ID": "nHTeG8XMMh11CNTRL",
+      "PublicKey": "nodekey:2ec2b4f64e37b35a65f934c18286745aa7d477b4244cfa598e310fab357a2e2b",
+      "HostName": "m3u1",
+      "DNSName": "m3u1-1.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.127.90.10",
+        "fd7a:115c:a1e0::2001:5a64"
+      ],
+      "AllowedIPs": [
+        "100.127.90.10/32",
+        "fd7a:115c:a1e0::2001:5a64/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "10.1.10.23:41641",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 1384112,
+      "TxBytes": 786672,
+      "Created": "2025-10-22T22:15:49.224638049Z",
+      "LastWrite": "2026-02-21T03:59:31.87493025-05:00",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T03:59:15.168279-05:00",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.127.90.10:43711",
+        "http://[fd7a:115c:a1e0::2001:5a64]:41914"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-05-12T22:38:16Z"
+    },
+    "nodekey:6f0fe0fa93f588515cd9ce29ab77d74dc18684483ff05bc896694072978b0305": {
+      "ID": "nRaXKnLWgF11CNTRL",
+      "PublicKey": "nodekey:6f0fe0fa93f588515cd9ce29ab77d74dc18684483ff05bc896694072978b0305",
+      "HostName": "mini2",
+      "DNSName": "mini2.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.75.3.6",
+        "fd7a:115c:a1e0::973b:306"
+      ],
+      "AllowedIPs": [
+        "100.75.3.6/32",
+        "fd7a:115c:a1e0::973b:306/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-02-14T21:37:17.569641Z",
+      "LastWrite": "2026-02-21T02:42:22.837421833-05:00",
+      "LastSeen": "2026-02-15T03:19:58.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.75.3.6:52677",
+        "http://[fd7a:115c:a1e0::973b:306]:42389"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-08-13T21:37:17Z"
+    },
+    "nodekey:7a63a7fc956ff95a2c8de99de3907edcac4730ddf33d4a5512666ee43e862579": {
+      "ID": "nAZxtcQjZE11CNTRL",
+      "PublicKey": "nodekey:7a63a7fc956ff95a2c8de99de3907edcac4730ddf33d4a5512666ee43e862579",
+      "HostName": "Cabral’s Mac mini",
+      "DNSName": "cabrals-mac-mini.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.70.37.122",
+        "fd7a:115c:a1e0::3e01:2586"
+      ],
+      "AllowedIPs": [
+        "100.70.37.122/32",
+        "fd7a:115c:a1e0::3e01:2586/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-10-29T21:52:47.173194761Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-01-18T17:52:30.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.70.37.122:57509",
+        "http://[fd7a:115c:a1e0::3e01:2586]:50647"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-04-27T21:52:47Z"
+    },
+    "nodekey:8a581f4a2ded61404d0c410135eb802326f84ce61f62550f21677a268db5f152": {
+      "ID": "nxzXgsu1u721CNTRL",
+      "PublicKey": "nodekey:8a581f4a2ded61404d0c410135eb802326f84ce61f62550f21677a268db5f152",
+      "HostName": "Juanes-Macbook-Pro-Max",
+      "DNSName": "juanes-macbook-pro-max.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 7000898379290044,
+      "TailscaleIPs": [
+        "100.117.241.83",
+        "fd7a:115c:a1e0::8d01:f163"
+      ],
+      "AllowedIPs": [
+        "100.117.241.83/32",
+        "fd7a:115c:a1e0::8d01:f163/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "nyc",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-09-04T03:14:15.489637675Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-12T04:50:12.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.117.241.83:41755",
+        "http://[fd7a:115c:a1e0::8d01:f163]:54075"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-03-03T03:14:15Z"
+    },
+    "nodekey:8b3e732be425f54fd846fe37777c229707b9185697726896734c3608c3707f41": {
+      "ID": "nbegv4bG5y11CNTRL",
+      "PublicKey": "nodekey:8b3e732be425f54fd846fe37777c229707b9185697726896734c3608c3707f41",
+      "HostName": "m3u3",
+      "DNSName": "m3u3.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.112.127.66",
+        "fd7a:115c:a1e0::c301:7f8e"
+      ],
+      "AllowedIPs": [
+        "100.112.127.66/32",
+        "fd7a:115c:a1e0::c301:7f8e/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "10.1.10.251:57685",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 15438584,
+      "TxBytes": 8564648,
+      "Created": "2025-12-19T08:34:42.211975297Z",
+      "LastWrite": "2026-02-21T03:59:35.590802958-05:00",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T03:58:19.98132-05:00",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.112.127.66:62663",
+        "http://[fd7a:115c:a1e0::c301:7f8e]:63547"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-06-17T08:34:42Z"
+    },
+    "nodekey:b50f9ab5f54573390ca4eb5baa8c039a3420ed804829df6b439aea85d1836575": {
+      "ID": "nNqDULMhxC11CNTRL",
+      "PublicKey": "nodekey:b50f9ab5f54573390ca4eb5baa8c039a3420ed804829df6b439aea85d1836575",
+      "HostName": "localhost",
+      "DNSName": "iphone181.tail6315a0.ts.net.",
+      "OS": "iOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.67.101.118",
+        "fd7a:115c:a1e0::d101:6576"
+      ],
+      "AllowedIPs": [
+        "100.67.101.118/32",
+        "fd7a:115c:a1e0::d101:6576/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-09-26T04:42:13.375831662Z",
+      "LastWrite": "2026-02-20T04:42:56.975614916-05:00",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.67.101.118:41312",
+        "http://[fd7a:115c:a1e0::d101:6576]:63694"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-03-25T04:42:13Z"
+    },
+    "nodekey:bf30ec47a7aed6b4c0e4f1c055047aee14bba9415a8b2e43a07a0f76976b3a0e": {
+      "ID": "nerTNinKcG11CNTRL",
+      "PublicKey": "nodekey:bf30ec47a7aed6b4c0e4f1c055047aee14bba9415a8b2e43a07a0f76976b3a0e",
+      "HostName": "Mario’s MacBook Pro",
+      "DNSName": "fcagmbk.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.107.58.15",
+        "fd7a:115c:a1e0::9701:3a11"
+      ],
+      "AllowedIPs": [
+        "100.107.58.15/32",
+        "fd7a:115c:a1e0::9701:3a11/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-08-09T22:23:53.202023899Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-11-15T21:44:44.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.107.58.15:48699",
+        "http://[fd7a:115c:a1e0::9701:3a11]:52654"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-03-03T03:35:04Z"
+    },
+    "nodekey:c9c2339f43f737568659521b187476f19ae52ca5ef58e26c0bbeefa243f19e2a": {
+      "ID": "neL1BTJyV421CNTRL",
+      "PublicKey": "nodekey:c9c2339f43f737568659521b187476f19ae52ca5ef58e26c0bbeefa243f19e2a",
+      "HostName": "JP’s MacBook Air",
+      "DNSName": "jps-macbook-air.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 1026735403516385,
+      "TailscaleIPs": [
+        "100.113.158.43",
+        "fd7a:115c:a1e0::4301:9e2d"
+      ],
+      "AllowedIPs": [
+        "100.113.158.43/32",
+        "fd7a:115c:a1e0::4301:9e2d/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-11-13T22:57:59.234764201Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-21T08:30:00.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.113.158.43:34209",
+        "http://[fd7a:115c:a1e0::4301:9e2d]:51396"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-05-12T22:57:59Z"
+    },
+    "nodekey:d30bcada7d021fe67847180e4cb664aba63fd6581b60fe7e5d1080a07a9e6a6e": {
+      "ID": "niAkPNhJDQ11CNTRL",
+      "PublicKey": "nodekey:d30bcada7d021fe67847180e4cb664aba63fd6581b60fe7e5d1080a07a9e6a6e",
+      "HostName": "k3s-m4m1",
+      "DNSName": "k3s-m4m1.tail6315a0.ts.net.",
+      "OS": "linux",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.94.106.111",
+        "fd7a:115c:a1e0::7a3b:6a6f"
+      ],
+      "AllowedIPs": [
+        "100.94.106.111/32",
+        "fd7a:115c:a1e0::7a3b:6a6f/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2026-02-14T08:05:51.097661565Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-15T03:19:56.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.94.106.111:42316",
+        "http://[fd7a:115c:a1e0::7a3b:6a6f]:44167"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-08-13T08:05:51Z"
+    },
+    "nodekey:d6200d5f84aae2f08261a95ff89cb3711c2ac653d67df2cb6eae31851508b10b": {
+      "ID": "nEk5h2oN9R11CNTRL",
+      "PublicKey": "nodekey:d6200d5f84aae2f08261a95ff89cb3711c2ac653d67df2cb6eae31851508b10b",
+      "HostName": "mini1",
+      "DNSName": "mini1.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 7000898379290044,
+      "TailscaleIPs": [
+        "100.72.177.12",
+        "fd7a:115c:a1e0::1501:b110"
+      ],
+      "AllowedIPs": [
+        "100.72.177.12/32",
+        "fd7a:115c:a1e0::1501:b110/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "nyc",
+      "PeerRelay": "",
+      "RxBytes": 2433456,
+      "TxBytes": 2260744,
+      "Created": "2026-02-02T01:41:15.1777302Z",
+      "LastWrite": "2026-02-21T03:55:43.283814208-05:00",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T03:55:41.926296-05:00",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.72.177.12:54968",
+        "http://[fd7a:115c:a1e0::1501:b110]:48312"
+      ],
+      "TaildropTarget": 9,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-08-01T01:41:15Z"
+    },
+    "nodekey:d902c855358153a1f2bf2dd684c00fae177801d0fbca7c16bd212a458853677b": {
+      "ID": "nRXLN2BGQt11CNTRL",
+      "PublicKey": "nodekey:d902c855358153a1f2bf2dd684c00fae177801d0fbca7c16bd212a458853677b",
+      "HostName": "localhost",
+      "DNSName": "ipad174.tail6315a0.ts.net.",
+      "OS": "iOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.83.103.124",
+        "fd7a:115c:a1e0::8801:677c"
+      ],
+      "AllowedIPs": [
+        "100.83.103.124/32",
+        "fd7a:115c:a1e0::8801:677c/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-10-22T21:24:55.203006681Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2026-02-17T08:14:50.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.83.103.124:35212",
+        "http://[fd7a:115c:a1e0::8801:677c]:62290"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-04-20T21:24:55Z"
+    },
+    "nodekey:fa8269657fd7d084e338d0b8332d6878801f11587ef449a9e3f6326632a5b008": {
+      "ID": "nUV4PPweEp11CNTRL",
+      "PublicKey": "nodekey:fa8269657fd7d084e338d0b8332d6878801f11587ef449a9e3f6326632a5b008",
+      "HostName": "m4m-b-1",
+      "DNSName": "m4m-b-1.tail6315a0.ts.net.",
+      "OS": "macOS",
+      "UserID": 640598314922965,
+      "TailscaleIPs": [
+        "100.101.176.9",
+        "fd7a:115c:a1e0::3201:b00a"
+      ],
+      "AllowedIPs": [
+        "100.101.176.9/32",
+        "fd7a:115c:a1e0::3201:b00a/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "mia",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 3572088,
+      "Created": "2025-11-20T05:20:43.592425971Z",
+      "LastWrite": "2026-02-21T03:59:40.309601166-05:00",
+      "LastSeen": "2026-02-19T18:35:43.1Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.101.176.9:50885",
+        "http://[fd7a:115c:a1e0::3201:b00a]:62595"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-05-19T05:20:43Z"
+    }
+  },
+  "User": {
+    "1026735403516385": {
+      "ID": 1026735403516385,
+      "LoginName": "galanesjp-hue@github",
+      "DisplayName": "galanesjp-hue",
+      "ProfilePicURL": "https://avatars.githubusercontent.com/u/242310255?v=4"
+    },
+    "640598314922965": {
+      "ID": 640598314922965,
+      "LoginName": "machiabeli@github",
+      "DisplayName": "machiabeli",
+      "ProfilePicURL": "https://avatars.githubusercontent.com/u/206121458?v=4"
+    },
+    "7000898379290044": {
+      "ID": 7000898379290044,
+      "LoginName": "juanes@fcag.io",
+      "DisplayName": "Juan Alvarado"
+    }
+  },
+  "ClientVersion": null
+}

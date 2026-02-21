@@ -1,0 +1,210 @@
+Thunderbolt/USB4:
+
+    Thunderbolt/USB4 Bus 5:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x05ACCF23ABE9B5D5
+      Route String: 0
+      Domain UUID: E723E836-6BE9-4310-8786-DCBB950EF9A0
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 6
+
+    Thunderbolt/USB4 Bus 4:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x05ACCF23ABE9B5D4
+      Route String: 0
+      Domain UUID: 1BA15504-5C7C-4D2A-A234-5874ACF829AD
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 5
+
+    Thunderbolt/USB4 Bus 3:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x05ACCF23ABE9B5D3
+      Route String: 0
+      Domain UUID: 8BE9083F-AF72-4643-85F5-D1F5AE7CFEB2
+      Port:
+          Status: Device connected
+          Link Status: 0x2
+          Speed: 80 Gb/s
+          Receptacle: 4
+          Micro Firmware Version: 0.0.0
+
+        Mac Studio:
+
+          Vendor Name: Apple Inc.
+          Device Name: Mac16,9
+          Device ID: 0xA
+          Vendor ID: 0x0A27
+          Domain UUID: 26827A3E-7772-49F9-AC06-FCED4D284F08
+          Services:
+            Internet Protocol:
+              Protocol ID: 1
+              Protocol Version: 1
+              Protocol Revision: 1
+              Service UUID: 6ED54E49-281E-44D4-B61F-EBF34884BBED
+            Service: Unknown:
+              Protocol ID: 64087
+              Protocol Version: 1
+              Protocol Revision: 0
+              Service Key: ˇˇˇˇˇˇAD
+              Service UUID: D3C65915-7E82-4B28-A674-E4F823013FD8
+
+    Thunderbolt/USB4 Bus 2:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x05ACCF23ABE9B5D2
+      Route String: 0
+      Domain UUID: DFA6C792-86E9-4925-A3EE-C70034046803
+      Port:
+          Status: Device connected
+          Link Status: 0x2
+          Speed: 80 Gb/s
+          Receptacle: 3
+          Micro Firmware Version: 0.0.0
+
+        Mac Studio:
+
+          Vendor Name: Apple Inc.
+          Device Name: Mac15,14
+          Device ID: 0xA
+          Vendor ID: 0x0A27
+          Domain UUID: 56D4CDBC-9A10-448A-AB33-39684154EC8F
+          Services:
+            Internet Protocol:
+              Protocol ID: 1
+              Protocol Version: 1
+              Protocol Revision: 1
+              Service UUID: B276844E-00BC-400E-9631-BA123BB11CF4
+            Service: Unknown:
+              Protocol ID: 64087
+              Protocol Version: 1
+              Protocol Revision: 0
+              Service Key: ˇˇˇˇˇˇAD
+              Service UUID: 37B05F35-ABB8-40E2-9191-02DBDAE865B3
+
+    Thunderbolt/USB4 Bus 1:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x05ACCF23ABE9B5D1
+      Route String: 0
+      Domain UUID: 41F3E67B-4091-4B12-A876-1136929E0EA1
+      Port:
+          Status: Device connected
+          Link Status: 0x2
+          Speed: 80 Gb/s
+          Receptacle: 2
+          Micro Firmware Version: 0.0.0
+
+        Mac Studio:
+
+          Vendor Name: Apple Inc.
+          Device Name: Mac15,14
+          Device ID: 0xA
+          Vendor ID: 0x0A27
+          Domain UUID: 24252176-D860-4A28-AB2A-9DD6F156094F
+          Services:
+            Internet Protocol:
+              Protocol ID: 1
+              Protocol Version: 1
+              Protocol Revision: 1
+              Service UUID: 370B1185-5BFA-4FC0-873F-3A1228650EF7
+            Service: Unknown:
+              Protocol ID: 64087
+              Protocol Version: 1
+              Protocol Revision: 0
+              Service Key: ˇˇˇˇˇˇAD
+              Service UUID: 598F5D96-04FF-4EA1-A842-EFADE3E6885A
+
+    Thunderbolt/USB4 Bus 0:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x05ACCF23ABE9B5D0
+      Route String: 0
+      Domain UUID: 694B93A5-6472-41CE-A665-87DADA1120A4
+      Port:
+          Status: Device connected
+          Link Status: 0x2
+          Speed: 80 Gb/s
+          Receptacle: 1
+          Micro Firmware Version: 0.0.0
+
+        Prime Docking Station (14-in-1, 8K, Thunderbolt 5):
+
+          Vendor Name: Anker
+          Device Name: Prime Docking Station (14-in-1, 8K, Thunderbolt 5)
+          Mode: USB4 v2
+          Device ID: 0x83B5
+          Vendor ID: 0x291A
+          Device Revision: 0x1
+          UID: 0x80878DFABA1D8700
+          Route String: 1
+          Firmware Version: 62.1
+          Port (Upstream):
+              Status: Device connected
+              Link Status: 0x2
+              Speed: 80 Gb/s
+              Micro Firmware Version: 1.9.0
+          Port:
+              Status: Device connected
+              Link Status: 0x2
+              Speed: 80 Gb/s
+              Micro Firmware Version: 1.9.0
+          Port:
+              Status: No device connected
+              Link Status: 0x7
+              Speed: Up to 120 Gb/s
+              Micro Firmware Version: 1.9.0
+          Port:
+              Status: Device connected
+              Link Status: 0x2
+              Speed: 80 Gb/s
+              Micro Firmware Version: 1.9.0
+
+            TB501Pro:
+
+              Vendor Name: ACASIS  
+              Device Name: TB501Pro
+              Mode: USB4 v2
+              Device ID: 0x14
+              Vendor ID: 0x35E6
+              Device Revision: 0x3
+              UID: 0x808714C4E16CB600
+              Route String: 301
+              Firmware Version: 62.62
+              Port (Upstream):
+                  Status: Device connected
+                  Link Status: 0x2
+                  Speed: 80 Gb/s
+                  Micro Firmware Version: 1.9.0
+
+            TB501Pro:
+
+              Vendor Name: ACASIS  
+              Device Name: TB501Pro
+              Mode: USB4 v2
+              Device ID: 0x14
+              Vendor ID: 0x35E6
+              Device Revision: 0x3
+              UID: 0x808714C4E1ADD600
+              Route String: 701
+              Firmware Version: 62.62
+              Port (Upstream):
+                  Status: Device connected
+                  Link Status: 0x2
+                  Speed: 80 Gb/s
+                  Micro Firmware Version: 1.9.0
+
