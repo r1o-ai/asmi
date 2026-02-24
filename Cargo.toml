@@ -10,28 +10,24 @@ license = "MIT"
 authors = ["MA"]
 
 [package]
-name = "apple-smi"
+name = "mlx-top"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Apple Silicon cluster monitor — like nvidia-smi for Mac"
+description = "MLX cluster monitor — like nvidia-smi + htop for Apple Silicon"
 
 [[bin]]
-name = "apple-smi"
+name = "mlx-top"
 path = "src/main.rs"
 
 [[bin]]
 name = "asmi"
 path = "src/asmi.rs"
 
-[[bin]]
-name = "mlx-smi"
-path = "src/mlx_smi.rs"
-
 [dependencies]
-apple-smi-core = { path = "crates/cluster-monitor" }
+mlx-top-core = { path = "crates/cluster-monitor" }
 ratatui = "0.30"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
@@ -44,3 +40,5 @@ clap = { version = "4.5.60", features = ["derive"] }
 toml = "1.0.3"
 dirs = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

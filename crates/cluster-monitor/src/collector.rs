@@ -19,7 +19,8 @@ use tracing::{debug, warn};
 const CMD_POWERMETRICS: &str =
     "sudo powermetrics -n 1 -i 1000 --samplers cpu_power,gpu_power 2>/dev/null";
 
-const CMD_VMSTAT_SYSCTL: &str = "vm_stat; echo '---MEMSIZE---'; sysctl -n hw.memsize";
+const CMD_VMSTAT_SYSCTL: &str =
+    "hostname -s; echo '---HOSTNAME---'; vm_stat; echo '---MEMSIZE---'; sysctl -n hw.memsize";
 
 /// Also captures mlx.launch (distributed launcher) and mlx_lm.share.
 /// JACCL detection: --backend jaccl in args, or ps -E showing MLX_JACCL env vars.
@@ -82,21 +83,33 @@ pub async fn collect_node_metrics(
         }
     };
 
-    // 3. Parse vm_stat + sysctl
-    let (ram_used_bytes, ram_total_bytes) = match &mem_res {
+    // 3. Parse hostname -s + vm_stat + sysctl
+    // The combined command outputs: hostname\n---HOSTNAME---\nvm_stat...\n---MEMSIZE---\nmemsize
+    let (resolved_hostname, ram_used_bytes, ram_total_bytes) = match &mem_res {
         Ok(r) if r.has_output() => {
             debug!(hostname, "vm_stat/sysctl OK");
-            parse_vmstat_and_memsize(&r.stdout)
+            let (resolved, vmstat_text) = match r.stdout.split_once("---HOSTNAME---\n") {
+                Some((h, rest)) => (Some(h.trim().to_string()), rest.to_string()),
+                None => (None, r.stdout.clone()),
+            };
+            let (used, total) = parse_vmstat_and_memsize(&vmstat_text);
+            (resolved, used, total)
         }
         Ok(r) => {
             debug!(hostname, stderr = r.stderr.as_str(), "vm_stat/sysctl empty/failed");
-            (0, 0)
+            (None, 0, 0)
         }
         Err(e) => {
             warn!(hostname, error = %e, "vm_stat/sysctl command error");
-            (0, 0)
+            (None, 0, 0)
         }
     };
+
+    // Use SSH-resolved hostname as canonical name to prevent duplicates
+    // when the same node is discovered via different networks (LAN vs TB).
+    let canonical_hostname = resolved_hostname
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| hostname.to_string());
 
     // 4. Parse ps aux for MLX processes
     let mut processes = match &ps_res {
@@ -137,22 +150,93 @@ pub async fn collect_node_metrics(
         }
     }
 
-    // 7. Enrich each process with footprint data (sequential — one per process)
-    for proc in &mut processes {
-        let cmd = footprint_cmd(proc.pid);
-        let fp_res = if is_local {
-            local_run(&cmd).await
-        } else {
-            ssh_run(hostname, &cmd, config).await
-        };
-
-        match fp_res {
-            Ok(r) if r.has_output() => {
-                proc.footprint_mb = parse_footprint(&r.stdout);
-                debug!(hostname, pid = proc.pid, footprint_mb = ?proc.footprint_mb, "footprint");
+    // 6. Verify actual listening ports via lsof (parallel, one per PID).
+    //    The --port flag from ps aux may not match the real socket when a
+    //    server fails to bind and falls back to a different port.
+    if !processes.is_empty() {
+        let port_futs: Vec<_> = processes.iter().map(|proc| {
+            let pid = proc.pid;
+            let hostname_owned = hostname.to_string();
+            let config_clone = config.clone();
+            async move {
+                let cmd = format!(
+                    "lsof -a -p {pid} -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk 'NR>1 {{print $9}}' | head -1"
+                );
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    async {
+                        if is_local {
+                            local_run(&cmd).await
+                        } else {
+                            ssh_run(&hostname_owned, &cmd, &config_clone).await
+                        }
+                    },
+                ).await;
+                let actual_port: Option<u16> = match res {
+                    Ok(Ok(r)) if r.has_output() => {
+                        // lsof output looks like "*:8091" or "127.0.0.1:8091"
+                        r.stdout.trim()
+                            .rsplit(':')
+                            .next()
+                            .and_then(|p| p.parse().ok())
+                    }
+                    _ => None,
+                };
+                (pid, actual_port)
             }
-            _ => {
-                debug!(hostname, pid = proc.pid, "footprint unavailable");
+        }).collect();
+
+        let port_results = futures::future::join_all(port_futs).await;
+        for (pid, actual_port) in port_results {
+            if let Some(proc) = processes.iter_mut().find(|p| p.pid == pid) {
+                if let Some(real_port) = actual_port {
+                    if proc.port != Some(real_port) {
+                        debug!(
+                            hostname,
+                            pid,
+                            cli_port = ?proc.port,
+                            actual_port = real_port,
+                            "port mismatch: lsof overrides CLI --port"
+                        );
+                    }
+                    proc.port = Some(real_port);
+                }
+            }
+        }
+    }
+
+    // 7. Enrich each process with footprint data (all PIDs in parallel)
+    if !processes.is_empty() {
+        let fp_futs: Vec<_> = processes.iter().map(|proc| {
+            let cmd = footprint_cmd(proc.pid);
+            let pid = proc.pid;
+            let hostname = hostname.to_string();
+            let config = config.clone();
+            async move {
+                let fp_res = if is_local {
+                    local_run(&cmd).await
+                } else {
+                    ssh_run(&hostname, &cmd, &config).await
+                };
+                let mb = match fp_res {
+                    Ok(r) if r.has_output() => {
+                        let mb = parse_footprint(&r.stdout);
+                        debug!(hostname = hostname.as_str(), pid, footprint_mb = ?mb, "footprint");
+                        mb
+                    }
+                    _ => {
+                        debug!(hostname = hostname.as_str(), pid, "footprint unavailable");
+                        None
+                    }
+                };
+                (pid, mb)
+            }
+        }).collect();
+
+        let results = futures::future::join_all(fp_futs).await;
+        for (pid, mb) in results {
+            if let Some(proc) = processes.iter_mut().find(|p| p.pid == pid) {
+                proc.footprint_mb = mb;
             }
         }
     }
@@ -165,7 +249,7 @@ pub async fn collect_node_metrics(
     };
 
     NodeSnapshot {
-        hostname: hostname.to_string(),
+        hostname: canonical_hostname,
         online: true,
         timestamp: Utc::now(),
         cpu_watts: power.cpu_mw,

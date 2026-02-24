@@ -84,9 +84,42 @@ impl ClusterState {
     }
 
     /// Update scan results and total node count.
+    /// Deduplicates by hostname — keeps the first (most complete) result
+    /// for each resolved hostname.
     pub fn update_scan(&mut self, results: Vec<ScanResult>) {
-        self.total_nodes = results.len();
-        self.scan_results = results;
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::with_capacity(results.len());
+        for r in results {
+            let key = r.hostname.to_lowercase();
+            if seen.insert(key) {
+                deduped.push(r);
+            }
+        }
+        // Only count SSH-reachable nodes — discovery candidates that can't
+        // be reached aren't real cluster nodes and shouldn't inflate the total.
+        self.total_nodes = deduped.iter().filter(|r| r.ssh_ok).count();
+        self.scan_results = deduped;
+    }
+
+    /// Merge new scan results into existing ones without replacing.
+    /// New SSH-reachable nodes are added; existing entries are updated.
+    pub fn merge_scan(&mut self, results: Vec<ScanResult>) {
+        let mut by_host: std::collections::HashMap<String, ScanResult> = self
+            .scan_results
+            .drain(..)
+            .map(|r| (r.hostname.to_lowercase(), r))
+            .collect();
+
+        for r in results {
+            let key = r.hostname.to_lowercase();
+            // Prefer the newer result if it reached the node
+            if r.ssh_ok || !by_host.contains_key(&key) {
+                by_host.insert(key, r);
+            }
+        }
+
+        self.scan_results = by_host.into_values().collect();
+        self.total_nodes = self.scan_results.iter().filter(|r| r.ssh_ok).count();
     }
 
     /// Mark a node as offline (sets online=false in its snapshot).
@@ -260,6 +293,7 @@ mod tests {
                 rdma: None,
                 mlx_servers: vec![],
                 latency_ms: Some(0.5),
+                link_speed: None,
             },
             ScanResult {
                 hostname: "m3u1".to_string(),
@@ -271,11 +305,138 @@ mod tests {
                 rdma: None,
                 mlx_servers: vec![],
                 latency_ms: Some(0.4),
+                link_speed: None,
             },
         ]);
 
         assert_eq!(state.total_nodes, 2);
         assert_eq!(state.scan_results.len(), 2);
+    }
+
+    #[test]
+    fn test_total_nodes_excludes_unreachable() {
+        let mut state = ClusterState::new(60);
+        state.update_scan(vec![
+            ScanResult {
+                hostname: "m3u1".to_string(),
+                reachable: true,
+                ssh_ok: true,
+                chip: Some("Apple M3 Ultra".to_string()),
+                ram_gb: Some(512),
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+            ScanResult {
+                hostname: "some-iot-device".to_string(),
+                reachable: true,
+                ssh_ok: false,
+                chip: None,
+                ram_gb: None,
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+            ScanResult {
+                hostname: "unreachable-host".to_string(),
+                reachable: false,
+                ssh_ok: false,
+                chip: None,
+                ram_gb: None,
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+        ]);
+
+        // Only 1 SSH-reachable node counts toward total
+        assert_eq!(state.total_nodes, 1);
+        // All 3 scan results are preserved for reference
+        assert_eq!(state.scan_results.len(), 3);
+    }
+
+    #[test]
+    fn test_merge_scan() {
+        let mut state = ClusterState::new(60);
+        // Phase 1: seed scan finds 2 nodes
+        state.update_scan(vec![
+            ScanResult {
+                hostname: "m3u1".to_string(),
+                reachable: true,
+                ssh_ok: true,
+                chip: Some("Apple M3 Ultra".to_string()),
+                ram_gb: Some(512),
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+            ScanResult {
+                hostname: "m3u2".to_string(),
+                reachable: true,
+                ssh_ok: true,
+                chip: Some("Apple M3 Ultra".to_string()),
+                ram_gb: Some(512),
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+        ]);
+        assert_eq!(state.total_nodes, 2);
+
+        // Phase 2: full scan finds same 2 + 1 new node + 5 unreachable
+        state.merge_scan(vec![
+            ScanResult {
+                hostname: "m3u1".to_string(),
+                reachable: true,
+                ssh_ok: true,
+                chip: Some("Apple M3 Ultra".to_string()),
+                ram_gb: Some(512),
+                gpu_cores: Some(80), // updated info
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: Some(0.3),
+                link_speed: None,
+            },
+            ScanResult {
+                hostname: "mse1".to_string(),
+                reachable: true,
+                ssh_ok: true,
+                chip: Some("Apple M4 Max".to_string()),
+                ram_gb: Some(128),
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+            ScanResult {
+                hostname: "iot-lamp".to_string(),
+                reachable: true,
+                ssh_ok: false,
+                chip: None,
+                ram_gb: None,
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+        ]);
+
+        // total_nodes = 3 (m3u1 + m3u2 + mse1), not counting iot-lamp
+        assert_eq!(state.total_nodes, 3);
+        // All unique entries preserved
+        assert_eq!(state.scan_results.len(), 4);
     }
 
     #[test]

@@ -82,12 +82,19 @@ pub struct ProcessInfo {
 /// Recognised ML frameworks / process types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProcessFramework {
+    #[serde(rename = "mlx-lm")]
     MlxLm,
+    #[serde(rename = "mlx-share")]
     MlxLmShare,
+    #[serde(rename = "mlx-vlm")]
     MlxVlm,
+    #[serde(rename = "vllm-mlx")]
     VllmMlx,
+    #[serde(rename = "mlx-dist")]
     MlxLaunch,
+    #[serde(rename = "watchdog")]
     Watchdog,
+    #[serde(rename = "unknown")]
     Unknown,
 }
 
@@ -107,6 +114,7 @@ impl fmt::Display for ProcessFramework {
 
 /// Distributed backend detected from process args or environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DistributedBackend {
     Jaccl,
     Ring,
@@ -162,6 +170,44 @@ pub struct RdmaDevice {
     pub port_state: PortState,
 }
 
+/// A discovered RDMA link: maps a local interface/device to a remote peer.
+/// Built by correlating RDMA device names (rdma_en3 → en3), ifconfig bridges,
+/// and ARP table peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RdmaLink {
+    /// Local interface name (e.g., "en3").
+    pub local_interface: String,
+    /// Local IP on that interface (e.g., "169.254.19.163").
+    pub local_ip: String,
+    /// Remote peer IP (e.g., "169.254.204.162").
+    pub remote_ip: String,
+    /// Remote peer hostname (e.g., "m3u3").
+    pub remote_hostname: String,
+    /// RDMA device name derived from interface (e.g., "rdma_en3").
+    #[serde(default)]
+    pub rdma_device: Option<String>,
+    /// Port state of the RDMA device (ACTIVE/DOWN/Unknown).
+    #[serde(default)]
+    pub port_state: Option<PortState>,
+}
+
+impl RdmaLink {
+    /// Derive the expected RDMA device name from the interface (en3 → rdma_en3).
+    pub fn expected_rdma_device(&self) -> String {
+        format!("rdma_{}", self.local_interface)
+    }
+}
+
+impl std::fmt::Display for RdmaLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self
+            .port_state
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        write!(f, "{} -> {} [{}]", self.local_interface, self.remote_hostname, state)
+    }
+}
+
 /// RDMA port link state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PortState {
@@ -211,6 +257,7 @@ pub struct ScanResult {
     pub rdma: Option<RdmaStatus>,
     pub mlx_servers: Vec<MlxServerInfo>,
     pub latency_ms: Option<f64>,
+    pub link_speed: Option<String>,
 }
 
 /// An MLX-LM (or compatible) server discovered on a node.
@@ -362,6 +409,84 @@ impl MetricsHistory {
     /// Maximum number of samples this history can hold.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster events (real-time activity feed for TUI)
+// ---------------------------------------------------------------------------
+
+/// Events emitted during cluster monitoring for real-time UI feedback.
+#[derive(Debug, Clone)]
+pub enum ClusterEvent {
+    /// A discovery method is starting.
+    DiscoveryStarted { method: String },
+    /// A discovery method found peers.
+    DiscoveryFound { method: String, count: usize },
+    /// Node probing phase starting.
+    ProbingStarted { count: usize },
+    /// A single node probe completed.
+    NodeProbed {
+        hostname: String,
+        online: bool,
+        chip: Option<String>,
+        ram_gb: Option<u64>,
+    },
+    /// Full cluster scan complete.
+    ScanComplete { online: usize, total: usize },
+    /// Metrics polling started.
+    MetricsPollStarted { count: usize },
+    /// Metrics received from one node.
+    MetricsReceived { hostname: String },
+    /// Node registry saved.
+    RegistrySaved { count: usize },
+    /// A hostname alias was auto-discovered (e.g., ARP "mac-360" → SSH "m3u2").
+    AliasDiscovered { alias: String, canonical: String },
+    /// Thunderbolt bridge IPs discovered for a node (used for RDMA/mlx-share).
+    RdmaIpsDiscovered {
+        canonical: String,
+        ips: Vec<String>,
+        interface: Option<String>,
+    },
+    /// An RDMA link was mapped: local interface → remote peer.
+    RdmaLinkDiscovered {
+        local_interface: String,
+        local_ip: String,
+        remote_ip: String,
+        remote_hostname: String,
+        rdma_device: Option<String>,
+        port_state: Option<PortState>,
+    },
+    /// Local RDMA device correlated with interface (post-scan).
+    /// Used to update existing RdmaLinks with port state.
+    RdmaDeviceCorrelated {
+        interface: String,
+        rdma_device: String,
+        port_state: PortState,
+    },
+}
+
+/// Sink for emitting cluster events. Cheap to clone, silently drops if
+/// no subscribers or if constructed as no-op.
+#[derive(Clone)]
+pub struct EventSink(Option<tokio::sync::broadcast::Sender<ClusterEvent>>);
+
+impl EventSink {
+    /// Create a sink that emits to a broadcast channel.
+    pub fn new(tx: tokio::sync::broadcast::Sender<ClusterEvent>) -> Self {
+        Self(Some(tx))
+    }
+
+    /// Create a no-op sink that discards all events.
+    pub fn noop() -> Self {
+        Self(None)
+    }
+
+    /// Emit an event. Silently drops if no subscribers.
+    pub fn emit(&self, event: ClusterEvent) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(event);
+        }
     }
 }
 

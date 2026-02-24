@@ -6,8 +6,9 @@
 
 use crate::aggregator::ClusterState;
 use crate::collector::collect_node_metrics;
-use crate::config::ClusterConfig;
-use crate::scanner::scan_cluster;
+use crate::config::{ClusterConfig, NodeMap};
+use crate::scanner::{scan_cluster, scan_seeds};
+use crate::types::{ClusterEvent, EventSink};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -17,7 +18,8 @@ use tracing::{debug, info};
 /// # Usage
 ///
 /// ```ignore
-/// let mut monitor = ClusterMonitor::new(ClusterConfig::default());
+/// let node_map = NodeMap::load();
+/// let mut monitor = ClusterMonitor::new(ClusterConfig::default(), node_map);
 /// let state = monitor.state(); // Arc<RwLock<ClusterState>>
 /// monitor.start();
 ///
@@ -25,39 +27,52 @@ use tracing::{debug, info};
 /// let s = state.read().await;
 /// println!("{} nodes online", s.online_count());
 ///
-/// // Or subscribe to updates
-/// let mut rx = monitor.subscribe();
-/// while rx.changed().await.is_ok() {
-///     let epoch = *rx.borrow();
-///     println!("state updated, epoch={epoch}");
-/// }
-///
 /// // Shutdown
 /// monitor.stop();
 /// ```
 pub struct ClusterMonitor {
     config: ClusterConfig,
     state: Arc<RwLock<ClusterState>>,
+    node_map: Arc<RwLock<NodeMap>>,
     epoch: Arc<tokio::sync::watch::Sender<u64>>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    events_tx: tokio::sync::broadcast::Sender<ClusterEvent>,
 }
 
 impl ClusterMonitor {
     /// Create a new monitor (not yet started).
-    pub fn new(config: ClusterConfig) -> Self {
+    pub fn new(config: ClusterConfig, node_map: NodeMap) -> Self {
         let state = Arc::new(RwLock::new(ClusterState::new(config.history_capacity)));
         let (epoch_tx, _) = tokio::sync::watch::channel(0u64);
+        let (events_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             config,
             state,
+            node_map: Arc::new(RwLock::new(node_map)),
             epoch: Arc::new(epoch_tx),
             shutdown_tx: None,
+            events_tx,
         }
+    }
+
+    /// Subscribe to real-time cluster events (discovery, probing, metrics).
+    pub fn events(&self) -> tokio::sync::broadcast::Receiver<ClusterEvent> {
+        self.events_tx.subscribe()
+    }
+
+    /// Get an EventSink for emitting events into this monitor's channel.
+    pub fn event_sink(&self) -> EventSink {
+        EventSink::new(self.events_tx.clone())
     }
 
     /// Get a handle to the shared cluster state.
     pub fn state(&self) -> Arc<RwLock<ClusterState>> {
         Arc::clone(&self.state)
+    }
+
+    /// Get a handle to the shared node map (for TUI alias display / manual merge).
+    pub fn node_map(&self) -> Arc<RwLock<NodeMap>> {
+        Arc::clone(&self.node_map)
     }
 
     /// Subscribe to state change notifications. The receiver yields the
@@ -75,17 +90,29 @@ impl ClusterMonitor {
         let local_hostname = whoami::fallible::hostname()
             .unwrap_or_else(|_| "localhost".to_string());
 
-        // --- Scan loop (runs first to populate initial node list) ---
+        let events = self.event_sink();
+
+        // --- Hierarchical scan loop ---
+        // Phase 1: Fast probe of seed/registry hosts (instant results)
+        // Phase 2: Full discovery scan (finds additional nodes)
+        // Phase 3+: Periodic re-scan on interval
         {
             let config = self.config.clone();
             let state = Arc::clone(&self.state);
             let epoch = Arc::clone(&self.epoch);
+            let events = events.clone();
             let mut rx = shutdown_rx.clone();
 
             tokio::spawn(async move {
-                // Run initial scan immediately
-                run_scan(&config, &state, &epoch).await;
+                // Phase 1: Probe seed hosts immediately (no discovery overhead)
+                if !config.seed_hosts.is_empty() {
+                    run_seed_scan(&config, &state, &epoch, &events).await;
+                }
 
+                // Phase 2: Full discovery scan (ARP, Tailscale, TB, etc.)
+                run_scan(&config, &state, &epoch, &events).await;
+
+                // Phase 3+: Periodic re-scan
                 loop {
                     tokio::select! {
                         _ = rx.changed() => {
@@ -93,7 +120,7 @@ impl ClusterMonitor {
                             break;
                         }
                         _ = tokio::time::sleep(config.scan_interval) => {
-                            run_scan(&config, &state, &epoch).await;
+                            run_scan(&config, &state, &epoch, &events).await;
                         }
                     }
                 }
@@ -105,12 +132,17 @@ impl ClusterMonitor {
             let config = self.config.clone();
             let state = Arc::clone(&self.state);
             let epoch = Arc::clone(&self.epoch);
+            let node_map = Arc::clone(&self.node_map);
+            let events = events.clone();
             let mut rx = shutdown_rx;
             let local = local_hostname;
 
             tokio::spawn(async move {
-                // Brief delay to let scan populate nodes first
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // Brief delay only if we need to wait for scan to discover
+                // nodes. With seed hosts, start immediately.
+                if config.seed_hosts.is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
 
                 loop {
                     tokio::select! {
@@ -119,7 +151,7 @@ impl ClusterMonitor {
                             break;
                         }
                         _ = tokio::time::sleep(config.poll_interval) => {
-                            poll_metrics(&config, &state, &epoch, &local).await;
+                            poll_metrics(&config, &state, &epoch, &local, &events, &node_map).await;
                         }
                     }
                 }
@@ -154,30 +186,35 @@ impl Drop for ClusterMonitor {
 }
 
 /// Collect metrics from all known nodes in parallel.
+/// Applies the NodeMap alias resolution to dedup the poll list.
 async fn poll_metrics(
     config: &ClusterConfig,
     state: &Arc<RwLock<ClusterState>>,
     epoch: &Arc<tokio::sync::watch::Sender<u64>>,
     local_hostname: &str,
+    events: &EventSink,
+    node_map: &Arc<RwLock<NodeMap>>,
 ) {
-    // Build the list of nodes to poll. If seed hosts are provided, use
-    // them exclusively — discovery finds the same machines by IP and
-    // causes duplicates. If no seeds, use scan results.
-    let hostnames: Vec<String> = {
-        if !config.seed_hosts.is_empty() {
+    // Build raw hostname list from scan results or seeds
+    let raw_hostnames: Vec<String> = {
+        let s = state.read().await;
+        if !s.scan_results.is_empty() {
+            s.scan_results
+                .iter()
+                .filter(|r| r.ssh_ok)
+                .map(|r| r.hostname.clone())
+                .collect()
+        } else if !config.seed_hosts.is_empty() {
             config.seed_hosts.clone()
         } else {
-            let s = state.read().await;
-            if !s.scan_results.is_empty() {
-                s.scan_results
-                    .iter()
-                    .filter(|r| r.ssh_ok)
-                    .map(|r| r.hostname.clone())
-                    .collect()
-            } else {
-                s.sorted_hostnames()
-            }
+            s.sorted_hostnames()
         }
+    };
+
+    // Apply alias map to resolve and deduplicate
+    let hostnames = {
+        let nm = node_map.read().await;
+        nm.resolve_dedup(&raw_hostnames)
     };
 
     if hostnames.is_empty() {
@@ -186,39 +223,45 @@ async fn poll_metrics(
     }
 
     debug!(count = hostnames.len(), "polling metrics from nodes");
+    events.emit(ClusterEvent::MetricsPollStarted { count: hostnames.len() });
 
-    // Collect from all nodes in parallel
     let futs: Vec<_> = hostnames
         .iter()
         .map(|h| {
             let is_local = h == local_hostname;
             let config = config.clone();
             let hostname = h.clone();
-            async move { collect_node_metrics(&hostname, &config, is_local).await }
+            let events = events.clone();
+            async move {
+                let snap = collect_node_metrics(&hostname, &config, is_local).await;
+                events.emit(ClusterEvent::MetricsReceived { hostname: hostname.clone() });
+                snap
+            }
         })
         .collect();
 
     let snapshots = futures::future::join_all(futs).await;
 
-    // Batch-update state (single write lock, single recalculate)
     {
         let mut s = state.write().await;
         s.update_nodes(snapshots);
     }
 
-    // Notify subscribers
     let _ = epoch.send_modify(|v| *v += 1);
 }
 
-/// Run a full cluster scan (discover + probe).
-async fn run_scan(
+/// Fast probe of seed/registry hosts only — no discovery overhead.
+/// Shows known nodes in the TUI immediately.
+async fn run_seed_scan(
     config: &ClusterConfig,
     state: &Arc<RwLock<ClusterState>>,
     epoch: &Arc<tokio::sync::watch::Sender<u64>>,
+    events: &EventSink,
 ) {
-    info!("starting cluster scan");
-    let results = scan_cluster(config).await;
-    info!(count = results.len(), "cluster scan complete");
+    info!("starting fast seed probe");
+    let results = scan_seeds(config, events).await;
+    let online = results.iter().filter(|r| r.ssh_ok).count();
+    info!(online, total = results.len(), "seed probe complete");
 
     {
         let mut s = state.write().await;
@@ -228,23 +271,42 @@ async fn run_scan(
     let _ = epoch.send_modify(|v| *v += 1);
 }
 
+/// Run a full cluster scan (discover + probe). Merges results into
+/// existing state so seed-probed nodes aren't lost.
+async fn run_scan(
+    config: &ClusterConfig,
+    state: &Arc<RwLock<ClusterState>>,
+    epoch: &Arc<tokio::sync::watch::Sender<u64>>,
+    events: &EventSink,
+) {
+    info!("starting cluster scan");
+    let results = scan_cluster(config, events).await;
+    info!(count = results.len(), "cluster scan complete");
+
+    {
+        let mut s = state.write().await;
+        s.merge_scan(results);
+    }
+
+    let _ = epoch.send_modify(|v| *v += 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DiscoveryMethod;
     use std::time::Duration;
 
     #[test]
     fn test_monitor_creation() {
         let config = ClusterConfig::default();
-        let monitor = ClusterMonitor::new(config);
+        let monitor = ClusterMonitor::new(config, NodeMap::default());
         assert!(!monitor.is_running());
     }
 
     #[test]
     fn test_monitor_state_shared() {
         let config = ClusterConfig::default();
-        let monitor = ClusterMonitor::new(config);
+        let monitor = ClusterMonitor::new(config, NodeMap::default());
         let s1 = monitor.state();
         let s2 = monitor.state();
         // Both point to the same allocation
@@ -254,7 +316,7 @@ mod tests {
     #[test]
     fn test_subscribe() {
         let config = ClusterConfig::default();
-        let monitor = ClusterMonitor::new(config);
+        let monitor = ClusterMonitor::new(config, NodeMap::default());
         let rx = monitor.subscribe();
         assert_eq!(*rx.borrow(), 0);
     }
@@ -269,7 +331,7 @@ mod tests {
             scan_interval: Duration::from_secs(60),
             ..ClusterConfig::default()
         };
-        let mut monitor = ClusterMonitor::new(config);
+        let mut monitor = ClusterMonitor::new(config, NodeMap::default());
         monitor.start();
         assert!(monitor.is_running());
 
@@ -279,7 +341,6 @@ mod tests {
         // State should have been updated (scan populates localhost)
         let state = monitor.state();
         let s = state.read().await;
-        // scan_cluster with empty discovery + seed "localhost" should produce something
         debug!("scan results: {:?}", s.scan_results.len());
 
         monitor.stop();

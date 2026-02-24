@@ -26,7 +26,7 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use r1o_cluster_monitor::{ClusterConfig, ClusterMonitor};
+//! use mlx_top_core::{ClusterConfig, ClusterMonitor};
 //!
 //! let config = ClusterConfig::default()
 //!     .with_seeds(vec!["m3u2".into(), "m3u1".into()]);
@@ -52,12 +52,15 @@ pub use collector::{
     collect_node_metrics, parse_footprint, parse_powermetrics_text, parse_ps_mlx,
     parse_vmstat_and_memsize, PowerMetricsResult,
 };
-pub use config::{ClusterConfig, DiscoveryMethod};
+pub use config::{ClusterConfig, DiscoveryMethod, NodeMap};
 pub use monitor::ClusterMonitor;
-pub use scanner::{DiscoveredPeer, discover_nodes, scan_cluster, scan_node};
+pub use scanner::{
+    DiscoveredPeer, discover_nodes, parse_ifconfig_all_ips, parse_ifconfig_bridges, scan_cluster,
+    scan_node, scan_node_fast, scan_seeds,
+};
 pub use ssh::{SshResult, local_run, ssh_run};
 pub use types::{
-    ClusterAggregates, DistributedBackend, MetricsHistory, MlxServerInfo, MonitorError,
-    NodeSnapshot, PortState, ProcessFramework, ProcessInfo, RdmaDevice, RdmaStatus, ScanResult,
-    TaskEnergy,
+    ClusterAggregates, ClusterEvent, DistributedBackend, EventSink, MetricsHistory, MlxServerInfo,
+    MonitorError, NodeSnapshot, PortState, ProcessFramework, ProcessInfo, RdmaDevice, RdmaLink,
+    RdmaStatus, ScanResult, TaskEnergy,
 };

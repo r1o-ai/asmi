@@ -28,6 +28,8 @@ pub struct DiscoveredPeer {
     pub ips: Vec<String>,
     pub discovery_source: String,
     pub thunderbolt_bridge: Option<String>,
+    /// Local IP on the thunderbolt bridge interface (our side of the link).
+    pub local_ip: Option<String>,
     pub link_speed: Option<String>,
 }
 
@@ -36,7 +38,10 @@ pub struct DiscoveredPeer {
 // ---------------------------------------------------------------------------
 
 /// Discover cluster nodes using configured methods. Returns deduplicated peers.
-pub async fn discover_nodes(config: &ClusterConfig) -> Vec<DiscoveredPeer> {
+///
+/// All discovery methods run **concurrently** — events stream in as each
+/// method completes independently.
+pub async fn discover_nodes(config: &ClusterConfig, events: &EventSink) -> Vec<DiscoveredPeer> {
     let mut all_peers: Vec<DiscoveredPeer> = Vec::new();
 
     // Add seed hosts first
@@ -46,48 +51,109 @@ pub async fn discover_nodes(config: &ClusterConfig) -> Vec<DiscoveredPeer> {
             ips: vec![seed.clone()],
             discovery_source: "seed".to_string(),
             thunderbolt_bridge: None,
+            local_ip: None,
             link_speed: None,
         });
     }
+    if !config.seed_hosts.is_empty() {
+        events.emit(ClusterEvent::DiscoveryFound {
+            method: "Seeds".to_string(),
+            count: config.seed_hosts.len(),
+        });
+    }
 
-    // Run each configured discovery method
+    if config.discovery.is_empty() {
+        return deduplicate_peers(all_peers);
+    }
+
+    // Emit all DiscoveryStarted events upfront
     for method in &config.discovery {
-        let discovered = match method {
-            DiscoveryMethod::ThunderboltBridge => discover_thunderbolt_bridge(config).await,
-            DiscoveryMethod::Tailscale => discover_tailscale().await,
-            DiscoveryMethod::Arp => discover_arp().await,
-            DiscoveryMethod::SystemProfiler => discover_system_profiler().await,
-            DiscoveryMethod::Bonjour => {
-                // TODO: dns-sd -B _ssh._tcp local. with timeout is tricky to
-                // implement reliably (it runs forever unless killed). Skipping
-                // for now — the other methods cover our use cases.
-                debug!("Bonjour discovery not yet implemented, skipping");
-                Vec::new()
-            }
-        };
+        events.emit(ClusterEvent::DiscoveryStarted {
+            method: discovery_method_name(method),
+        });
+    }
 
-        info!(
-            method = ?method,
-            count = discovered.len(),
-            "discovery method returned peers"
-        );
+    // Spawn all discovery methods concurrently
+    let handles: Vec<_> = config.discovery.iter().map(|method| {
+        let config = config.clone();
+        let events = events.clone();
+        let method = method.clone();
+        tokio::spawn(async move {
+            let method_name = discovery_method_name(&method);
+            let discovered = match method {
+                DiscoveryMethod::ThunderboltBridge => discover_thunderbolt_bridge(&config).await,
+                DiscoveryMethod::Tailscale => discover_tailscale().await,
+                DiscoveryMethod::Arp => discover_arp(true).await,
+                DiscoveryMethod::ArpAll => discover_arp(false).await,
+                DiscoveryMethod::SystemProfiler => discover_system_profiler().await,
+                DiscoveryMethod::Bonjour => {
+                    debug!("Bonjour discovery not yet implemented, skipping");
+                    Vec::new()
+                }
+            };
 
-        all_peers.extend(discovered);
+            info!(
+                method = method_name.as_str(),
+                count = discovered.len(),
+                "discovery method returned peers"
+            );
+
+            events.emit(ClusterEvent::DiscoveryFound {
+                method: method_name,
+                count: discovered.len(),
+            });
+
+            discovered
+        })
+    }).collect();
+
+    for handle in handles {
+        match handle.await {
+            Ok(peers) => all_peers.extend(peers),
+            Err(e) => warn!(error = %e, "discovery task panicked"),
+        }
     }
 
     deduplicate_peers(all_peers)
 }
 
+fn discovery_method_name(method: &DiscoveryMethod) -> String {
+    match method {
+        DiscoveryMethod::ThunderboltBridge => "Thunderbolt".to_string(),
+        DiscoveryMethod::Tailscale => "Tailscale".to_string(),
+        DiscoveryMethod::Arp => "ARP".to_string(),
+        DiscoveryMethod::ArpAll => "ARP (all)".to_string(),
+        DiscoveryMethod::SystemProfiler => "System Profiler".to_string(),
+        DiscoveryMethod::Bonjour => "Bonjour".to_string(),
+    }
+}
+
 /// Probe a single node for hardware info, RDMA status, and running servers.
+///
+/// If `skip_ping` is true, assumes the node is reachable and goes straight
+/// to SSH. Use for seed hosts and previously-known nodes.
 pub async fn scan_node(hostname: &str, config: &ClusterConfig) -> ScanResult {
-    // 1. Ping test
-    let ping_result = local_run(&format!("ping -c 1 -W 2 {} 2>/dev/null", hostname)).await;
-    let (reachable, latency_ms) = match ping_result {
-        Ok(ref r) if r.success => {
-            let latency = parse_ping_latency(&r.stdout);
-            (true, latency)
+    scan_node_inner(hostname, config, false).await
+}
+
+/// Like `scan_node` but skips the ping check for known-reachable hosts.
+pub async fn scan_node_fast(hostname: &str, config: &ClusterConfig) -> ScanResult {
+    scan_node_inner(hostname, config, true).await
+}
+
+async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool) -> ScanResult {
+    // 1. Ping test (skipped for known hosts)
+    let (reachable, latency_ms) = if skip_ping {
+        (true, None)
+    } else {
+        let ping_result = local_run(&format!("ping -c 1 -W 2 {} 2>/dev/null", hostname)).await;
+        match ping_result {
+            Ok(ref r) if r.success => {
+                let latency = parse_ping_latency(&r.stdout);
+                (true, latency)
+            }
+            _ => (false, None),
         }
-        _ => (false, None),
     };
 
     if !reachable {
@@ -102,29 +168,38 @@ pub async fn scan_node(hostname: &str, config: &ClusterConfig) -> ScanResult {
             rdma: None,
             mlx_servers: Vec::new(),
             latency_ms: None,
+            link_speed: None,
         };
     }
 
-    // 2. SSH hardware probe
-    let hw_cmd = "sysctl -n hw.memsize 2>/dev/null; \
+    // 2. SSH hardware probe (includes hostname -s for IP resolution)
+    let hw_cmd = "hostname -s 2>/dev/null; \
+                  sysctl -n hw.memsize 2>/dev/null; \
                   sysctl -n machdep.cpu.brand_string 2>/dev/null; \
                   sysctl -n hw.ncpu 2>/dev/null";
     let hw_result = ssh_run(hostname, hw_cmd, config).await;
-    let (ssh_ok, chip, ram_gb, gpu_cores) = match hw_result {
+    let (ssh_ok, resolved_hostname, chip, ram_gb, gpu_cores) = match hw_result {
         Ok(ref r) if r.success => {
             let lines: Vec<&str> = r.stdout.lines().collect();
-            let mem_bytes: Option<u64> = lines.first().and_then(|s| s.trim().parse().ok());
+            let resolved = lines.first()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let mem_bytes: Option<u64> = lines.get(1).and_then(|s| s.trim().parse().ok());
             let ram = mem_bytes.map(|b| b / (1024 * 1024 * 1024));
-            let chip_name = lines.get(1).map(|s| s.trim().to_string());
-            let ncpu: Option<u32> = lines.get(2).and_then(|s| s.trim().parse().ok());
-            (true, chip_name, ram, ncpu)
+            let chip_name = lines.get(2).map(|s| s.trim().to_string());
+            let ncpu: Option<u32> = lines.get(3).and_then(|s| s.trim().parse().ok());
+            (true, resolved, chip_name, ram, ncpu)
         }
-        Ok(_) => (false, None, None, None),
+        Ok(_) => (false, None, None, None, None),
         Err(e) => {
             debug!(hostname, error = %e, "SSH hardware probe failed");
-            (false, None, None, None)
+            (false, None, None, None, None)
         }
     };
+
+    // Use SSH-resolved hostname if we probed by IP
+    let final_hostname = resolved_hostname
+        .unwrap_or_else(|| hostname.to_string());
 
     // 3. RDMA check
     let rdma = if ssh_ok {
@@ -171,7 +246,7 @@ pub async fn scan_node(hostname: &str, config: &ClusterConfig) -> ScanResult {
     }
 
     ScanResult {
-        hostname: hostname.to_string(),
+        hostname: final_hostname,
         reachable,
         ssh_ok,
         chip,
@@ -180,37 +255,196 @@ pub async fn scan_node(hostname: &str, config: &ClusterConfig) -> ScanResult {
         rdma,
         mlx_servers,
         latency_ms,
+        link_speed: None,
     }
 }
 
+/// Quick probe of seed hosts only — no discovery. Used for the fast first
+/// phase of hierarchical scanning to show known nodes immediately.
+/// Emits `AliasDiscovered` for any seed that resolves to a different canonical name.
+pub async fn scan_seeds(config: &ClusterConfig, events: &EventSink) -> Vec<ScanResult> {
+    if config.seed_hosts.is_empty() {
+        return Vec::new();
+    }
+
+    info!(count = config.seed_hosts.len(), "fast-probing seed hosts");
+    events.emit(ClusterEvent::ProbingStarted {
+        count: config.seed_hosts.len(),
+    });
+
+    let handles: Vec<_> = config
+        .seed_hosts
+        .iter()
+        .map(|host| {
+            let config = config.clone();
+            let events = events.clone();
+            let host = host.clone();
+            tokio::spawn(async move {
+                let result = scan_node_fast(&host, &config).await;
+                events.emit(ClusterEvent::NodeProbed {
+                    hostname: result.hostname.clone(),
+                    online: result.ssh_ok,
+                    chip: result.chip.clone(),
+                    ram_gb: result.ram_gb,
+                });
+                // Emit alias if the seed resolved to a different canonical name
+                if result.ssh_ok && host != result.hostname {
+                    events.emit(ClusterEvent::AliasDiscovered {
+                        alias: host.clone(),
+                        canonical: result.hostname.clone(),
+                    });
+                }
+                result
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(result) => results.push(result),
+            Err(e) => warn!(error = %e, "seed scan task panicked"),
+        }
+    }
+
+    let online = results.iter().filter(|r| r.ssh_ok).count();
+    events.emit(ClusterEvent::ScanComplete {
+        online,
+        total: results.len(),
+    });
+    results
+}
+
 /// Full cluster scan: discover + probe all found nodes.
-pub async fn scan_cluster(config: &ClusterConfig) -> Vec<ScanResult> {
-    let peers = discover_nodes(config).await;
+/// Emits `AliasDiscovered` events for every hostname/IP that resolves to a
+/// different canonical SSH name — this auto-populates the persistent NodeMap.
+pub async fn scan_cluster(config: &ClusterConfig, events: &EventSink) -> Vec<ScanResult> {
+    let seeds: std::collections::HashSet<String> = config.seed_hosts.iter().cloned().collect();
+    let peers = discover_nodes(config, events).await;
     info!(count = peers.len(), "discovered peers, starting scan");
+    events.emit(ClusterEvent::ProbingStarted { count: peers.len() });
 
     let mut results = Vec::with_capacity(peers.len());
 
-    // Scan all peers concurrently
+    // Scan all peers concurrently, returning (peer, probed_host, result) so we
+    // can extract alias mappings after scanning.
     let handles: Vec<_> = peers
         .into_iter()
         .map(|peer| {
             let config = config.clone();
+            let events = events.clone();
+            let is_seed = seeds.contains(&peer.hostname)
+                || peer.ips.iter().any(|ip| seeds.contains(ip));
             let host = if peer.ips.is_empty() {
                 peer.hostname.clone()
             } else {
-                // Prefer the first IP for connectivity
                 peer.ips[0].clone()
             };
-            tokio::spawn(async move { scan_node(&host, &config).await })
+            tokio::spawn(async move {
+                let result = if is_seed {
+                    scan_node_fast(&host, &config).await
+                } else {
+                    scan_node(&host, &config).await
+                };
+                events.emit(ClusterEvent::NodeProbed {
+                    hostname: result.hostname.clone(),
+                    online: result.ssh_ok,
+                    chip: result.chip.clone(),
+                    ram_gb: result.ram_gb,
+                });
+                (peer, host, result)
+            })
         })
         .collect();
 
     for handle in handles {
         match handle.await {
-            Ok(result) => results.push(result),
+            Ok((peer, probed_host, result)) => {
+                // Emit alias mappings for any name that resolved differently
+                if result.ssh_ok {
+                    if probed_host != result.hostname {
+                        events.emit(ClusterEvent::AliasDiscovered {
+                            alias: probed_host,
+                            canonical: result.hostname.clone(),
+                        });
+                    }
+                    if peer.hostname != result.hostname {
+                        events.emit(ClusterEvent::AliasDiscovered {
+                            alias: peer.hostname,
+                            canonical: result.hostname.clone(),
+                        });
+                    }
+                    // Collect TB bridge IPs (169.254.x.x) for RDMA
+                    let tb_ips: Vec<String> = peer
+                        .ips
+                        .iter()
+                        .filter(|ip| ip.starts_with("169.254."))
+                        .cloned()
+                        .collect();
+                    if !tb_ips.is_empty() {
+                        events.emit(ClusterEvent::RdmaIpsDiscovered {
+                            canonical: result.hostname.clone(),
+                            ips: tb_ips.clone(),
+                            interface: peer.thunderbolt_bridge.clone(),
+                        });
+                        // Emit RDMA link mapping if we know the local interface + IP
+                        if let (Some(iface), Some(local_ip)) =
+                            (&peer.thunderbolt_bridge, &peer.local_ip)
+                        {
+                            for remote_ip in &tb_ips {
+                                // Derive RDMA device name: en3 → rdma_en3
+                                let rdma_dev_name = format!("rdma_{iface}");
+                                events.emit(ClusterEvent::RdmaLinkDiscovered {
+                                    local_interface: iface.clone(),
+                                    local_ip: local_ip.clone(),
+                                    remote_ip: remote_ip.clone(),
+                                    remote_hostname: result.hostname.clone(),
+                                    rdma_device: Some(rdma_dev_name),
+                                    port_state: None, // filled in post-scan correlation
+                                });
+                            }
+                        }
+                    }
+                    for ip in peer.ips {
+                        if ip != result.hostname {
+                            events.emit(ClusterEvent::AliasDiscovered {
+                                alias: ip,
+                                canonical: result.hostname.clone(),
+                            });
+                        }
+                    }
+                }
+                let mut result = result;
+                result.link_speed = peer.link_speed;
+                results.push(result);
+            }
             Err(e) => warn!(error = %e, "scan task panicked"),
         }
     }
+
+    // Post-scan: get local RDMA device states to correlate with links.
+    // Run `rdma_ctl status; ibv_devinfo` locally to get our own RDMA info.
+    let local_rdma = match local_run("rdma_ctl status 2>/dev/null; echo '---'; ibv_devices 2>/dev/null; echo '---'; ibv_devinfo 2>/dev/null").await {
+        Ok(ref r) if r.has_output() => Some(parse_rdma_status(&r.stdout)),
+        _ => None,
+    };
+    if let Some(ref rdma) = local_rdma {
+        // Re-emit links with port state from local RDMA devices
+        // This is done via the CorrelateRdmaLinks approach: find device by name
+        for device in &rdma.devices {
+            // rdma_en3 → en3
+            if let Some(iface) = device.name.strip_prefix("rdma_") {
+                events.emit(ClusterEvent::RdmaDeviceCorrelated {
+                    interface: iface.to_string(),
+                    rdma_device: device.name.clone(),
+                    port_state: device.port_state,
+                });
+            }
+        }
+    }
+
+    let online = results.iter().filter(|r| r.ssh_ok).count();
+    events.emit(ClusterEvent::ScanComplete { online, total: results.len() });
 
     results
 }
@@ -219,41 +453,53 @@ pub async fn scan_cluster(config: &ClusterConfig) -> Vec<ScanResult> {
 // Discovery implementations
 // ---------------------------------------------------------------------------
 
-/// Discover nodes via Thunderbolt bridge interfaces (169.254.x.x on en*).
+/// Discover nodes via Thunderbolt bridge interfaces.
 ///
-/// Runs `ifconfig` locally, finds interfaces with link-local addresses, then
-/// cross-references with `arp -a` to find peer IPs on those interfaces. For
-/// each peer IP, SSHs to get the hostname.
+/// Two-pass approach:
+/// 1. `ifconfig` → find interfaces with 169.254.x.x local IPs (obvious TB bridges)
+/// 2. `arp -a` → find any `en*` interface carrying 169.254.x.x *peers* (catches
+///    interfaces like en4 that have a non-link-local local IP but still carry TB traffic)
+///
+/// For each discovered peer IP, SSHs to get the remote hostname.
 async fn discover_thunderbolt_bridge(config: &ClusterConfig) -> Vec<DiscoveredPeer> {
     let ifconfig = match local_run("ifconfig 2>/dev/null").await {
         Ok(r) if r.has_output() => r.stdout,
         _ => return Vec::new(),
     };
 
+    // Pass 1: interfaces with 169.254 local IPs
     let bridges = parse_ifconfig_bridges(&ifconfig);
-    if bridges.is_empty() {
-        debug!("no thunderbolt bridge interfaces found");
-        return Vec::new();
-    }
+    // Also collect ALL interface IPs for skipping our own addresses
+    let all_iface_ips = parse_ifconfig_all_ips(&ifconfig);
 
-    debug!(count = bridges.len(), "found thunderbolt bridge interfaces");
+    debug!(
+        bridge_count = bridges.len(),
+        all_iface_count = all_iface_ips.len(),
+        "parsed ifconfig"
+    );
 
-    // Get ARP table to find peer IPs on these interfaces
+    // Get ARP table to find peer IPs
     let arp_output = match local_run("arp -a 2>/dev/null").await {
         Ok(r) if r.has_output() => r.stdout,
         _ => return Vec::new(),
     };
 
     let mut peers = Vec::new();
+    let mut seen_ips = std::collections::HashSet::new();
 
-    // For each bridge interface, find peer IPs in the ARP table that are on
-    // the same interface and in 169.254.x.x range (but not our own IP)
+    // Build set of our own IPs (any local address on any interface)
+    let our_ips: std::collections::HashSet<&str> = all_iface_ips
+        .values()
+        .flat_map(|ips| ips.iter().map(|s| s.as_str()))
+        .collect();
+
+    // Map from interface → local 169.254 IP (for RDMA link mapping)
     let bridge_ips: HashMap<String, String> = bridges.iter().cloned().collect();
 
+    let arp_re = Regex::new(r"(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+(\S+)\s+on\s+(\S+)")
+        .expect("valid regex");
+
     for line in arp_output.lines() {
-        // Parse: hostname (ip) at mac on interface [...]
-        let arp_re = Regex::new(r"(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+(\S+)\s+on\s+(\S+)")
-            .expect("valid regex");
         if let Some(caps) = arp_re.captures(line) {
             let _arp_host = caps.get(1).unwrap().as_str();
             let ip = caps.get(2).unwrap().as_str();
@@ -265,18 +511,28 @@ async fn discover_thunderbolt_bridge(config: &ClusterConfig) -> Vec<DiscoveredPe
                 continue;
             }
 
-            // Only 169.254.x.x addresses on our bridge interfaces
+            // Only 169.254.x.x peer addresses (link-local = TB direct-connect)
             if !ip.starts_with("169.254.") {
                 continue;
             }
 
-            // Must be on one of our TB bridge interfaces
-            if !bridge_ips.contains_key(iface) {
+            // Must be on an en* interface (Thunderbolt bridges are always en*)
+            if !iface.starts_with("en") {
                 continue;
             }
 
-            // Skip our own IPs
-            if bridge_ips.values().any(|own_ip| own_ip == ip) {
+            // Skip our own IPs (detected from ifconfig)
+            if our_ips.contains(ip) {
+                continue;
+            }
+
+            // Skip permanent (self) ARP entries
+            if line.contains("permanent") {
+                continue;
+            }
+
+            // Dedup by IP
+            if !seen_ips.insert(ip.to_string()) {
                 continue;
             }
 
@@ -286,11 +542,22 @@ async fn discover_thunderbolt_bridge(config: &ClusterConfig) -> Vec<DiscoveredPe
                 _ => ip.to_string(),
             };
 
+            // Local IP: prefer 169.254 address from bridge_ips, else grab from all_iface_ips
+            let local_ip = bridge_ips
+                .get(iface)
+                .cloned()
+                .or_else(|| {
+                    all_iface_ips
+                        .get(iface)
+                        .and_then(|ips| ips.first().cloned())
+                });
+
             peers.push(DiscoveredPeer {
                 hostname,
                 ips: vec![ip.to_string()],
                 discovery_source: "thunderbolt-bridge".to_string(),
                 thunderbolt_bridge: Some(iface.to_string()),
+                local_ip,
                 link_speed: None,
             });
         }
@@ -316,10 +583,14 @@ async fn discover_tailscale() -> Vec<DiscoveredPeer> {
 }
 
 /// Discover nodes via ARP table.
-async fn discover_arp() -> Vec<DiscoveredPeer> {
+///
+/// When `filter_non_ssh` is true, skips hostnames that are unlikely to be
+/// SSH-able Mac/cluster nodes (IoT devices, phones, etc.) to avoid 10s
+/// SSH timeouts that stall the scan.
+async fn discover_arp(filter_non_ssh: bool) -> Vec<DiscoveredPeer> {
     let result = local_run("arp -a 2>/dev/null").await;
     match result {
-        Ok(ref r) if r.has_output() => parse_arp_table(&r.stdout),
+        Ok(ref r) if r.has_output() => parse_arp_table(&r.stdout, filter_non_ssh),
         _ => Vec::new(),
     }
 }
@@ -353,6 +624,31 @@ pub fn parse_ifconfig_bridges(text: &str) -> Vec<(String, String)> {
             if let Some(ref iface) = current_iface {
                 let ip = caps.get(1).unwrap().as_str().to_string();
                 results.push((iface.clone(), ip));
+            }
+        }
+    }
+
+    results
+}
+
+/// Parse `ifconfig` output to get ALL IPv4 addresses per interface.
+/// Returns `interface_name → [ip1, ip2, ...]`.
+/// Used to identify our own IPs for ARP filtering and to find local IPs on
+/// non-link-local TB interfaces (e.g., en4 with 192.168.60.1).
+pub fn parse_ifconfig_all_ips(text: &str) -> HashMap<String, Vec<String>> {
+    let mut results: HashMap<String, Vec<String>> = HashMap::new();
+    let mut current_iface: Option<String> = None;
+
+    let iface_re = Regex::new(r"^(\w+):\s+flags=").expect("valid regex");
+    let inet_re = Regex::new(r"^\s+inet\s+(\d+\.\d+\.\d+\.\d+)\s").expect("valid regex");
+
+    for line in text.lines() {
+        if let Some(caps) = iface_re.captures(line) {
+            current_iface = Some(caps.get(1).unwrap().as_str().to_string());
+        } else if let Some(caps) = inet_re.captures(line) {
+            if let Some(ref iface) = current_iface {
+                let ip = caps.get(1).unwrap().as_str().to_string();
+                results.entry(iface.clone()).or_default().push(ip);
             }
         }
     }
@@ -420,13 +716,18 @@ fn extract_tailscale_peer(value: &serde_json::Value) -> Option<DiscoveredPeer> {
         ips,
         discovery_source: "tailscale".to_string(),
         thunderbolt_bridge: None,
+        local_ip: None,
         link_speed: None,
     })
 }
 
 /// Parse `arp -a` output to find named hosts (skip `?` entries).
 /// Format: `hostname (ip) at mac on interface [...]`
-pub fn parse_arp_table(text: &str) -> Vec<DiscoveredPeer> {
+///
+/// When `filter_non_ssh` is true, only keeps entries on 169.254.x.x
+/// (Thunderbolt link-local) — these are always direct-connected Macs.
+/// LAN entries are deferred to `ssh_prefilter` which tests connectivity.
+pub fn parse_arp_table(text: &str, filter_non_ssh: bool) -> Vec<DiscoveredPeer> {
     let re = Regex::new(r"^(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+(\S+)\s+on\s+(\S+)")
         .expect("valid regex");
 
@@ -449,6 +750,12 @@ pub fn parse_arp_table(text: &str) -> Vec<DiscoveredPeer> {
             // Normalize hostname: strip ".local" suffix
             let normalized = hostname.strip_suffix(".local").unwrap_or(hostname);
 
+            // When filtering, only keep link-local (169.254 = TB direct-connect).
+            // LAN entries go through ssh_prefilter separately.
+            if filter_non_ssh && !ip.starts_with("169.254.") {
+                continue;
+            }
+
             let entry = peers_map
                 .entry(normalized.to_string())
                 .or_insert_with(|| DiscoveredPeer {
@@ -456,6 +763,7 @@ pub fn parse_arp_table(text: &str) -> Vec<DiscoveredPeer> {
                     ips: Vec::new(),
                     discovery_source: "arp".to_string(),
                     thunderbolt_bridge: None,
+                    local_ip: None,
                     link_speed: None,
                 });
 
@@ -580,6 +888,7 @@ fn parse_system_profiler(text: &str) -> Vec<DiscoveredPeer> {
                         ips: Vec::new(), // System profiler doesn't give IPs
                         discovery_source: "system-profiler".to_string(),
                         thunderbolt_bridge: None,
+                        local_ip: None,
                         link_speed: current_speed.clone(),
                     });
                 }
@@ -699,6 +1008,7 @@ fn deduplicate_peers(peers: Vec<DiscoveredPeer>) -> Vec<DiscoveredPeer> {
             ips: Vec::new(),
             discovery_source: peer.discovery_source.clone(),
             thunderbolt_bridge: None,
+            local_ip: None,
             link_speed: None,
         });
 
@@ -712,6 +1022,9 @@ fn deduplicate_peers(peers: Vec<DiscoveredPeer>) -> Vec<DiscoveredPeer> {
         // Prefer non-None metadata
         if entry.thunderbolt_bridge.is_none() {
             entry.thunderbolt_bridge = peer.thunderbolt_bridge;
+        }
+        if entry.local_ip.is_none() {
+            entry.local_ip = peer.local_ip;
         }
         if entry.link_speed.is_none() {
             entry.link_speed = peer.link_speed;
@@ -795,7 +1108,7 @@ mod tests {
     #[test]
     fn test_parse_arp_table() {
         let text = include_str!("../testdata/arp-table.txt");
-        let peers = parse_arp_table(text);
+        let peers = parse_arp_table(text, false);
 
         let hostnames: Vec<&str> = peers.iter().map(|p| p.hostname.as_str()).collect();
 
@@ -838,6 +1151,31 @@ mod tests {
             "m3u1 should have at least 2 IPs, got: {:?}",
             m3u1.ips
         );
+    }
+
+    #[test]
+    fn test_parse_arp_table_filtered() {
+        let text = include_str!("../testdata/arp-table.txt");
+        let peers = parse_arp_table(text, true);
+
+        let hostnames: Vec<&str> = peers.iter().map(|p| p.hostname.as_str()).collect();
+
+        // Should still find Mac/cluster nodes
+        assert!(hostnames.contains(&"m3u1"), "should find m3u1: {hostnames:?}");
+        assert!(hostnames.contains(&"m3u2"), "should find m3u2: {hostnames:?}");
+        assert!(hostnames.contains(&"m4m1"), "should find m4m1: {hostnames:?}");
+
+        // Should NOT include non-Mac devices (samsung, lifx, amazon, iphone, etc.)
+        for peer in &peers {
+            let lower = peer.hostname.to_lowercase();
+            assert!(
+                !lower.contains("samsung") && !lower.contains("lifx")
+                    && !lower.contains("amazon") && !lower.contains("iphone")
+                    && !lower.contains("docsis"),
+                "filtered ARP should not include non-Mac device: {}",
+                peer.hostname
+            );
+        }
     }
 
     #[test]
@@ -898,6 +1236,29 @@ mod tests {
         // Check specific IPs
         let en3_ip = bridges.iter().find(|(i, _)| i == "en3").unwrap();
         assert_eq!(en3_ip.1, "169.254.19.163");
+    }
+
+    #[test]
+    fn test_parse_ifconfig_all_ips() {
+        let text = include_str!("../testdata/ifconfig-bridges.txt");
+        let all_ips = parse_ifconfig_all_ips(text);
+
+        // en4 should be found with its 192.168.60.1 address (the blind spot fix)
+        assert!(
+            all_ips.contains_key("en4"),
+            "should find en4: {all_ips:?}"
+        );
+        assert!(
+            all_ips["en4"].contains(&"192.168.60.1".to_string()),
+            "en4 should have 192.168.60.1: {:?}",
+            all_ips["en4"]
+        );
+
+        // en3 should have 169.254.19.163
+        assert!(all_ips["en3"].contains(&"169.254.19.163".to_string()));
+
+        // en5 should have 169.254.124.8
+        assert!(all_ips["en5"].contains(&"169.254.124.8".to_string()));
     }
 
     #[test]
@@ -972,6 +1333,7 @@ mod tests {
                 ips: vec!["169.254.118.6".to_string()],
                 discovery_source: "arp".to_string(),
                 thunderbolt_bridge: Some("en4".to_string()),
+                local_ip: Some("169.254.19.163".to_string()),
                 link_speed: None,
             },
             DiscoveredPeer {
@@ -979,6 +1341,7 @@ mod tests {
                 ips: vec!["100.127.90.10".to_string()],
                 discovery_source: "tailscale".to_string(),
                 thunderbolt_bridge: None,
+                local_ip: None,
                 link_speed: None,
             },
         ];

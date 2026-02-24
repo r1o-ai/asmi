@@ -1,10 +1,10 @@
 [package]
-name = "apple-smi-core"
+name = "mlx-top-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Core library for apple-smi — SSH-based Apple Silicon cluster metrics"
+description = "Core library for mlx-top — SSH-based Apple Silicon cluster metrics"
 
 [dependencies]
 tokio = { version = "1", features = ["process", "time", "sync", "macros"] }
@@ -16,6 +16,7 @@ thiserror = "2"
 tracing = "0.1"
 futures = "0.3"
 whoami = "1"
+dirs = "6"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
