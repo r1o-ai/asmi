@@ -26,7 +26,7 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use mlx_top_core::{ClusterConfig, ClusterMonitor};
+//! use asmi_core::{ClusterConfig, ClusterMonitor};
 //!
 //! let config = ClusterConfig::default()
 //!     .with_seeds(vec!["m3u2".into(), "m3u1".into()]);

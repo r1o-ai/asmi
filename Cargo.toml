@@ -10,24 +10,24 @@ license = "MIT"
 authors = ["MA"]
 
 [package]
-name = "mlx-top"
+name = "asmi"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "MLX cluster monitor — like nvidia-smi + htop for Apple Silicon"
-
-[[bin]]
-name = "mlx-top"
-path = "src/main.rs"
+description = "Apple Silicon cluster monitor — like nvidia-smi + htop for Mac"
 
 [[bin]]
 name = "asmi"
 path = "src/main.rs"
 
+[[bin]]
+name = "mlx-top"
+path = "src/main.rs"
+
 [dependencies]
-mlx-top-core = { path = "crates/cluster-monitor" }
+asmi-core = { path = "crates/cluster-monitor" }
 ratatui = "0.30"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }

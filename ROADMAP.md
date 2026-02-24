@@ -1,8 +1,8 @@
-# mlx-top / asmi Roadmap
+# asmi Roadmap
 
 ## v0.1 — Initial Release (shipped)
 
-- Two binaries: `mlx-top` (primary), `asmi` (alias — same code, different name)
+- Primary binary: `asmi` (also installs `mlx-top` alias for backward compatibility)
 - Clap CLI: `--hosts`, `--scan`, `--format`, `--watch`, `--interval`
 - Smart TTY detection (tui if interactive, table if piped)
 - Streaming/ephemeral output (`--watch --format table|json`)
@@ -77,7 +77,7 @@ Coverage of nvidia-smi features (35 applicable, excluding 11 N/A):
 | Partial | 8 | 23% |
 | Feasible (planned) | 6 | 17% |
 
-Features mlx-top/asmi has that nvidia-smi lacks:
+Features asmi has that nvidia-smi lacks:
 - Cluster-native multi-node monitoring (nvidia-smi is single-host only)
 - Dynamic node discovery (5 methods)
 - ML framework-aware process detection (model name, serving port)

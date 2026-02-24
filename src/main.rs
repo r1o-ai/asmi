@@ -5,7 +5,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use mlx_top_core::{
+use asmi_core::{
     ClusterConfig, ClusterEvent, ClusterMonitor, ClusterState, DiscoveryMethod, NodeMap, RdmaLink,
 };
 use ratatui::{
@@ -20,9 +20,9 @@ use std::io::{stdout, IsTerminal};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// MLX cluster monitor — like nvidia-smi + htop for Apple Silicon.
+/// Apple Silicon cluster monitor — like nvidia-smi + htop for Mac.
 ///
-/// Available as both `mlx-top` and `asmi`.
+/// Also available as `mlx-top` for backward compatibility.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
@@ -62,7 +62,7 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Manage mlx-top metrics daemons on cluster nodes.
+    /// Manage asmi metrics daemons on cluster nodes.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
@@ -257,7 +257,7 @@ impl ActivityLog {
                 port_state,
                 ..
             } => {
-                let color = if *port_state == mlx_top_core::PortState::Active {
+                let color = if *port_state == asmi_core::PortState::Active {
                     Color::Green
                 } else {
                     Color::Red
@@ -306,7 +306,7 @@ fn bin_name() -> &'static str {
             .next()
             .as_deref()
             .and_then(|s| s.rsplit('/').next())
-            .unwrap_or("mlx-top")
+            .unwrap_or("asmi")
             .to_string()
     })
 }
@@ -336,9 +336,9 @@ async fn main() -> Result<()> {
     let watch = cli.watch || matches!(format, Format::Tui);
 
     // Init tracing to file (never to stdout — corrupts TUI)
-    let log_file = std::fs::File::create("/tmp/mlx-top.log")?;
+    let log_file = std::fs::File::create("/tmp/asmi.log")?;
     tracing_subscriber::fmt()
-        .with_env_filter("mlx_top_core=info")
+        .with_env_filter("asmi_core=info")
         .with_writer(std::sync::Mutex::new(log_file))
         .with_ansi(false)
         .init();
@@ -920,7 +920,7 @@ fn render_nodes(
                 // RDMA info: show links to this node with state
                 let (rdma_info, rdma_color) = {
                     let scan = state.scan_results.iter().find(|r| r.hostname == *name);
-                    let links: Vec<&mlx_top_core::RdmaLink> = node_map
+                    let links: Vec<&asmi_core::RdmaLink> = node_map
                         .rdma_links
                         .iter()
                         .filter(|l| l.remote_hostname == *name)
@@ -931,15 +931,15 @@ fn render_nodes(
                         // Flag 192.168 local IPs — these are non-link-local and
                         // may indicate the TB interface needs re-seating
                         let has_active = links.iter().any(|l| {
-                            l.port_state == Some(mlx_top_core::PortState::Active)
+                            l.port_state == Some(asmi_core::PortState::Active)
                         });
                         let has_192 = links.iter().any(|l| l.local_ip.starts_with("192.168."));
                         let info = links
                             .iter()
                             .map(|l| {
                                 let state_char = match (l.rdma_device.as_ref(), l.port_state) {
-                                    (Some(_), Some(mlx_top_core::PortState::Active)) => "\u{2191}", // ↑ RDMA active
-                                    (Some(_), Some(mlx_top_core::PortState::Down)) => "\u{2193}",   // ↓ RDMA down
+                                    (Some(_), Some(asmi_core::PortState::Active)) => "\u{2191}", // ↑ RDMA active
+                                    (Some(_), Some(asmi_core::PortState::Down)) => "\u{2193}",   // ↓ RDMA down
                                     (Some(_), _) => "?",            // RDMA device exists, state unknown
                                     (None, _) => "\u{2014}",       // — no RDMA device (TB-only link)
                                 };
@@ -1084,8 +1084,8 @@ fn render_node_summary(
             .iter()
             .map(|l| {
                 let st = match (l.rdma_device.as_ref(), l.port_state) {
-                    (Some(_), Some(mlx_top_core::PortState::Active)) => "\u{2191}",
-                    (Some(_), Some(mlx_top_core::PortState::Down)) => "\u{2193}",
+                    (Some(_), Some(asmi_core::PortState::Active)) => "\u{2191}",
+                    (Some(_), Some(asmi_core::PortState::Down)) => "\u{2193}",
                     _ => "\u{2014}",
                 };
                 format!("{}{st}", l.local_interface)
@@ -1520,9 +1520,9 @@ const DAEMON_NODES: &[(&str, &str)] = &[
     ("m3u3", "m3u3.local"),
     ("m4m1", "m4m1.local"),
 ];
-const DAEMON_PLIST: &str = "com.r1o.mlx-top-daemon";
+const DAEMON_PLIST: &str = "com.r1o.asmi-daemon";
 
-/// Manage mlx-top daemons across cluster nodes.
+/// Manage asmi daemons across cluster nodes.
 async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
     let local_hostname = std::process::Command::new("hostname")
         .arg("-s")
@@ -1603,17 +1603,17 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
                 .and_then(|p| {
                     // If running from target/release or target/debug, find sibling mlx-top
                     let dir = p.parent()?;
-                    let release = dir.join("mlx-top");
+                    let release = dir.join("asmi");
                     if release.exists() { return Some(release); }
                     // Try ../release/mlx-top from debug builds
-                    let up = dir.parent()?.join("release").join("mlx-top");
+                    let up = dir.parent()?.join("release").join("asmi");
                     if up.exists() { return Some(up); }
                     None
                 })
                 .unwrap_or_else(|| {
                     dirs::home_dir()
                         .unwrap_or_default()
-                        .join("Projects/Personal/apple-smi/target/release/mlx-top")
+                        .join("Projects/Personal/apple-smi/target/release/asmi")
                 });
             let plist_path = dirs::home_dir()
                 .unwrap_or_default()
@@ -1633,7 +1633,7 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
                 let ok1 = std::process::Command::new("scp")
                     .args(["-o", "ConnectTimeout=5",
                         bin.to_str().unwrap_or(""),
-                        &format!("{}:~/.cargo/bin/mlx-top", name)])
+                        &format!("{}:~/.cargo/bin/asmi", name)])
                     .status().map(|s| s.success()).unwrap_or(false);
                 let ok2 = std::process::Command::new("scp")
                     .args(["-o", "ConnectTimeout=5",
@@ -1645,7 +1645,7 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
         }
         DaemonAction::Logs { node } => {
             let target = node.as_deref().unwrap_or(&local_hostname);
-            let cmd = "tail -50 /tmp/mlx-top-daemon.log";
+            let cmd = "tail -50 /tmp/asmi-daemon.log";
             if target == local_hostname || target == "m3u2" {
                 let _ = std::process::Command::new("sh")
                     .args(["-c", cmd])
@@ -1678,7 +1678,7 @@ fn run_on_node(node: &str, local_hostname: &str, cmd: &str) -> bool {
     }
 }
 
-/// Run mlx-top as an HTTP daemon serving local node metrics.
+/// Run asmi as an HTTP daemon serving local node metrics.
 ///
 /// Polls local metrics every `interval` seconds and serves them via:
 /// - GET /metrics   → full NodeSnapshot JSON
@@ -1687,7 +1687,7 @@ fn run_on_node(node: &str, local_hostname: &str, cmd: &str) -> bool {
 async fn run_serve(port: u16, interval: u64) -> Result<()> {
     // Init tracing to stderr (no TUI to corrupt)
     tracing_subscriber::fmt()
-        .with_env_filter("mlx_top_core=info,mlx_top=info")
+        .with_env_filter("asmi_core=info,asmi=info")
         .with_ansi(true)
         .init();
 
@@ -1709,7 +1709,7 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
         .with_poll_interval(Duration::from_secs(interval));
 
     // Shared state: latest snapshot from this node
-    let snapshot: Arc<tokio::sync::RwLock<Option<mlx_top_core::NodeSnapshot>>> =
+    let snapshot: Arc<tokio::sync::RwLock<Option<asmi_core::NodeSnapshot>>> =
         Arc::new(tokio::sync::RwLock::new(None));
     let started_at = std::time::Instant::now();
 
@@ -1720,7 +1720,7 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
         let hostname = hostname.clone();
         tokio::spawn(async move {
             loop {
-                let snap = mlx_top_core::collect_node_metrics(&hostname, &config, true).await;
+                let snap = asmi_core::collect_node_metrics(&hostname, &config, true).await;
                 tracing::debug!(
                     cpu = format!("{:.1}%", snap.cpu_percent),
                     gpu = format!("{:.1}%", snap.gpu_percent),
@@ -1739,7 +1739,7 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
 
     #[derive(Clone)]
     struct AppState {
-        snapshot: Arc<tokio::sync::RwLock<Option<mlx_top_core::NodeSnapshot>>>,
+        snapshot: Arc<tokio::sync::RwLock<Option<asmi_core::NodeSnapshot>>>,
         hostname: String,
         started_at: std::time::Instant,
     }

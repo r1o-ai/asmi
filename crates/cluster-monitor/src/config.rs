@@ -147,12 +147,12 @@ pub struct NodeMap {
 
 impl NodeMap {
     /// Path to the persistent config file.
-    /// Uses `~/.config/mlx-top/config.json` (XDG-style) for CLI consistency.
+    /// Uses `~/.config/asmi/config.json` (XDG-style) for CLI consistency.
     pub fn config_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".config")
-            .join("mlx-top")
+            .join("asmi")
             .join("config.json")
     }
 
