@@ -2,7 +2,7 @@
 
 ## v0.1 — Initial Release (shipped)
 
-- Primary binary: `asmi` (also installs `mlx-top` alias for backward compatibility)
+- Single binary: `asmi`
 - Clap CLI: `--hosts`, `--scan`, `--format`, `--watch`, `--interval`
 - Smart TTY detection (tui if interactive, table if piped)
 - Streaming/ephemeral output (`--watch --format table|json`)

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 /// Apple Silicon cluster monitor — like nvidia-smi + htop for Mac.
 ///
-/// Also available as `mlx-top` for backward compatibility.
+/// Apple Silicon Machine Intelligence.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
@@ -298,7 +298,7 @@ struct MergeMode {
     source: String,
 }
 
-/// Get the binary name from argv[0] (e.g. "asmi" or "mlx-top").
+/// Get the binary name from argv[0].
 fn bin_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     NAME.get_or_init(|| {
@@ -1601,11 +1601,11 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
             let bin = std::env::current_exe()
                 .ok()
                 .and_then(|p| {
-                    // If running from target/release or target/debug, find sibling mlx-top
+                    // If running from target/release or target/debug, find sibling asmi
                     let dir = p.parent()?;
                     let release = dir.join("asmi");
                     if release.exists() { return Some(release); }
-                    // Try ../release/mlx-top from debug builds
+                    // Try ../release/asmi from debug builds
                     let up = dir.parent()?.join("release").join("asmi");
                     if up.exists() { return Some(up); }
                     None
