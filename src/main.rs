@@ -22,7 +22,7 @@ use std::time::Duration;
 
 /// MLX cluster monitor — like nvidia-smi + htop for Apple Silicon.
 ///
-/// Also available as `asmi`.
+/// Available as both `mlx-top` and `asmi`.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
@@ -296,6 +296,19 @@ impl ActivityLog {
 struct MergeMode {
     /// The node selected as the alias (to be merged INTO another).
     source: String,
+}
+
+/// Get the binary name from argv[0] (e.g. "asmi" or "mlx-top").
+fn bin_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::args()
+            .next()
+            .as_deref()
+            .and_then(|s| s.rsplit('/').next())
+            .unwrap_or("mlx-top")
+            .to_string()
+    })
 }
 
 #[tokio::main]
@@ -1432,7 +1445,8 @@ fn print_table(state: &ClusterState) {
     let agg = &state.aggregates;
     println!("+{:-<82}+", "");
     println!("| {:<80} |", format!(
-        "mlx-top   {}  nodes: {}/{}  power: {:.1}W  RAM: {:.0}/{:.0}GB",
+        "{}   {}  nodes: {}/{}  power: {:.1}W  RAM: {:.0}/{:.0}GB",
+        bin_name(),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         agg.nodes_online,
         agg.nodes_total,
@@ -1518,7 +1532,7 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
 
     match action {
         DaemonAction::Status => {
-            println!("asmi daemon status (:{})", port);
+            println!("{} daemon status (:{})", bin_name(), port);
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(1))
                 .timeout(Duration::from_secs(2))
@@ -1582,15 +1596,32 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
             }
         }
         DaemonAction::Deploy { node } => {
-            let bin = dirs::home_dir()
-                .unwrap_or_default()
-                .join("Projects/Personal/apple-smi/target/release/mlx-top");
+            // Find the release binary relative to the current exe's location,
+            // falling back to the known project path.
+            let bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| {
+                    // If running from target/release or target/debug, find sibling mlx-top
+                    let dir = p.parent()?;
+                    let release = dir.join("mlx-top");
+                    if release.exists() { return Some(release); }
+                    // Try ../release/mlx-top from debug builds
+                    let up = dir.parent()?.join("release").join("mlx-top");
+                    if up.exists() { return Some(up); }
+                    None
+                })
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .unwrap_or_default()
+                        .join("Projects/Personal/apple-smi/target/release/mlx-top")
+                });
             let plist_path = dirs::home_dir()
                 .unwrap_or_default()
                 .join(format!("Library/LaunchAgents/{}.plist", DAEMON_PLIST));
 
             if !bin.exists() {
-                eprintln!("Build first: cd ~/Projects/Personal/apple-smi && cargo build --release");
+                eprintln!("Release binary not found at {}", bin.display());
+                eprintln!("Build first: cargo build --release");
                 std::process::exit(1);
             }
 
@@ -1670,7 +1701,7 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
         hostname = %hostname,
         port = port,
         interval_secs = interval,
-        "mlx-top daemon starting"
+        "{} daemon starting", bin_name()
     );
 
     // Config for local-only collection (no SSH, no discovery)
@@ -1755,7 +1786,7 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!(%addr, "HTTP server listening");
-    eprintln!("mlx-top daemon: http://{hostname}:{port}/metrics");
+    eprintln!("{} daemon: http://{hostname}:{port}/metrics", bin_name());
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

@@ -1,8 +1,8 @@
-# apple-smi Roadmap
+# mlx-top / asmi Roadmap
 
 ## v0.1 — Initial Release (shipped)
 
-- Three binaries: `apple-smi`, `asmi`, `mlx-smi`
+- Two binaries: `mlx-top` (primary), `asmi` (alias — same code, different name)
 - Clap CLI: `--hosts`, `--scan`, `--format`, `--watch`, `--interval`
 - Smart TTY detection (tui if interactive, table if piped)
 - Streaming/ephemeral output (`--watch --format table|json`)
@@ -77,7 +77,7 @@ Coverage of nvidia-smi features (35 applicable, excluding 11 N/A):
 | Partial | 8 | 23% |
 | Feasible (planned) | 6 | 17% |
 
-Features apple-smi has that nvidia-smi lacks:
+Features mlx-top/asmi has that nvidia-smi lacks:
 - Cluster-native multi-node monitoring (nvidia-smi is single-host only)
 - Dynamic node discovery (5 methods)
 - ML framework-aware process detection (model name, serving port)

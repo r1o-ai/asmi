@@ -24,7 +24,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "asmi"
-path = "src/asmi.rs"
+path = "src/main.rs"
 
 [dependencies]
 mlx-top-core = { path = "crates/cluster-monitor" }
