@@ -10,9 +10,11 @@
 //! After discovery, `scan_node()` probes each peer for hardware info, RDMA
 //! status, and running MLX servers.
 
+use crate::collector::fetch_from_daemon;
 use crate::config::{ClusterConfig, DiscoveryMethod};
 use crate::ssh::{local_run, ssh_run};
 use crate::types::*;
+use crate::types::ModelServerMetadata;
 use regex::Regex;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
@@ -142,7 +144,49 @@ pub async fn scan_node_fast(hostname: &str, config: &ClusterConfig) -> ScanResul
 }
 
 async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool) -> ScanResult {
-    // 1. Ping test (skipped for known hosts)
+    // 1. Try HTTP daemon first — fast online check + basic hardware info.
+    //    If it responds, we know the node is reachable and get hostname/RAM
+    //    from the snapshot without any SSH.
+    if let Some(snap) = fetch_from_daemon(hostname, config.daemon_port).await {
+        info!(hostname, "scan: daemon online, skipping SSH hardware probe");
+        let ram_gb = if snap.ram_total_bytes > 0 {
+            Some(snap.ram_total_bytes / (1024 * 1024 * 1024))
+        } else {
+            None
+        };
+        // Still run RDMA check via SSH (changes rarely, daemon doesn't expose it)
+        let rdma = {
+            let rdma_cmd = "rdma_ctl status 2>/dev/null; \
+                            echo '---'; \
+                            ibv_devices 2>/dev/null; \
+                            echo '---'; \
+                            ibv_devinfo 2>/dev/null";
+            match ssh_run(hostname, rdma_cmd, config).await {
+                Ok(ref r) if r.has_output() => Some(parse_rdma_status(&r.stdout)),
+                _ => None,
+            }
+        };
+        return ScanResult {
+            hostname: snap.hostname,
+            reachable: true,
+            ssh_ok: true,
+            chip: None,       // Not in NodeSnapshot; SSH probe below fills this
+            ram_gb,
+            gpu_cores: None,  // Not in NodeSnapshot
+            rdma,
+            mlx_servers: snap.processes.iter().filter_map(|p| {
+                p.port.map(|port| MlxServerInfo {
+                    port,
+                    models: p.server_models.iter().map(|m| m.id.clone()).collect(),
+                    engine: p.framework,
+                })
+            }).collect(),
+            latency_ms: None,
+            link_speed: None,
+        };
+    }
+
+    // 2. Daemon unreachable — fall back to ping + SSH.
     let (reachable, latency_ms) = if skip_ping {
         (true, None)
     } else {
@@ -172,7 +216,7 @@ async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool
         };
     }
 
-    // 2. SSH hardware probe (includes hostname -s for IP resolution)
+    // 3. SSH hardware probe (daemon not running — new/undeployed node)
     let hw_cmd = "hostname -s 2>/dev/null; \
                   sysctl -n hw.memsize 2>/dev/null; \
                   sysctl -n machdep.cpu.brand_string 2>/dev/null; \
@@ -223,17 +267,18 @@ async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool
         if let Ok(ref r) = ssh_run(hostname, ps_cmd, config).await {
             if r.has_output() {
                 let processes = parse_mlx_processes(&r.stdout);
-                // 5. For each discovered port, try to query models
+                // 5. For each discovered port, probe /v1/models for full metadata
                 for proc in &processes {
                     if let Some(port) = proc.port {
                         let curl_cmd = format!(
                             "curl -s --connect-timeout 2 http://127.0.0.1:{}/v1/models 2>/dev/null",
                             port
                         );
-                        let models = match ssh_run(hostname, &curl_cmd, config).await {
-                            Ok(ref r) if r.has_output() => parse_v1_models_response(&r.stdout),
+                        let server_models = match ssh_run(hostname, &curl_cmd, config).await {
+                            Ok(ref r) if r.has_output() => parse_v1_models_metadata(&r.stdout),
                             _ => Vec::new(),
                         };
+                        let models: Vec<String> = server_models.iter().map(|m| m.id.clone()).collect();
                         mlx_servers.push(MlxServerInfo {
                             port,
                             models,
@@ -960,6 +1005,7 @@ fn parse_mlx_processes(text: &str) -> Vec<ProcessInfo> {
             mem_percent,
             footprint_mb: None,
             distributed,
+            server_models: Vec::new(),
         });
     }
 
@@ -967,7 +1013,19 @@ fn parse_mlx_processes(text: &str) -> Vec<ProcessInfo> {
 }
 
 /// Parse a `/v1/models` JSON response to extract model IDs.
+#[cfg(test)]
 fn parse_v1_models_response(json: &str) -> Vec<String> {
+    parse_v1_models_metadata(json)
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
+}
+
+/// Parse a `/v1/models` JSON response into full model metadata.
+///
+/// Extracts `id`, `context_length`, and `max_tokens` from each model entry.
+/// Returns an empty vec on invalid JSON or missing `data` array.
+pub fn parse_v1_models_metadata(json: &str) -> Vec<ModelServerMetadata> {
     let value: serde_json::Value = match serde_json::from_str(json) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
@@ -978,7 +1036,18 @@ fn parse_v1_models_response(json: &str) -> Vec<String> {
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|item| item.get("id").and_then(|id| id.as_str()).map(String::from))
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_str()?.to_string();
+                    Some(ModelServerMetadata {
+                        id,
+                        context_length: item
+                            .get("context_length")
+                            .and_then(|v| v.as_u64()),
+                        max_tokens: item
+                            .get("max_tokens")
+                            .and_then(|v| v.as_u64()),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -1405,6 +1474,38 @@ mod tests {
     #[test]
     fn test_parse_v1_models_invalid_json() {
         let models = parse_v1_models_response("not json");
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_parse_v1_models_metadata() {
+        let json = std::fs::read_to_string("testdata/v1-models-response.json").unwrap();
+        let models = parse_v1_models_metadata(&json);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "mlx-community/Qwen3-32B-4bit");
+        assert_eq!(models[0].context_length, Some(131072));
+        assert_eq!(models[0].max_tokens, Some(16384));
+    }
+
+    #[test]
+    fn test_parse_v1_models_metadata_no_context() {
+        let json = r#"{"data":[{"id":"test-model","object":"model"}]}"#;
+        let models = parse_v1_models_metadata(json);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "test-model");
+        assert_eq!(models[0].context_length, None);
+        assert_eq!(models[0].max_tokens, None);
+    }
+
+    #[test]
+    fn test_parse_v1_models_metadata_empty() {
+        let models = parse_v1_models_metadata("{}");
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_parse_v1_models_metadata_invalid_json() {
+        let models = parse_v1_models_metadata("not json");
         assert!(models.is_empty());
     }
 }

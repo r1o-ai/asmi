@@ -55,12 +55,12 @@ pub use collector::{
 pub use config::{ClusterConfig, DiscoveryMethod, NodeMap};
 pub use monitor::ClusterMonitor;
 pub use scanner::{
-    DiscoveredPeer, discover_nodes, parse_ifconfig_all_ips, parse_ifconfig_bridges, scan_cluster,
-    scan_node, scan_node_fast, scan_seeds,
+    DiscoveredPeer, discover_nodes, parse_ifconfig_all_ips, parse_ifconfig_bridges,
+    parse_v1_models_metadata, scan_cluster, scan_node, scan_node_fast, scan_seeds,
 };
 pub use ssh::{SshResult, local_run, ssh_run};
 pub use types::{
-    ClusterAggregates, ClusterEvent, DistributedBackend, EventSink, MetricsHistory, MlxServerInfo,
-    MonitorError, NodeSnapshot, PortState, ProcessFramework, ProcessInfo, RdmaDevice, RdmaLink,
-    RdmaStatus, ScanResult, TaskEnergy,
+    ClusterAggregates, ClusterEvent, DistributedBackend, EventSink, MetricsHistory,
+    MlxServerInfo, ModelServerMetadata, MonitorError, NodeSnapshot, PortState, ProcessFramework,
+    ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, TaskEnergy,
 };

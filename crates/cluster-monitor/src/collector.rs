@@ -1,16 +1,18 @@
-//! Metrics collector — runs parallel SSH commands per node, parses output,
-//! and enriches with footprint data.
+//! Metrics collector — HTTP-first (daemon), SSH fallback.
 //!
-//! This mirrors the proven TypeScript pattern from the web app:
-//! 3 parallel SSH commands (powermetrics, vm_stat+sysctl, ps aux), then
-//! a sequential footprint lookup for each discovered MLX process.
+//! For remote nodes: fetch from `http://<host>:9090/metrics` if the asmi
+//! daemon is running. This avoids SSH overhead (~200-500ms per session) and
+//! keeps the TUI responsive. Falls back to 3 parallel SSH commands if the
+//! daemon is unreachable.
+//!
+//! Local node always uses direct command execution (powermetrics needs sudo).
 
 use crate::config::ClusterConfig;
 use crate::ssh::{local_run, ssh_run};
 use crate::types::*;
 use chrono::Utc;
 use regex::Regex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -44,13 +46,73 @@ fn footprint_cmd(pid: u32) -> String {
 
 /// Collect a full metrics snapshot from a node.
 ///
-/// Runs powermetrics + vm_stat/sysctl + ps aux in parallel via `tokio::join!`,
-/// then enriches each discovered MLX process with a footprint lookup.
+/// Strategy:
+/// - **Remote nodes**: try `http://<host>:<daemon_port>/metrics` first (fast,
+///   no SSH overhead). Falls back to SSH if the daemon is unreachable.
+/// - **Local node**: always runs commands directly (powermetrics needs sudo).
 pub async fn collect_node_metrics(
     hostname: &str,
     config: &ClusterConfig,
     is_local: bool,
 ) -> NodeSnapshot {
+    // For remote nodes, try the HTTP daemon first.
+    if !is_local {
+        if let Some(snap) = fetch_from_daemon(hostname, config.daemon_port).await {
+            return snap;
+        }
+        warn!(hostname, "daemon unreachable, falling back to SSH");
+    }
+
+    collect_via_ssh(hostname, config, is_local).await
+}
+
+/// Fetch a NodeSnapshot from the asmi daemon HTTP endpoint.
+/// Returns `None` if unreachable or response fails to parse.
+/// Public so `scanner` can use it for HTTP-first online checks.
+pub async fn fetch_from_daemon(hostname: &str, port: u16) -> Option<NodeSnapshot> {
+    // Try bare hostname first, then <hostname>.local (mDNS fallback).
+    let candidates = [
+        format!("http://{}:{}/metrics", hostname, port),
+        format!("http://{}.local:{}/metrics", hostname, port),
+    ];
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    for url in &candidates {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<NodeSnapshot>().await {
+                    Ok(snap) => {
+                        debug!(hostname, url, "fetched metrics from daemon");
+                        return Some(snap);
+                    }
+                    Err(e) => {
+                        warn!(hostname, url, error = %e, "daemon metrics parse error");
+                    }
+                }
+            }
+            Ok(resp) => {
+                debug!(hostname, url, status = %resp.status(), "daemon returned error status");
+            }
+            Err(_) => {
+                // Connection refused / timeout — try next candidate silently
+            }
+        }
+    }
+    None
+}
+
+/// Collect metrics via SSH commands (original path, used for local node
+/// and as fallback for remote nodes without a running daemon).
+async fn collect_via_ssh(
+    hostname: &str,
+    config: &ClusterConfig,
+    is_local: bool,
+) -> NodeSnapshot {
+    info!(hostname, is_local, "collecting metrics via SSH");
     let run = |cmd: &'static str| async move {
         if is_local {
             local_run(cmd).await
@@ -241,7 +303,10 @@ pub async fn collect_node_metrics(
         }
     }
 
-    // 8. Assemble NodeSnapshot
+    // 8. Enrich processes with /v1/models metadata (non-blocking, best-effort)
+    probe_model_endpoints(hostname, config, is_local, &mut processes).await;
+
+    // 9. Assemble NodeSnapshot
     let ram_percent = if ram_total_bytes > 0 {
         (ram_used_bytes as f64 / ram_total_bytes as f64) * 100.0
     } else {
@@ -264,6 +329,51 @@ pub async fn collect_node_metrics(
         gpu_temp_c: None,
         processes,
         top_tasks: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /v1/models endpoint probing
+// ---------------------------------------------------------------------------
+
+/// Probe `/v1/models` on each process that has a port, enriching with server metadata.
+/// Failures leave `server_models` empty (not an error).
+async fn probe_model_endpoints(
+    hostname: &str,
+    config: &ClusterConfig,
+    is_local: bool,
+    processes: &mut [ProcessInfo],
+) {
+    let probes: Vec<_> = processes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.port.map(|port| (i, port)))
+        .map(|(i, port)| {
+            let hostname = hostname.to_string();
+            let config = config.clone();
+            async move {
+                let curl_cmd = format!(
+                    "curl -s --connect-timeout 2 http://127.0.0.1:{}/v1/models 2>/dev/null",
+                    port
+                );
+                let result = if is_local {
+                    local_run(&curl_cmd).await
+                } else {
+                    ssh_run(&hostname, &curl_cmd, &config).await
+                };
+                let models = match result {
+                    Ok(ref r) if r.has_output() => {
+                        crate::scanner::parse_v1_models_metadata(&r.stdout)
+                    }
+                    _ => Vec::new(),
+                };
+                (i, models)
+            }
+        })
+        .collect();
+
+    for (i, models) in futures::future::join_all(probes).await {
+        processes[i].server_models = models;
     }
 }
 
@@ -517,6 +627,7 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
             mem_percent,
             footprint_mb: None,
             distributed,
+            server_models: Vec::new(),
         });
     }
 

@@ -77,6 +77,10 @@ pub struct ProcessInfo {
     pub footprint_mb: Option<f64>,
     /// Distributed backend if this is part of a distributed run.
     pub distributed: Option<DistributedBackend>,
+    /// Model metadata from probing the server's `/v1/models` endpoint.
+    /// Empty if the server is not reachable or has no models loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_models: Vec<ModelServerMetadata>,
 }
 
 /// Recognised ML frameworks / process types.
@@ -317,10 +321,16 @@ impl ClusterAggregates {
 
         let mut models: Vec<String> = online
             .iter()
-            .flat_map(|s| {
-                s.processes
-                    .iter()
-                    .filter_map(|p| p.model.clone())
+            .flat_map(|s| s.processes.iter())
+            .flat_map(|p| {
+                // Prefer server-reported model IDs, fall back to ps-parsed model name
+                if !p.server_models.is_empty() {
+                    p.server_models.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+                } else if let Some(ref model) = p.model {
+                    vec![model.clone()]
+                } else {
+                    vec![]
+                }
             })
             .collect();
         models.sort();
@@ -493,6 +503,14 @@ impl EventSink {
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
+
+/// Metadata returned by a `/v1/models` endpoint for a single model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelServerMetadata {
+    pub id: String,
+    pub context_length: Option<u64>,
+    pub max_tokens: Option<u64>,
+}
 
 /// Errors from cluster monitoring operations.
 #[derive(Debug, thiserror::Error)]

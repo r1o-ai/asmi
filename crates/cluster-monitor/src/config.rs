@@ -57,6 +57,10 @@ pub struct ClusterConfig {
 
     /// Number of metrics history samples to keep per node.
     pub history_capacity: usize,
+
+    /// Port the asmi HTTP daemon listens on (default: 9090).
+    /// Used for HTTP-first metrics fetching on remote nodes.
+    pub daemon_port: u16,
 }
 
 impl Default for ClusterConfig {
@@ -73,6 +77,7 @@ impl Default for ClusterConfig {
             ssh_user: None,
             ssh_identity: None,
             history_capacity: 300,
+            daemon_port: 9090,
         }
     }
 }
@@ -147,8 +152,14 @@ pub struct NodeMap {
 
 impl NodeMap {
     /// Path to the persistent config file.
-    /// Uses `~/.config/asmi/config.json` (XDG-style) for CLI consistency.
+    /// Respects `XDG_CONFIG_HOME` if set, otherwise `~/.config/asmi/config.json`.
     pub fn config_path() -> PathBuf {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let p = PathBuf::from(&xdg);
+            if p.is_absolute() {
+                return p.join("asmi").join("config.json");
+            }
+        }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".config")
@@ -462,6 +473,13 @@ mod tests {
     fn test_hostfile_jaccl_empty() {
         let nm = NodeMap::default();
         assert_eq!(nm.hostfile_jaccl("m3u2"), "[]");
+    }
+
+    #[test]
+    fn test_config_path_ends_with_asmi() {
+        let path = NodeMap::config_path();
+        assert!(path.ends_with("asmi/config.json"),
+            "config path should end with asmi/config.json, got: {}", path.display());
     }
 }
 
