@@ -775,7 +775,7 @@ mod tests {
         let p = &procs[0];
         assert_eq!(p.pid, 62283);
         assert_eq!(p.framework, ProcessFramework::MlxLm);
-        assert_eq!(p.model.as_deref(), Some("MiniMax-M2.5-REAP-19-8bit"));
+        assert_eq!(p.model.as_deref(), Some("ExampleModel-8bit"));
         assert_eq!(p.port, Some(8003));
         assert!((p.cpu_percent - 0.0).abs() < 0.1);
         assert!((p.mem_percent - 37.8).abs() < 0.1);

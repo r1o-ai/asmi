@@ -1,39 +1,39 @@
 en3: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	options=460<TSO4,TSO6,CHANNEL_IO>
-	ether 36:49:60:a6:d7:44
-	inet6 fe80::8e2:3842:7ec8:b66b%en3 prefixlen 64 secured scopeid 0x12
+	ether 36:00:00:00:00:01
+	inet6 fe80::1%en3 prefixlen 64 secured scopeid 0x12
 	inet 169.254.19.163 netmask 0xffff0000 broadcast 169.254.255.255
 	nd6 options=201<PERFORMNUD,DAD>
 	media: autoselect <full-duplex>
 	status: active
 en4: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	options=460<TSO4,TSO6,CHANNEL_IO>
-	ether 36:49:60:a6:d7:48
-	inet6 fe80::1446:f8e7:b2c6:ebb6%en4 prefixlen 64 secured scopeid 0x13
+	ether 36:00:00:00:00:02
+	inet6 fe80::2%en4 prefixlen 64 secured scopeid 0x13
 	inet 192.168.60.1 netmask 0xffffff00 broadcast 192.168.60.255
 	nd6 options=201<PERFORMNUD,DAD>
 	media: autoselect <full-duplex>
 	status: active
 en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	options=460<TSO4,TSO6,CHANNEL_IO>
-	ether 36:49:60:a6:d7:4c
-	inet6 fe80::143a:ca8b:467e:d33f%en5 prefixlen 64 secured scopeid 0x14
+	ether 36:00:00:00:00:03
+	inet6 fe80::3%en5 prefixlen 64 secured scopeid 0x14
 	inet 169.254.124.8 netmask 0xffff0000 broadcast 169.254.255.255
 	nd6 options=201<PERFORMNUD,DAD>
 	media: autoselect <full-duplex>
 	status: active
 en22: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	options=460<TSO4,TSO6,CHANNEL_IO>
-	ether be:cc:5f:02:b8:ac
-	inet6 fe80::bccc:5fff:fe02:b8ac%en22 prefixlen 64 secured scopeid 0x19
+	ether 36:00:00:00:00:04
+	inet6 fe80::4%en22 prefixlen 64 secured scopeid 0x19
 	inet 169.254.61.111 netmask 0xffff0000 broadcast 169.254.255.255
 	nd6 options=201<PERFORMNUD,DAD>
 	media: autoselect <full-duplex>
 	status: active
 en23: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 	options=460<TSO4,TSO6,CHANNEL_IO>
-	ether a2:5c:29:33:82:3b
-	inet6 fe80::a05c:29ff:fe33:823b%en23 prefixlen 64 secured scopeid 0x1a
+	ether 36:00:00:00:00:05
+	inet6 fe80::5%en23 prefixlen 64 secured scopeid 0x1a
 	inet 169.254.137.202 netmask 0xffff0000 broadcast 169.254.255.255
 	nd6 options=201<PERFORMNUD,DAD>
 	media: autoselect <full-duplex>

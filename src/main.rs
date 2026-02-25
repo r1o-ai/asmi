@@ -1530,7 +1530,7 @@ async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
     let node_map = asmi_core::NodeMap::load();
     let known_nodes: Vec<String> = if node_map.nodes.is_empty() {
         eprintln!("No known nodes in NodeMap. Run `asmi` first to discover cluster nodes,");
-        eprintln!("or add seed hosts: `asmi --hosts m3u1,m3u2,m3u3`");
+        eprintln!("or add seed hosts: `asmi --hosts node1,node2,node3`");
         std::process::exit(1);
     } else {
         node_map.nodes.clone()

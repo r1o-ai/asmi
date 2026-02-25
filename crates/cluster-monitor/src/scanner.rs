@@ -1123,10 +1123,9 @@ mod tests {
 
         // Should only include macOS + online peers
         // From the testdata: m3u2 (Self, macOS, online), m4m1 (macOS, online),
-        // jose's Mac mini (macOS, online), m3u1 (macOS, online),
-        // m3u3 (macOS, online), mini1 (macOS, online)
+        // m3u1 (macOS, online), m3u3 (macOS, online)
         // Should NOT include: MacBookPro (offline), alienMARIO (windows),
-        // k3s-* (linux), localhost/iOS, JP's MacBook Air (offline), etc.
+        // k3s-m3u1 (linux), localhost/iOS, etc.
 
         let hostnames: Vec<&str> = peers.iter().map(|p| p.hostname.as_str()).collect();
         assert!(
@@ -1375,7 +1374,7 @@ mod tests {
         assert_eq!(server.port, Some(8003), "should extract port 8003");
         assert_eq!(
             server.model.as_deref(),
-            Some("MiniMax-M2.5-REAP-19-8bit"),
+            Some("ExampleModel-8bit"),
             "should extract model name"
         );
         assert_eq!(server.pid, 62283, "should extract PID");

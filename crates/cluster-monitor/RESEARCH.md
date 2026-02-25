@@ -11,7 +11,7 @@ Captured from live cluster on 2026-02-21. All parsers must match these real form
 ### Header
 ```
 Machine model: Mac15,14
-OS version: 25E5207k
+OS version: 25A123x
 ```
 
 ### Cluster Format
@@ -97,7 +97,7 @@ Apple M3 Ultra        # machdep.cpu.brand_string
 ## ps aux (MLX processes)
 
 ```
-ma  62283  0.0  37.8 866456400 202951136  ??  S  12:51AM  1:35.69 .../Python -m mlx_lm.server --model /Users/ma/models/MiniMax-M2.5-REAP-19-8bit --port 8003 --host 0.0.0.0
+runner  62283  0.0  37.8 866456400 202951136  ??  S  12:51AM  1:35.69 .../Python -m mlx_lm.server --model /Users/runner/models/ExampleModel-8bit --port 8003 --host 0.0.0.0
 ```
 
 **Fields:** user(0) pid(1) cpu%(2) mem%(3) vsz(4) rss(5) tty(6) stat(7) started(8) time(9) command(10+)
@@ -113,8 +113,8 @@ ma  62283  0.0  37.8 866456400 202951136  ??  S  12:51AM  1:35.69 .../Python -m 
 
 **NOTE:** The `ps aux` grep also catches:
 - Chrome DevTools MCP watchdog (PID 23397) — filter by `chrome-devtools-mcp`
-- Custom shell script watchdog (PID 2050) — `m4m1-watchdog.sh`
-- Microsoft Teams GPU watchdog (PID 1945) — filter by `Microsoft`
+- Custom shell script watchdog (PID 2050) — `node-watchdog.sh`
+- Microsoft Teams GPU watchdog (PID 1889) — filter by `Microsoft`
 - System watchdogd (PID 585) — filter by `/usr/libexec/watchdogd`
 
 **Filter strategy:** Only match lines containing `mlx_lm` or `mlx_vlm` or `vllm_mlx`, then separately match `watchdog` lines that contain `r1o` or custom script names.
@@ -178,7 +178,7 @@ hca_id: rdma_en3
 **Port state regex:** `state:\s+(PORT_\w+)`
 **Values:** `PORT_ACTIVE` (connected), `PORT_DOWN` (no cable or no peer)
 
-On m3u2: rdma_en3, rdma_en4, rdma_en5 are PORT_ACTIVE (3 cables connected); rdma_en2, rdma_en6, rdma_en7 are PORT_DOWN.
+On node-a: rdma_en3, rdma_en4, rdma_en5 are PORT_ACTIVE (3 cables connected); rdma_en2, rdma_en6, rdma_en7 are PORT_DOWN.
 
 ## ifconfig bridges
 
