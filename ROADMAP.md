@@ -56,7 +56,21 @@ Dedicated monitoring views matching nvidia-smi's `dmon`, `pmon`, `topo`.
   - Columns: node, power, temp, cpu%, gpu%, ram, tb-rx, tb-tx
 - [ ] **TB throughput** — rx/tx bytes/sec from `netstat -I enN` or `nettop` on bridge interfaces
 
-## v0.5 — Metal Integration
+## v0.5 — Storage & Device Discovery
+
+Full cluster device inventory — not just compute nodes, but all attached storage, docks, and NAS devices.
+
+- [ ] **Storage volume discovery** — SSH to each node, run `diskutil list external` + `df -h` to enumerate attached drives (SSDs, HDDs, USB)
+- [ ] **Storage tier display** — show hot (SSD), warm (NAS), cold (archive) tiers per node in TUI, cross-ref with Supabase `storage_locations`
+- [ ] **Model location awareness** — which models are on which storage tier, ready-to-serve vs need-to-pull
+- [ ] **Dock topology** — parse `system_profiler SPThunderboltDataType` downstream devices to show what's behind each dock (e.g., mini2 via Prime TB5 dock)
+- [ ] **Thunderbolt bridge detection** — discover nodes behind docks via bridge0 IP (not just direct TB peers). Key pattern: `ifconfig bridge0` on remote node for dock-chained devices
+- [ ] **NAS health** — poll mini2's `/Volumes/NAS` usage, active transfer status, Seagate SMART data
+- [ ] **Network storage** — discover Buffalo/Synology NAS via `dns-sd -B _smb._tcp` + probe for health APIs
+- [ ] **`asmi storage`** — subcommand showing per-node storage summary: volumes, capacity, usage, tier, models stored
+- [ ] **Transfer monitoring** — detect active rsync/scp processes and show progress (source → dest, speed, ETA)
+
+## v0.6 — Metal Integration
 
 GPU-level metrics via Metal APIs and IOKit for deeper profiling.
 
