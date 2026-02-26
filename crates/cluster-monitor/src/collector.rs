@@ -29,6 +29,10 @@ const CMD_VMSTAT_SYSCTL: &str =
 const CMD_PS_MLX: &str =
     "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch' | grep -v grep";
 
+/// RDMA status + ifconfig in one command to minimize SSH connections.
+const CMD_RDMA_NET: &str =
+    "rdma_ctl status 2>/dev/null || echo disabled; echo '---'; ibv_devices 2>/dev/null || echo ''; echo '---'; ibv_devinfo 2>/dev/null || echo ''; echo '===IFCONFIG==='; ifconfig 2>/dev/null";
+
 /// Detect JACCL/distributed by checking `mlx.launch` wrapper processes.
 /// Only `mlx.launch --backend jaccl` is a reliable signal — env vars
 /// can persist from previous runs and cause false positives on single-node.
@@ -49,21 +53,26 @@ fn footprint_cmd(pid: u32) -> String {
 /// Strategy:
 /// - **Remote nodes**: try `http://<host>:<daemon_port>/metrics` first (fast,
 ///   no SSH overhead). Falls back to SSH if the daemon is unreachable.
-/// - **Local node**: always runs commands directly (powermetrics needs sudo).
+/// - **Local node**: always runs commands directly to avoid self-referencing
+///   the daemon's own HTTP endpoint (which would return stale cached data).
 pub async fn collect_node_metrics(
     hostname: &str,
     config: &ClusterConfig,
     is_local: bool,
 ) -> NodeSnapshot {
-    // For remote nodes, try the HTTP daemon first.
-    if !is_local {
-        if let Some(snap) = fetch_from_daemon(hostname, config.daemon_port).await {
-            return snap;
-        }
-        warn!(hostname, "daemon unreachable, falling back to SSH");
+    // Local node: run commands directly — never fetch from our own daemon
+    // (that would return stale cached data, creating a self-referencing loop).
+    if is_local {
+        return collect_via_ssh(hostname, config, true).await;
     }
 
-    collect_via_ssh(hostname, config, is_local).await
+    // Remote nodes: try HTTP daemon first (fast, no SSH overhead).
+    if let Some(snap) = fetch_from_daemon(hostname, config.daemon_port).await {
+        return snap;
+    }
+
+    warn!(hostname, "daemon unreachable, falling back to SSH");
+    collect_via_ssh(hostname, config, false).await
 }
 
 /// Fetch a NodeSnapshot from the asmi daemon HTTP endpoint.
@@ -121,12 +130,13 @@ async fn collect_via_ssh(
         }
     };
 
-    // 1. Run 4 commands in parallel
-    let (power_res, mem_res, ps_res, jaccl_res) = tokio::join!(
+    // 1. Run 5 commands in parallel
+    let (power_res, mem_res, ps_res, jaccl_res, rdma_net_res) = tokio::join!(
         run(CMD_POWERMETRICS),
         run(CMD_VMSTAT_SYSCTL),
         run(CMD_PS_MLX),
         run(CMD_JACCL_ENV),
+        run(CMD_RDMA_NET),
     );
 
     // 2. Parse powermetrics
@@ -275,13 +285,18 @@ async fn collect_via_ssh(
             let hostname = hostname.to_string();
             let config = config.clone();
             async move {
-                let fp_res = if is_local {
-                    local_run(&cmd).await
-                } else {
-                    ssh_run(&hostname, &cmd, &config).await
-                };
+                let fp_res = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        if is_local {
+                            local_run(&cmd).await
+                        } else {
+                            ssh_run(&hostname, &cmd, &config).await
+                        }
+                    },
+                ).await;
                 let mb = match fp_res {
-                    Ok(r) if r.has_output() => {
+                    Ok(Ok(r)) if r.has_output() => {
                         let mb = parse_footprint(&r.stdout);
                         debug!(hostname = hostname.as_str(), pid, footprint_mb = ?mb, "footprint");
                         mb
@@ -306,7 +321,37 @@ async fn collect_via_ssh(
     // 8. Enrich processes with /v1/models metadata (non-blocking, best-effort)
     probe_model_endpoints(hostname, config, is_local, &mut processes).await;
 
-    // 9. Assemble NodeSnapshot
+    // 9. Parse RDMA status + interface IPs
+    let (rdma_status, interface_ips) = match &rdma_net_res {
+        Ok(r) if r.has_output() => {
+            let delim = "===IFCONFIG===";
+            let (rdma_text, ifconfig_text) = match r.stdout.find(delim) {
+                Some(idx) => (&r.stdout[..idx], &r.stdout[idx + delim.len()..]),
+                None => (r.stdout.as_str(), ""),
+            };
+            let rdma = crate::scanner::parse_rdma_status(rdma_text);
+            let all_ips = crate::scanner::parse_ifconfig_all_ips(ifconfig_text);
+            // Filter to RDMA-relevant IPs only (192.168.0.x, 169.254.x.x)
+            let mut iface_ips = std::collections::BTreeMap::new();
+            for (iface, ips) in all_ips {
+                let rdma_ips: Vec<String> = ips
+                    .into_iter()
+                    .filter(|ip| ip.starts_with("192.168.0.") || ip.starts_with("169.254."))
+                    .collect();
+                if !rdma_ips.is_empty() {
+                    iface_ips.insert(iface, rdma_ips);
+                }
+            }
+            debug!(hostname, devices = rdma.devices.len(), ifaces = iface_ips.len(), "RDMA + ifconfig parsed");
+            (Some(rdma), iface_ips)
+        }
+        _ => {
+            debug!(hostname, "RDMA/ifconfig unavailable");
+            (None, std::collections::BTreeMap::new())
+        }
+    };
+
+    // 10. Assemble NodeSnapshot
     let ram_percent = if ram_total_bytes > 0 {
         (ram_used_bytes as f64 / ram_total_bytes as f64) * 100.0
     } else {
@@ -317,6 +362,10 @@ async fn collect_via_ssh(
         hostname: canonical_hostname,
         online: true,
         timestamp: Utc::now(),
+        // Hardware identity filled in by daemon after collection (system_profiler)
+        chip_model: None,
+        serial_number: None,
+        model_name: None,
         cpu_watts: power.cpu_mw,
         gpu_watts: power.gpu_mw,
         ane_watts: power.ane_mw,
@@ -329,6 +378,8 @@ async fn collect_via_ssh(
         gpu_temp_c: None,
         processes,
         top_tasks: Vec::new(),
+        rdma: rdma_status,
+        interface_ips,
     }
 }
 
@@ -353,16 +404,21 @@ async fn probe_model_endpoints(
             let config = config.clone();
             async move {
                 let curl_cmd = format!(
-                    "curl -s --connect-timeout 2 http://127.0.0.1:{}/v1/models 2>/dev/null",
+                    "curl -s --connect-timeout 2 --max-time 5 http://127.0.0.1:{}/v1/models 2>/dev/null",
                     port
                 );
-                let result = if is_local {
-                    local_run(&curl_cmd).await
-                } else {
-                    ssh_run(&hostname, &curl_cmd, &config).await
-                };
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    async {
+                        if is_local {
+                            local_run(&curl_cmd).await
+                        } else {
+                            ssh_run(&hostname, &curl_cmd, &config).await
+                        }
+                    },
+                ).await;
                 let models = match result {
-                    Ok(ref r) if r.has_output() => {
+                    Ok(Ok(ref r)) if r.has_output() => {
                         crate::scanner::parse_v1_models_metadata(&r.stdout)
                     }
                     _ => Vec::new(),

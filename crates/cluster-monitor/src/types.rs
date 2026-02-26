@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -18,6 +18,14 @@ pub struct NodeSnapshot {
     pub hostname: String,
     pub online: bool,
     pub timestamp: DateTime<Utc>,
+
+    // Hardware identity (collected once at daemon startup, never changes)
+    #[serde(default)]
+    pub chip_model: Option<String>,     // "Apple M3 Ultra"
+    #[serde(default)]
+    pub serial_number: Option<String>,  // "H7WQ2P7L6X"
+    #[serde(default)]
+    pub model_name: Option<String>,     // "Mac Studio", "MacBook Pro", "Mac mini"
 
     // Power (milliwatts from powermetrics)
     pub cpu_watts: f64,
@@ -42,6 +50,15 @@ pub struct NodeSnapshot {
 
     // Top energy-consuming tasks from powermetrics
     pub top_tasks: Vec<TaskEnergy>,
+
+    // RDMA subsystem status (devices and port states)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rdma: Option<RdmaStatus>,
+
+    // Interface → IPs mapping for RDMA link correlation.
+    // Only includes interfaces with RDMA-relevant IPs (192.168.0.x, 169.254.x.x).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub interface_ips: BTreeMap<String, Vec<String>>,
 }
 
 impl NodeSnapshot {

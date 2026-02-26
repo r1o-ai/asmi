@@ -52,6 +52,11 @@ struct Cli {
     #[arg(long)]
     serve: bool,
 
+    /// Cluster hub mode: also poll all known nodes and expose /cluster endpoint.
+    /// Run this on the monitoring node (e.g. mini2) to aggregate the whole fleet.
+    #[arg(long)]
+    cluster: bool,
+
     /// Port for --serve mode (default: 9090).
     #[arg(long, default_value_t = 9090)]
     port: u16,
@@ -324,7 +329,7 @@ async fn main() -> Result<()> {
 
     // --serve mode: run as HTTP daemon (no TUI, no cluster discovery)
     if cli.serve {
-        return run_serve(cli.port, cli.interval).await;
+        return run_serve(cli.port, cli.interval, cli.cluster).await;
     }
 
     // Smart default: tui if interactive terminal, table if piped
@@ -886,10 +891,13 @@ fn render_nodes(
                     snap.processes
                         .iter()
                         .map(|p| {
-                            let name = p.model.as_deref()
-                                .map(|m| m.rsplit('/').next().unwrap_or(m))
-                                .unwrap_or(&p.framework.to_string())
-                                .to_string();
+                            let name = if let Some(m) = p.server_models.first() {
+                                m.id.rsplit('/').next().unwrap_or(&m.id).to_string()
+                            } else if let Some(m) = p.model.as_deref() {
+                                m.rsplit('/').next().unwrap_or(m).to_string()
+                            } else {
+                                p.framework.to_string()
+                            };
                             if let Some(dist) = &p.distributed {
                                 format!("{name} [{dist}]")
                             } else {
@@ -1103,15 +1111,21 @@ fn render_node_summary(
             let procs = if s.processes.is_empty() {
                 "idle".to_string()
             } else {
-                s.processes
+                let names: Vec<String> = s.processes
                     .iter()
-                    .filter_map(|p| {
-                        p.model.as_deref().map(|m| {
-                            m.rsplit('/').next().unwrap_or(m).to_string()
-                        })
+                    .flat_map(|p| {
+                        if !p.server_models.is_empty() {
+                            p.server_models.iter()
+                                .map(|m| m.id.rsplit('/').next().unwrap_or(&m.id).to_string())
+                                .collect::<Vec<_>>()
+                        } else if let Some(ref m) = p.model {
+                            vec![m.rsplit('/').next().unwrap_or(m).to_string()]
+                        } else {
+                            vec![p.framework.to_string()]
+                        }
                     })
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                    .collect();
+                names.join(", ")
             };
             (
                 format!("CPU {:.0}%", s.cpu_percent),
@@ -1469,10 +1483,13 @@ fn print_table(state: &ClusterState) {
                 "--".to_string()
             } else {
                 snap.processes.iter().map(|p| {
-                    let name = p.model.as_deref()
-                        .map(|m| m.rsplit('/').next().unwrap_or(m))
-                        .unwrap_or(&p.framework.to_string())
-                        .to_string();
+                    let name = if let Some(m) = p.server_models.first() {
+                        m.id.rsplit('/').next().unwrap_or(&m.id).to_string()
+                    } else if let Some(m) = p.model.as_deref() {
+                        m.rsplit('/').next().unwrap_or(m).to_string()
+                    } else {
+                        p.framework.to_string()
+                    };
                     if let Some(dist) = &p.distributed {
                         format!("{name} [{dist}]")
                     } else {
@@ -1707,13 +1724,45 @@ fn run_on_node(node: &str, local_hostname: &str, cmd: &str) -> bool {
     }
 }
 
+/// Collect hardware identity from `system_profiler SPHardwareDataType`.
+/// Returns (chip_model, serial_number, model_name). Runs synchronously (once at startup).
+fn collect_hardware_identity() -> (Option<String>, Option<String>, Option<String>) {
+    let output = std::process::Command::new("system_profiler")
+        .arg("SPHardwareDataType")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let mut chip_model = None;
+    let mut serial_number = None;
+    let mut model_name = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("Chip:") {
+            chip_model = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Serial Number (system):") {
+            serial_number = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Model Name:") {
+            model_name = Some(v.trim().to_string());
+        }
+    }
+
+    (chip_model, serial_number, model_name)
+}
+
 /// Run asmi as an HTTP daemon serving local node metrics.
 ///
 /// Polls local metrics every `interval` seconds and serves them via:
-/// - GET /metrics   → full NodeSnapshot JSON
+/// - GET /metrics   → full NodeSnapshot JSON (with hardware identity injected)
 /// - GET /health    → lightweight health check
 /// - GET /processes → MLX process list only
-async fn run_serve(port: u16, interval: u64) -> Result<()> {
+///
+/// With `--cluster`:
+/// - GET /cluster   → Vec<NodeSnapshot> for all known nodes (hub aggregator mode)
+/// - GET /nodes     → list of known node hostnames from NodeMap
+async fn run_serve(port: u16, interval: u64, cluster_hub: bool) -> Result<()> {
     // Init tracing to stderr (no TUI to corrupt)
     tracing_subscriber::fmt()
         .with_env_filter("asmi_core=info,asmi=info")
@@ -1730,7 +1779,17 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
         hostname = %hostname,
         port = port,
         interval_secs = interval,
+        cluster_hub = cluster_hub,
         "{} daemon starting", bin_name()
+    );
+
+    // Collect hardware identity once at startup
+    let (chip_model, serial_number, model_name) = collect_hardware_identity();
+    tracing::info!(
+        chip = chip_model.as_deref().unwrap_or("unknown"),
+        serial = serial_number.as_deref().unwrap_or("unknown"),
+        model = model_name.as_deref().unwrap_or("unknown"),
+        "hardware identity"
     );
 
     // Config for local-only collection (no SSH, no discovery)
@@ -1742,14 +1801,30 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
         Arc::new(tokio::sync::RwLock::new(None));
     let started_at = std::time::Instant::now();
 
+    // Broadcast channel for SSE streaming — subscribers get pushed on every poll tick
+    let (metrics_tx, _) = tokio::sync::broadcast::channel::<String>(16);
+
+    // Hardware identity shared into handlers
+    let hw_chip = chip_model.clone();
+    let hw_serial = serial_number.clone();
+    let hw_model = model_name.clone();
+
     // Background polling loop — collect local metrics every N seconds
     {
         let snapshot = Arc::clone(&snapshot);
         let config = config.clone();
         let hostname = hostname.clone();
+        let hw_chip = hw_chip.clone();
+        let hw_serial = hw_serial.clone();
+        let hw_model = hw_model.clone();
+        let metrics_tx = metrics_tx.clone();
         tokio::spawn(async move {
             loop {
-                let snap = asmi_core::collect_node_metrics(&hostname, &config, true).await;
+                let mut snap = asmi_core::collect_node_metrics(&hostname, &config, true).await;
+                // Inject hardware identity into every snapshot
+                snap.chip_model = hw_chip.clone();
+                snap.serial_number = hw_serial.clone();
+                snap.model_name = hw_model.clone();
                 tracing::debug!(
                     cpu = format!("{:.1}%", snap.cpu_percent),
                     gpu = format!("{:.1}%", snap.gpu_percent),
@@ -1757,11 +1832,38 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
                     procs = snap.processes.len(),
                     "metrics collected"
                 );
+                // Broadcast serialized snapshot for SSE subscribers
+                if let Ok(json) = serde_json::to_string(&snap) {
+                    let _ = metrics_tx.send(json);
+                }
                 *snapshot.write().await = Some(snap);
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
         });
     }
+
+    // Optional cluster hub: spin up ClusterMonitor to poll all known nodes
+    let cluster_state: Option<Arc<tokio::sync::RwLock<asmi_core::ClusterState>>> = if cluster_hub {
+        let node_map = asmi_core::NodeMap::load();
+        if node_map.nodes.is_empty() {
+            tracing::warn!("--cluster requested but NodeMap is empty; run `asmi` first to discover nodes");
+            None
+        } else {
+            tracing::info!(nodes = ?node_map.nodes, "cluster hub: polling {} nodes", node_map.nodes.len());
+            let cfg = ClusterConfig::default()
+                .with_seeds(node_map.nodes.clone())
+                .with_poll_interval(Duration::from_secs(interval));
+            let mut monitor = asmi_core::ClusterMonitor::new(cfg, node_map);
+            let state = monitor.state();
+            monitor.start();
+            // Leak the monitor so it lives for the process lifetime.
+            // ClusterMonitor::drop() sends a shutdown signal — we must not drop it.
+            std::mem::forget(monitor);
+            Some(state)
+        }
+    } else {
+        None
+    };
 
     // Build axum router
     use axum::{extract::State, response::Json, routing::get, Router};
@@ -1769,8 +1871,11 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
     #[derive(Clone)]
     struct AppState {
         snapshot: Arc<tokio::sync::RwLock<Option<asmi_core::NodeSnapshot>>>,
+        cluster_state: Option<Arc<tokio::sync::RwLock<asmi_core::ClusterState>>>,
+        node_map: Arc<tokio::sync::RwLock<asmi_core::NodeMap>>,
         hostname: String,
         started_at: std::time::Instant,
+        metrics_tx: tokio::sync::broadcast::Sender<String>,
     }
 
     async fn metrics_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -1801,21 +1906,202 @@ async fn run_serve(port: u16, interval: u64) -> Result<()> {
         }
     }
 
+    /// GET /cluster → Vec<NodeSnapshot> for all polled nodes (hub mode only)
+    async fn cluster_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+        match &state.cluster_state {
+            Some(cs) => {
+                let s = cs.read().await;
+                let snapshots: Vec<&asmi_core::NodeSnapshot> = s.snapshots.values().collect();
+                Json(serde_json::to_value(&snapshots)
+                    .unwrap_or(serde_json::json!([])))
+            }
+            None => Json(serde_json::json!({
+                "error": "not running in cluster hub mode (start with --cluster)"
+            })),
+        }
+    }
+
+    /// GET /nodes → list of known node hostnames
+    async fn nodes_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+        match &state.cluster_state {
+            Some(cs) => {
+                let s = cs.read().await;
+                let hostnames: Vec<&str> = s.snapshots.keys().map(|k| k.as_str()).collect();
+                Json(serde_json::json!({ "nodes": hostnames, "total": hostnames.len() }))
+            }
+            None => Json(serde_json::json!({ "nodes": [], "total": 0 })),
+        }
+    }
+
+    /// GET /stream → SSE push of NodeSnapshot JSON on every poll tick (~2s)
+    async fn stream_handler(
+        State(state): State<AppState>,
+    ) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+    {
+        use futures::StreamExt;
+
+        let rx = state.metrics_tx.subscribe();
+        let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| {
+            futures::future::ready(match result {
+                Ok(json) => Some(Ok(axum::response::sse::Event::default().data(json))),
+                Err(_) => None, // lagged subscriber — skip missed messages
+            })
+        });
+
+        axum::response::sse::Sse::new(stream).keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("ping"),
+        )
+    }
+
+    /// GET /jaccl/config → JACCL hostfile matrix from stored RDMA link topology.
+    /// Query params: ?hosts=m3u2,m3u1 (comma-separated hostnames, optional — defaults to all)
+    async fn jaccl_config_handler(
+        State(state): State<AppState>,
+        axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let nm = state.node_map.read().await;
+
+        if nm.rdma_links.is_empty() {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "No RDMA links discovered. Run `asmi` TUI scan first to discover RDMA topology."
+            }));
+        }
+
+        let hostfile_json = nm.hostfile_jaccl(&state.hostname);
+        if hostfile_json == "[]" {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "No RDMA-connected nodes found in topology"
+            }));
+        }
+
+        // Parse the JSON string from hostfile_jaccl and optionally filter by requested hosts
+        match serde_json::from_str::<serde_json::Value>(&hostfile_json) {
+            Ok(hosts) => {
+                let filtered = if let Some(hosts_param) = params.get("hosts") {
+                    let requested: Vec<&str> = hosts_param.split(',').collect();
+                    if let Some(arr) = hosts.as_array() {
+                        let filtered: Vec<&serde_json::Value> = arr.iter().filter(|h| {
+                            h.get("ssh").and_then(|s| s.as_str()).map_or(false, |ssh| {
+                                requested.iter().any(|r| ssh.starts_with(r))
+                            })
+                        }).collect();
+                        serde_json::to_value(&filtered).unwrap_or(hosts.clone())
+                    } else {
+                        hosts.clone()
+                    }
+                } else {
+                    hosts.clone()
+                };
+
+                let count = filtered.as_array().map(|a| a.len()).unwrap_or(0);
+                Json(serde_json::json!({
+                    "success": true,
+                    "hosts": filtered,
+                    "nodeCount": count,
+                    "rdma_links_total": nm.rdma_links.len(),
+                    "local_hostname": state.hostname,
+                }))
+            }
+            Err(e) => Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to build JACCL matrix: {e}"),
+                "raw": hostfile_json,
+            })),
+        }
+    }
+
+    /// POST /jaccl/config → generate and write JACCL hostfile to coordinator
+    async fn jaccl_generate_handler(
+        State(state): State<AppState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let nm = state.node_map.read().await;
+
+        if nm.rdma_links.is_empty() {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "No RDMA links discovered. Run `asmi` TUI scan first."
+            }));
+        }
+
+        let hostfile_json = nm.hostfile_jaccl(&state.hostname);
+        let hosts: serde_json::Value = match serde_json::from_str(&hostfile_json) {
+            Ok(v) => v,
+            Err(e) => return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Failed to build matrix: {e}"),
+            })),
+        };
+
+        let count = hosts.as_array().map(|a| a.len()).unwrap_or(0);
+        if count == 0 {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": "No RDMA-connected nodes found",
+            }));
+        }
+
+        // Optionally write to disk if 'write' flag is set
+        let should_write = body.get("write").and_then(|v| v.as_bool()).unwrap_or(false);
+        let path = format!("~/hostfile-jaccl-{}node.json", count);
+
+        if should_write {
+            let pretty = serde_json::to_string_pretty(&hosts).unwrap_or_default();
+            // Write via local file (asmi runs on the coordinator)
+            let expanded = path.replace('~', &std::env::var("HOME").unwrap_or_default());
+            match std::fs::write(&expanded, &pretty) {
+                Ok(()) => {
+                    tracing::info!(path = %expanded, nodes = count, "wrote JACCL hostfile");
+                }
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to write hostfile: {e}"),
+                        "hosts": hosts,
+                    }));
+                }
+            }
+        }
+
+        Json(serde_json::json!({
+            "success": true,
+            "action": if should_write { "generate" } else { "discover" },
+            "hosts": hosts,
+            "nodeCount": count,
+            "path": if should_write { Some(&path) } else { None },
+        }))
+    }
+
     let app_state = AppState {
         snapshot,
+        cluster_state,
+        node_map: Arc::new(tokio::sync::RwLock::new(asmi_core::NodeMap::load())),
         hostname: hostname.clone(),
         started_at,
+        metrics_tx: metrics_tx.clone(),
     };
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/processes", get(processes_handler))
+        .route("/cluster", get(cluster_handler))
+        .route("/nodes", get(nodes_handler))
+        .route("/stream", get(stream_handler))
+        .route("/jaccl/config", get(jaccl_config_handler).post(jaccl_generate_handler))
         .with_state(app_state);
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!(%addr, "HTTP server listening");
-    eprintln!("{} daemon: http://{hostname}:{port}/metrics", bin_name());
+    if cluster_hub {
+        eprintln!("{} cluster hub: http://{hostname}:{port}/cluster", bin_name());
+    } else {
+        eprintln!("{} daemon: http://{hostname}:{port}/metrics", bin_name());
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
