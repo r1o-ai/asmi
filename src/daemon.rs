@@ -306,7 +306,7 @@ async fn logs_handler(
         "mlx-server" | "mlx_lm" => "/tmp/r1o-mlx_lm-server.log",
         "mlx-vlm" | "mlx_vlm" => "/tmp/r1o-mlx_vlm-server.log",
         "vllm" | "vllm_mlx" => "/tmp/r1o-vllm_mlx-server.log",
-        "asmi" | "daemon" => "~/Library/Application Support/asmi/asmi.log",
+        "asmi" | "daemon" => "~/Library/Logs/asmi-daemon.log",
         _ => {
             return Json(serde_json::json!({
                 "error": format!("unknown log name: {name}"),

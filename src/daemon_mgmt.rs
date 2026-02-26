@@ -160,7 +160,7 @@ pub(crate) async fn run_daemon(action: DaemonAction, port: u16) -> Result<()> {
         }
         DaemonAction::Logs { node } => {
             let target = node.as_deref().unwrap_or(&local_hostname);
-            let cmd = "tail -50 ~/Library/Application\\ Support/asmi/asmi.log";
+            let cmd = "tail -50 ~/Library/Logs/asmi-daemon.log";
             if target == local_hostname {
                 let _ = std::process::Command::new("sh")
                     .args(["-c", cmd])
