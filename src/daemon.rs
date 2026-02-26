@@ -25,18 +25,37 @@ pub struct RuntimeInfo {
     pub macos_version: Option<String>,
 }
 
+/// Resolve the best python3 binary. Homebrew python has the real MLX install;
+/// the system /usr/bin/python3 (3.9.6) has an older version.
+/// Returns the path as a string so callers can use it with Command::new().
+pub fn resolve_python() -> &'static str {
+    // Candidates in priority order
+    const CANDIDATES: &[&str] = &[
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ];
+    for p in CANDIDATES {
+        if std::path::Path::new(p).exists() {
+            return p;
+        }
+    }
+    "python3" // fallback to PATH
+}
+
 /// Probe the local Python environment for ML framework versions.
 pub async fn probe_runtime() -> RuntimeInfo {
     use tokio::process::Command;
 
-    let python = Command::new("python3")
+    let py = resolve_python();
+
+    let python = Command::new(py)
         .args(["-c", "import sys; print(sys.version.split()[0])"])
         .output().await
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
-    let mlx = Command::new("python3")
+    let mlx = Command::new(py)
         .args(["-c", "import mlx.core as mx; print(mx.__version__); print(mx.default_device())"])
         .output().await
         .ok()
@@ -54,7 +73,7 @@ pub async fn probe_runtime() -> RuntimeInfo {
         None => (None, None),
     };
 
-    let vllm = Command::new("python3")
+    let vllm = Command::new(py)
         .args(["-c", "import vllm; print(vllm.__version__)"])
         .output().await
         .ok()

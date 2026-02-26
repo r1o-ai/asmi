@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Resolve the best python3 binary (homebrew > system).
+fn resolve_python() -> &'static str {
+    const CANDIDATES: &[&str] = &[
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ];
+    for p in CANDIDATES {
+        if std::path::Path::new(p).exists() {
+            return p;
+        }
+    }
+    "python3"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     pub id: String,
@@ -30,7 +44,7 @@ pub async fn run_setup_checks() -> SetupChecks {
 }
 
 async fn check_python_mlx() -> CheckResult {
-    let output = tokio::process::Command::new("python3")
+    let output = tokio::process::Command::new(resolve_python())
         .args(["-c", "import mlx.core as mx; print(f'MLX {mx.__version__}')"])
         .output()
         .await;
