@@ -64,6 +64,10 @@ struct Cli {
     #[arg(long, default_value_t = 9090)]
     port: u16,
 
+    /// Directories to scan for models (comma-separated). Defaults to ~/Models + HuggingFace cache.
+    #[arg(long, value_delimiter = ',')]
+    models_dir: Vec<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -332,7 +336,7 @@ async fn main() -> Result<()> {
 
     // --serve mode: run as HTTP daemon (no TUI, no cluster discovery)
     if cli.serve {
-        return run_serve(cli.port, cli.interval, cli.cluster).await;
+        return run_serve(cli.port, cli.interval, cli.cluster, cli.models_dir).await;
     }
 
     // Smart default: tui if interactive terminal, table if piped
@@ -1571,7 +1575,7 @@ fn collect_hardware_identity() -> (Option<String>, Option<String>, Option<String
 /// With `--cluster`:
 /// - GET /cluster   → Vec<NodeSnapshot> for all known nodes (hub aggregator mode)
 /// - GET /nodes     → list of known node hostnames from NodeMap
-async fn run_serve(port: u16, interval: u64, cluster_hub: bool) -> Result<()> {
+async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>) -> Result<()> {
     // Init tracing to stderr (no TUI to corrupt)
     tracing_subscriber::fmt()
         .with_env_filter("asmi_core=info,asmi=info")
@@ -1697,11 +1701,18 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool) -> Result<()> {
     let model_cache: Arc<tokio::sync::RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>> =
         Arc::new(tokio::sync::RwLock::new(None));
 
+    // Prepare model directories: use CLI override if provided, else defaults
+    let model_dirs: Vec<std::path::PathBuf> = if cli_models_dir.is_empty() {
+        asmi_core::default_model_dirs()
+    } else {
+        cli_models_dir.iter().map(std::path::PathBuf::from).collect()
+    };
+
     // Background model scan — refresh every 60s
     {
         let model_cache = Arc::clone(&model_cache);
+        let dirs = model_dirs.clone();
         tokio::spawn(async move {
-            let dirs = asmi_core::default_model_dirs();
             loop {
                 let models = asmi_core::scan_models(&dirs);
                 tracing::info!(count = models.len(), "model scan complete");
