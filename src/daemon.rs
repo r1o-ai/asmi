@@ -1,4 +1,5 @@
 use axum::{extract::State, response::Json, routing::get, Router};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -10,6 +11,70 @@ pub struct AppState {
     pub hostname: String,
     pub started_at: std::time::Instant,
     pub metrics_tx: tokio::sync::broadcast::Sender<String>,
+    pub model_cache: Arc<RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>>,
+    pub runtime: Arc<RuntimeInfo>,
+}
+
+/// Cached Python/MLX/macOS version info, probed once at startup.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    pub python_version: Option<String>,
+    pub mlx_version: Option<String>,
+    pub mlx_device: Option<String>,
+    pub vllm_version: Option<String>,
+    pub macos_version: Option<String>,
+}
+
+/// Probe the local Python environment for ML framework versions.
+pub async fn probe_runtime() -> RuntimeInfo {
+    use tokio::process::Command;
+
+    let python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.version.split()[0])"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    let mlx = Command::new("python3")
+        .args(["-c", "import mlx.core as mx; print(mx.__version__); print(mx.default_device())"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    let (mlx_version, mlx_device) = match mlx {
+        Some(output) => {
+            let mut lines = output.lines();
+            (
+                lines.next().map(|s| s.to_string()),
+                lines.next().map(|s| s.to_string()),
+            )
+        }
+        None => (None, None),
+    };
+
+    let vllm = Command::new("python3")
+        .args(["-c", "import vllm; print(vllm.__version__)"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    let macos = Command::new("sw_vers")
+        .args(["-productVersion"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    RuntimeInfo {
+        python_version: python,
+        mlx_version,
+        mlx_device,
+        vllm_version: vllm,
+        macos_version: macos,
+    }
 }
 
 async fn metrics_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -21,11 +86,15 @@ async fn metrics_handler(State(state): State<AppState>) -> Json<serde_json::Valu
 }
 
 async fn health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let has_data = state.snapshot.read().await.is_some();
+    let snap = state.snapshot.read().await;
+    let has_data = snap.is_some();
+    let process_count = snap.as_ref().map(|s| s.processes.len()).unwrap_or(0);
     Json(serde_json::json!({
         "ok": has_data,
         "hostname": state.hostname,
         "uptime_secs": state.started_at.elapsed().as_secs(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "process_count": process_count,
     }))
 }
 
@@ -210,11 +279,86 @@ async fn jaccl_generate_handler(
     }))
 }
 
+/// GET /models → cached local model file listing
+async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cache = state.model_cache.read().await;
+    let (models, scanned_at) = match cache.as_ref() {
+        Some((m, t)) => (m.clone(), t.elapsed().as_secs()),
+        None => (vec![], 0),
+    };
+    Json(serde_json::json!({
+        "models": models,
+        "scan_age_seconds": scanned_at,
+    }))
+}
+
+/// GET /logs?name=mlx-server&lines=50 → tail server log files
+async fn logs_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let name = params.get("name").cloned().unwrap_or_else(|| "mlx-server".to_string());
+    let lines: usize = params.get("lines")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(50)
+        .min(500);
+
+    let log_path = match name.as_str() {
+        "mlx-server" | "mlx_lm" => "/tmp/r1o-mlx_lm-server.log",
+        "mlx-vlm" | "mlx_vlm" => "/tmp/r1o-mlx_vlm-server.log",
+        "vllm" | "vllm_mlx" => "/tmp/r1o-vllm_mlx-server.log",
+        "asmi" | "daemon" => "~/Library/Application Support/asmi/asmi.log",
+        _ => {
+            return Json(serde_json::json!({
+                "error": format!("unknown log name: {name}"),
+                "known_names": ["mlx-server", "mlx-vlm", "vllm", "asmi"],
+            }));
+        }
+    };
+
+    let expanded = log_path.replace('~', &std::env::var("HOME").unwrap_or_default());
+
+    match std::fs::read_to_string(&expanded) {
+        Ok(content) => {
+            let all_lines: Vec<&str> = content.lines().collect();
+            let start = all_lines.len().saturating_sub(lines);
+            let tail: Vec<&str> = all_lines[start..].to_vec();
+            Json(serde_json::json!({
+                "name": name,
+                "path": expanded,
+                "lines": tail,
+                "total_lines": all_lines.len(),
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "name": name,
+            "path": expanded,
+            "error": format!("could not read log: {e}"),
+        })),
+    }
+}
+
+/// GET /runtime → Python/MLX/macOS version info (cached at startup)
+async fn runtime_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::to_value(state.runtime.as_ref())
+        .unwrap_or(serde_json::json!({"error": "no runtime info"})))
+}
+
+/// GET /health/setup → run setup validation checks
+async fn setup_handler() -> Json<serde_json::Value> {
+    let checks = asmi_core::run_setup_checks().await;
+    Json(serde_json::to_value(&checks)
+        .unwrap_or(serde_json::json!({"error": "check failed"})))
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
+        .route("/health/setup", get(setup_handler))
         .route("/processes", get(processes_handler))
+        .route("/models", get(models_handler))
+        .route("/logs", get(logs_handler))
+        .route("/runtime", get(runtime_handler))
         .route("/cluster", get(cluster_handler))
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))

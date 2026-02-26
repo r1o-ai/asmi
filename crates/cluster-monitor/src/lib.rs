@@ -46,6 +46,8 @@ pub mod monitor;
 pub mod scanner;
 pub mod ssh;
 pub mod types;
+pub mod models;
+pub mod health;
 
 pub use aggregator::ClusterState;
 pub use collector::{
@@ -64,3 +66,5 @@ pub use types::{
     MlxServerInfo, ModelServerMetadata, MonitorError, NodeSnapshot, PortState, ProcessFramework,
     ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, TaskEnergy,
 };
+pub use models::{LocalModel, default_model_dirs, parse_model_name, scan_models};
+pub use health::{CheckResult, SetupChecks, run_setup_checks};
