@@ -179,6 +179,9 @@ mod tests {
             hostname: hostname.to_string(),
             online,
             timestamp: Utc::now(),
+            chip_model: None,
+            serial_number: None,
+            model_name: None,
             cpu_watts: 5000.0,  // 5W
             gpu_watts: 8000.0,  // 8W
             ane_watts: 100.0,   // 0.1W
@@ -191,6 +194,8 @@ mod tests {
             gpu_temp_c: None,
             processes: vec![],
             top_tasks: vec![],
+            rdma: None,
+            interface_ips: std::collections::BTreeMap::new(),
         }
     }
 
