@@ -87,8 +87,14 @@ impl ClusterMonitor {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
+        // Normalize to short hostname (strip .local / .tailnet-xxx.ts.net suffix)
+        // so it matches the short names in NodeMap seed_hosts.
         let local_hostname = whoami::fallible::hostname()
-            .unwrap_or_else(|_| "localhost".to_string());
+            .unwrap_or_else(|_| "localhost".to_string())
+            .split('.')
+            .next()
+            .unwrap_or("localhost")
+            .to_string();
 
         let events = self.event_sink();
 

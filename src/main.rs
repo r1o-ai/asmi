@@ -1849,9 +1849,20 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool) -> Result<()> {
             tracing::warn!("--cluster requested but NodeMap is empty; run `asmi` first to discover nodes");
             None
         } else {
-            tracing::info!(nodes = ?node_map.nodes, "cluster hub: polling {} nodes", node_map.nodes.len());
+            // Filter self from seed list — defense-in-depth against self-referencing
+            // loop where the daemon fetches from its own HTTP endpoint.
+            let remote_nodes: Vec<String> = node_map.nodes.iter()
+                .filter(|n| n.as_str() != hostname.as_str())
+                .cloned()
+                .collect();
+            tracing::info!(
+                all_nodes = ?node_map.nodes,
+                remote_nodes = ?remote_nodes,
+                "cluster hub: polling {} remote nodes (excluded self: {})",
+                remote_nodes.len(), hostname
+            );
             let cfg = ClusterConfig::default()
-                .with_seeds(node_map.nodes.clone())
+                .with_seeds(remote_nodes)
                 .with_poll_interval(Duration::from_secs(interval));
             let mut monitor = asmi_core::ClusterMonitor::new(cfg, node_map);
             let state = monitor.state();
