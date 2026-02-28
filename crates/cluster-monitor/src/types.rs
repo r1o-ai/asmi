@@ -40,6 +40,13 @@ pub struct NodeSnapshot {
     pub ram_used_bytes: u64,
     pub ram_total_bytes: u64,
     pub ram_percent: f64,
+    // Memory breakdown (macOS vm_stat categories)
+    // app = active + wired + compressor (what processes actually need)
+    // cached = speculative + inactive (file cache, immediately reclaimable)
+    #[serde(default)]
+    pub ram_app_bytes: u64,
+    #[serde(default)]
+    pub ram_cached_bytes: u64,
 
     // Thermals (celsius, optional because not all sources report them)
     pub cpu_temp_c: Option<f64>,

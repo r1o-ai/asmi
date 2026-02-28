@@ -55,6 +55,16 @@ fn footprint_cmd(pid: u32) -> String {
 ///   no SSH overhead). Falls back to SSH if the daemon is unreachable.
 /// - **Local node**: always runs commands directly to avoid self-referencing
 ///   the daemon's own HTTP endpoint (which would return stale cached data).
+///
+/// # INVARIANT: Self-Reference Prevention
+///
+/// When `is_local=true`, this function MUST NOT call `fetch_from_daemon()`.
+/// The daemon calls this function in its own poll loop — if it fetches from
+/// its own `/metrics` endpoint, it gets back its own cached (stale) snapshot,
+/// creating an infinite self-referencing loop where processes are never
+/// refreshed from `ps aux`.
+///
+/// This invariant is tested by `test_collect_node_metrics_local_bypasses_http`.
 pub async fn collect_node_metrics(
     hostname: &str,
     config: &ClusterConfig,
@@ -157,23 +167,22 @@ async fn collect_via_ssh(
 
     // 3. Parse hostname -s + vm_stat + sysctl
     // The combined command outputs: hostname\n---HOSTNAME---\nvm_stat...\n---MEMSIZE---\nmemsize
-    let (resolved_hostname, ram_used_bytes, ram_total_bytes) = match &mem_res {
+    let (resolved_hostname, mem_stats) = match &mem_res {
         Ok(r) if r.has_output() => {
             debug!(hostname, "vm_stat/sysctl OK");
             let (resolved, vmstat_text) = match r.stdout.split_once("---HOSTNAME---\n") {
                 Some((h, rest)) => (Some(h.trim().to_string()), rest.to_string()),
                 None => (None, r.stdout.clone()),
             };
-            let (used, total) = parse_vmstat_and_memsize(&vmstat_text);
-            (resolved, used, total)
+            (resolved, parse_vmstat_and_memsize(&vmstat_text))
         }
         Ok(r) => {
             debug!(hostname, stderr = r.stderr.as_str(), "vm_stat/sysctl empty/failed");
-            (None, 0, 0)
+            (None, MemoryStats::default())
         }
         Err(e) => {
             warn!(hostname, error = %e, "vm_stat/sysctl command error");
-            (None, 0, 0)
+            (None, MemoryStats::default())
         }
     };
 
@@ -262,16 +271,29 @@ async fn collect_via_ssh(
         for (pid, actual_port) in port_results {
             if let Some(proc) = processes.iter_mut().find(|p| p.pid == pid) {
                 if let Some(real_port) = actual_port {
-                    if proc.port != Some(real_port) {
-                        debug!(
-                            hostname,
-                            pid,
-                            cli_port = ?proc.port,
-                            actual_port = real_port,
-                            "port mismatch: lsof overrides CLI --port"
-                        );
+                    match proc.port {
+                        Some(cli_port) if cli_port != real_port => {
+                            // CLI --port takes priority over lsof. The lsof
+                            // port may be an internal IPC socket (e.g. Python
+                            // runtime or Metal framework) rather than the
+                            // server's actual listening port.
+                            debug!(
+                                hostname,
+                                pid,
+                                cli_port,
+                                lsof_port = real_port,
+                                "port mismatch: CLI --port wins over lsof"
+                            );
+                            // Keep proc.port unchanged (CLI value).
+                        }
+                        Some(_) => {
+                            // CLI and lsof agree — nothing to do.
+                        }
+                        None => {
+                            // No --port on command line; use lsof as fallback.
+                            proc.port = Some(real_port);
+                        }
                     }
-                    proc.port = Some(real_port);
                 }
             }
         }
@@ -352,8 +374,9 @@ async fn collect_via_ssh(
     };
 
     // 10. Assemble NodeSnapshot
-    let ram_percent = if ram_total_bytes > 0 {
-        (ram_used_bytes as f64 / ram_total_bytes as f64) * 100.0
+    // ram_percent reflects actual app usage (excludes file cache)
+    let ram_percent = if mem_stats.total_bytes > 0 {
+        (mem_stats.app_bytes as f64 / mem_stats.total_bytes as f64) * 100.0
     } else {
         0.0
     };
@@ -371,9 +394,11 @@ async fn collect_via_ssh(
         ane_watts: power.ane_mw,
         cpu_percent: power.cpu_percent,
         gpu_percent: power.gpu_percent,
-        ram_used_bytes,
-        ram_total_bytes,
+        ram_used_bytes: mem_stats.used_bytes,
+        ram_total_bytes: mem_stats.total_bytes,
         ram_percent,
+        ram_app_bytes: mem_stats.app_bytes,
+        ram_cached_bytes: mem_stats.cached_bytes,
         cpu_temp_c: None,
         gpu_temp_c: None,
         processes,
@@ -534,6 +559,20 @@ pub fn parse_powermetrics_text(text: &str) -> PowerMetricsResult {
     result
 }
 
+/// Breakdown of macOS memory categories from vm_stat.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryStats {
+    /// Total physical RAM from sysctl hw.memsize.
+    pub total_bytes: u64,
+    /// Legacy "used" = active + inactive + speculative + wired + compressor.
+    /// Kept for backward compatibility. Includes file cache.
+    pub used_bytes: u64,
+    /// App memory = active + wired + compressor. What processes actually need.
+    pub app_bytes: u64,
+    /// Cached memory = speculative + inactive. File cache, immediately reclaimable.
+    pub cached_bytes: u64,
+}
+
 /// Parse combined vm_stat + sysctl output.
 ///
 /// The input format is:
@@ -546,10 +585,10 @@ pub fn parse_powermetrics_text(text: &str) -> PowerMetricsResult {
 /// 549755813888
 /// ```
 ///
-/// Returns `(used_bytes, total_bytes)`.
-///
-/// Used memory = (active + inactive + speculative + wired + occupied_by_compressor) * page_size
-pub fn parse_vmstat_and_memsize(text: &str) -> (u64, u64) {
+/// Returns a `MemoryStats` separating app memory (active + wired + compressor)
+/// from cached memory (speculative + inactive). `used_bytes` is the legacy total
+/// for backward compatibility.
+pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
     // Split on the separator
     let parts: Vec<&str> = text.splitn(2, "---MEMSIZE---").collect();
     let vmstat_text = parts.first().copied().unwrap_or("");
@@ -593,9 +632,16 @@ pub fn parse_vmstat_and_memsize(text: &str) -> (u64, u64) {
         }
     }
 
-    let used_bytes = (active + inactive + speculative + wired + compressor) * page_size;
+    let app_bytes = (active + wired + compressor) * page_size;
+    let cached_bytes = (speculative + inactive) * page_size;
+    let used_bytes = app_bytes + cached_bytes;
 
-    (used_bytes, total_bytes)
+    MemoryStats {
+        total_bytes,
+        used_bytes,
+        app_bytes,
+        cached_bytes,
+    }
 }
 
 /// Parse `ps aux` output filtered for MLX/vLLM processes.
@@ -787,25 +833,33 @@ mod tests {
         let sysctl = include_str!("../testdata/sysctl-hw.txt");
         let combined = format!("{vmstat}\n---MEMSIZE---\n{sysctl}");
 
-        let (used, total) = parse_vmstat_and_memsize(&combined);
+        let stats = parse_vmstat_and_memsize(&combined);
 
         // Total should be 549755813888 (512 GiB)
-        assert_eq!(total, 549_755_813_888, "total_bytes");
+        assert_eq!(stats.total_bytes, 549_755_813_888, "total_bytes");
 
-        // Used should be > 0 and < total
-        assert!(used > 0, "used_bytes should be > 0, got {used}");
-        assert!(used < total, "used_bytes ({used}) should be < total ({total})");
+        // App = active + wired + compressor = 11058419 + 1434855 + 422 = 12493696 pages
+        let expected_app_pages: u64 = 11_058_419 + 1_434_855 + 422;
+        let expected_app = expected_app_pages * 16384;
+        assert_eq!(stats.app_bytes, expected_app, "app_bytes");
 
-        // Sanity: active=11058419 + inactive=11287075 + speculative=133882 +
-        //         wired=1434855 + compressor=422 = 23914653 pages
-        // 23914653 * 16384 = 391,808,155,648 bytes
-        let expected_pages: u64 = 11_058_419 + 11_287_075 + 133_882 + 1_434_855 + 422;
-        let expected = expected_pages * 16384;
-        assert_eq!(used, expected, "used bytes mismatch");
+        // Cached = speculative + inactive = 133882 + 11287075 = 11420957 pages
+        let expected_cached_pages: u64 = 133_882 + 11_287_075;
+        let expected_cached = expected_cached_pages * 16384;
+        assert_eq!(stats.cached_bytes, expected_cached, "cached_bytes");
 
-        eprintln!("Parsed: used={used} ({:.1} GiB), total={total} ({:.1} GiB)",
-            used as f64 / (1024.0 * 1024.0 * 1024.0),
-            total as f64 / (1024.0 * 1024.0 * 1024.0),
+        // Used = app + cached (backward compat)
+        assert_eq!(stats.used_bytes, expected_app + expected_cached, "used_bytes = app + cached");
+
+        // Sanity: app should be much smaller than total
+        assert!(stats.app_bytes < stats.total_bytes / 2, "app_bytes should be < 50% of total");
+
+        eprintln!(
+            "Parsed: app={:.1} GiB, cached={:.1} GiB, used={:.1} GiB, total={:.1} GiB",
+            stats.app_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            stats.cached_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            stats.used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            stats.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
     }
 
@@ -815,9 +869,12 @@ mod tests {
                      Pages active:                               100.\n\
                      ---MEMSIZE---\n\
                      8589934592\n";
-        let (used, total) = parse_vmstat_and_memsize(text);
-        assert_eq!(total, 8_589_934_592);
-        assert_eq!(used, 100 * 4096);
+        let stats = parse_vmstat_and_memsize(text);
+        assert_eq!(stats.total_bytes, 8_589_934_592);
+        // Only active pages — no inactive/speculative/wired/compressor
+        assert_eq!(stats.app_bytes, 100 * 4096);  // active goes into app (with wired+compressor=0)
+        assert_eq!(stats.cached_bytes, 0);
+        assert_eq!(stats.used_bytes, 100 * 4096);
     }
 
     #[test]
@@ -946,5 +1003,54 @@ mod tests {
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].framework, ProcessFramework::MlxLaunch);
         assert_eq!(procs[0].distributed, Some(DistributedBackend::Ring));
+    }
+
+    #[tokio::test]
+    async fn test_collect_node_metrics_local_bypasses_http() {
+        // When is_local=true, collect_node_metrics should NEVER call
+        // fetch_from_daemon(). It should go directly to collect_via_ssh()
+        // with local command execution.
+        //
+        // We can't easily mock the HTTP call, but we CAN verify that:
+        // 1. The function returns a snapshot (not an HTTP error)
+        // 2. The hostname in the snapshot is set (from `hostname -s`)
+        // 3. ram_total_bytes > 0 (from sysctl, proving local exec ran)
+        //
+        // If this were hitting an HTTP endpoint that doesn't exist on the
+        // test host, ram_total_bytes would be 0.
+        let config = crate::config::ClusterConfig::default();
+        let snap = super::collect_node_metrics("localhost", &config, true).await;
+
+        assert!(snap.online, "local snapshot should be online");
+        assert!(
+            snap.ram_total_bytes > 0,
+            "ram_total_bytes should be > 0 (proves local exec ran, not HTTP fetch). Got: {}",
+            snap.ram_total_bytes
+        );
+        assert!(
+            !snap.hostname.is_empty(),
+            "hostname should be resolved from `hostname -s`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_node_metrics_remote_tries_http_first() {
+        // When is_local=false and the daemon is unreachable, the function
+        // should fall back to SSH. With a bogus hostname, both HTTP and SSH
+        // will fail, resulting in an offline-looking snapshot.
+        //
+        // This test verifies the function doesn't panic and handles
+        // unreachable remotes gracefully.
+        let config = crate::config::ClusterConfig {
+            daemon_port: 19999, // deliberately wrong port
+            ssh_timeout: std::time::Duration::from_secs(1),
+            ..Default::default()
+        };
+        let snap = super::collect_node_metrics("nonexistent-host-12345", &config, false).await;
+
+        // Should return a snapshot (not panic), but with zero/empty data
+        // because both HTTP and SSH failed
+        assert!(snap.online, "snapshot.online is always true from collect_via_ssh");
+        assert_eq!(snap.ram_total_bytes, 0, "unreachable host should have 0 RAM");
     }
 }

@@ -190,6 +190,8 @@ mod tests {
             ram_used_bytes: 128 * 1024 * 1024 * 1024, // 128 GiB
             ram_total_bytes: 512 * 1024 * 1024 * 1024, // 512 GiB
             ram_percent: 25.0,
+            ram_app_bytes: 128 * 1024 * 1024 * 1024,
+            ram_cached_bytes: 0,
             cpu_temp_c: Some(42.0),
             gpu_temp_c: None,
             processes: vec![],
