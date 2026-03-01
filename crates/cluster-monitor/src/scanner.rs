@@ -12,6 +12,7 @@
 
 use crate::collector::fetch_from_daemon;
 use crate::config::{ClusterConfig, DiscoveryMethod};
+use crate::health::{find_thunderbolt_issues, parse_thunderbolt_services};
 use crate::ssh::{local_run, ssh_run};
 use crate::types::*;
 use crate::types::ModelServerMetadata;
@@ -485,6 +486,26 @@ pub async fn scan_cluster(config: &ClusterConfig, events: &EventSink) -> Vec<Sca
                     port_state: device.port_state,
                 });
             }
+        }
+    }
+
+    // Post-scan: check Thunderbolt network service names on each SSH-reachable node.
+    // Uses `networksetup -listallnetworkservices` to detect duplicates / non-r1o prefixes.
+    for result in &results {
+        if !result.ssh_ok {
+            continue;
+        }
+        let tb_cmd = "networksetup -listallnetworkservices 2>/dev/null | grep -i thunder";
+        let tb_services = match ssh_run(&result.hostname, tb_cmd, config).await {
+            Ok(ref r) if r.has_output() => parse_thunderbolt_services(&r.stdout),
+            _ => continue,
+        };
+        let issues = find_thunderbolt_issues(&tb_services);
+        if !issues.is_empty() {
+            events.emit(ClusterEvent::ThunderboltServiceIssue {
+                hostname: result.hostname.clone(),
+                issues,
+            });
         }
     }
 

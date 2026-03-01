@@ -1,5 +1,6 @@
 mod daemon;
 mod daemon_mgmt;
+mod serve;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -275,6 +276,15 @@ impl ActivityLog {
                     Color::Red
                 };
                 self.push(format!("RDMA: {rdma_device} {port_state}"), color);
+            }
+            ClusterEvent::ThunderboltServiceIssue { hostname, issues } => {
+                self.push(
+                    format!("TB services: {hostname} — {} issue(s)", issues.len()),
+                    Color::Yellow,
+                );
+                for issue in issues {
+                    self.push(format!("  {issue}"), Color::Red);
+                }
             }
         }
     }
@@ -807,8 +817,13 @@ fn render_header(f: &mut Frame, state: &ClusterState, area: Rect) {
             ),
             Span::raw("  "),
             Span::styled(
-                format!("{:.0}/{:.0} GB", agg.total_ram_used_gib(), agg.total_ram_total_gib()),
+                format!("{:.0}/{:.0} GB", agg.total_ram_app_gib(), agg.total_ram_total_gib()),
                 Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("cache {:.0} GB", agg.total_ram_cached_gib()),
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(vec![
@@ -856,7 +871,7 @@ fn render_nodes(
     merge_mode: Option<&MergeMode>,
     area: Rect,
 ) {
-    let header_cells = ["Node", "Chip", "TB", "CPU%", "GPU%", "RAM", "Power", "RDMA", "Processes"]
+    let header_cells = ["Node", "Chip", "TB", "CPU%", "GPU%", "RAM", "Cache", "Power", "RDMA", "Processes"]
         .iter()
         .map(|h| {
             Cell::from(*h).style(
@@ -888,6 +903,7 @@ fn render_nodes(
                         Cell::from("--"),
                         Cell::from("--"),
                         Cell::from("--"),
+                        Cell::from("--"),
                     ])
                     .style(Style::default().fg(Color::DarkGray));
                 }
@@ -898,18 +914,18 @@ fn render_nodes(
                     snap.processes
                         .iter()
                         .map(|p| {
-                            let name = if let Some(m) = p.server_models.first() {
+                            let model_name = if let Some(m) = p.server_models.first() {
                                 m.id.rsplit('/').next().unwrap_or(&m.id).to_string()
                             } else if let Some(m) = p.model.as_deref() {
                                 m.rsplit('/').next().unwrap_or(m).to_string()
                             } else {
-                                p.framework.to_string()
+                                "no model".to_string()
                             };
-                            if let Some(dist) = &p.distributed {
-                                format!("{name} [{dist}]")
-                            } else {
-                                name
-                            }
+                            let port_str = p.port
+                                .map(|port| format!(":{port}"))
+                                .unwrap_or_default();
+                            let backend_str = format_backend(p.distributed.as_ref());
+                            format!("{model_name}{port_str} {backend_str}")
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -1002,6 +1018,25 @@ fn render_nodes(
                     Style::default()
                 };
 
+                // RAM column: show app memory (what processes need), not total used
+                let ram_app = snap.ram_app_gib();
+                let ram_total = snap.ram_total_gib();
+                let ram_pct = if snap.ram_total_bytes > 0 {
+                    (snap.ram_app_bytes as f64 / snap.ram_total_bytes as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let ram_color = if ram_pct > 90.0 {
+                    Color::Red
+                } else if ram_pct > 70.0 {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                };
+
+                // Cache column: file cache (reclaimable)
+                let cache_gib = snap.ram_cached_gib();
+
                 Row::new(vec![
                     Cell::from(node_display).style(Style::default().fg(Color::White)),
                     Cell::from(chip).style(Style::default().fg(Color::DarkGray)),
@@ -1010,8 +1045,10 @@ fn render_nodes(
                         .style(Style::default().fg(usage_color(snap.cpu_percent))),
                     Cell::from(format!("{:.0}%", snap.gpu_percent))
                         .style(Style::default().fg(gpu_color(snap.gpu_percent))),
-                    Cell::from(format!("{:.0}/{:.0}G", snap.ram_used_gib(), snap.ram_total_gib()))
-                        .style(Style::default().fg(Color::Cyan)),
+                    Cell::from(format!("{:.0}/{:.0}G", ram_app, ram_total))
+                        .style(Style::default().fg(ram_color)),
+                    Cell::from(format!("{:.0}G", cache_gib))
+                        .style(Style::default().fg(Color::DarkGray)),
                     Cell::from(format!("{:.1}W", snap.total_watts()))
                         .style(Style::default().fg(Color::Yellow)),
                     Cell::from(rdma_info).style(Style::default().fg(rdma_color)),
@@ -1028,6 +1065,7 @@ fn render_nodes(
                     Cell::from("--"),
                     Cell::from("--"),
                     Cell::from("--"),
+                    Cell::from("--"),
                 ])
                 .style(Style::default().fg(Color::DarkGray))
             }
@@ -1040,7 +1078,8 @@ fn render_nodes(
         Constraint::Length(10), // TB link speed
         Constraint::Length(6),  // CPU%
         Constraint::Length(6),  // GPU%
-        Constraint::Length(12), // RAM
+        Constraint::Length(12), // RAM (app)
+        Constraint::Length(7),  // Cache
         Constraint::Length(8),  // Power
         Constraint::Length(10), // RDMA
         Constraint::Min(20),    // Processes
@@ -1113,36 +1152,37 @@ fn render_node_summary(
         format!("  RDMA: {}", parts.join(" "))
     };
 
-    let (cpu_s, gpu_s, ram_s, power_s, proc_s) = snap
+    let (cpu_s, gpu_s, ram_s, cache_s, power_s, proc_s) = snap
         .map(|s| {
             let procs = if s.processes.is_empty() {
                 "idle".to_string()
             } else {
-                let names: Vec<String> = s.processes
-                    .iter()
-                    .flat_map(|p| {
-                        if !p.server_models.is_empty() {
-                            p.server_models.iter()
-                                .map(|m| m.id.rsplit('/').next().unwrap_or(&m.id).to_string())
-                                .collect::<Vec<_>>()
-                        } else if let Some(ref m) = p.model {
-                            vec![m.rsplit('/').next().unwrap_or(m).to_string()]
-                        } else {
-                            vec![p.framework.to_string()]
-                        }
-                    })
-                    .collect();
-                names.join(", ")
+                s.processes.iter().map(|p| {
+                    let model_name = if !p.server_models.is_empty() {
+                        p.server_models.iter()
+                            .map(|m| m.id.rsplit('/').next().unwrap_or(&m.id).to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else if let Some(ref m) = p.model {
+                        m.rsplit('/').next().unwrap_or(m).to_string()
+                    } else {
+                        "no model".to_string()
+                    };
+                    let port_str = p.port.map(|port| format!(":{port}")).unwrap_or_default();
+                    let backend_str = format_backend(p.distributed.as_ref());
+                    format!("{model_name}{port_str} {backend_str}")
+                }).collect::<Vec<_>>().join(", ")
             };
             (
                 format!("CPU {:.0}%", s.cpu_percent),
                 format!("GPU {:.0}%", s.gpu_percent),
-                format!("{:.0}/{:.0}G", s.ram_used_gib(), s.ram_total_gib()),
+                format!("{:.0}/{:.0}G", s.ram_app_gib(), s.ram_total_gib()),
+                format!("cache {:.0}G", s.ram_cached_gib()),
                 format!("{:.1}W", s.total_watts()),
                 procs,
             )
         })
-        .unwrap_or_else(|| ("--".into(), "--".into(), "--".into(), "--".into(), "--".into()));
+        .unwrap_or_else(|| ("--".into(), "--".into(), "--".into(), "--".into(), "--".into(), "--".into()));
 
     let content = vec![
         Line::from(vec![
@@ -1163,6 +1203,8 @@ fn render_node_summary(
             Span::styled(gpu_s, Style::default().fg(gpu_color(snap.map(|s| s.gpu_percent).unwrap_or(0.0)))),
             Span::raw("  "),
             Span::styled(ram_s, Style::default().fg(Color::Cyan)),
+            Span::raw("  "),
+            Span::styled(cache_s, Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
             Span::styled(power_s, Style::default().fg(Color::Yellow)),
             Span::styled(rdma_summary, Style::default().fg(Color::Green)),
@@ -1200,12 +1242,22 @@ fn render_node_detail(
             .collect()
     };
 
-    // Layout: big CPU/GPU chart on top, Power + RAM on bottom
+    // Count processes for layout sizing
+    let proc_count = snap.map(|s| s.processes.len()).unwrap_or(0);
+    // Processes table: header(1) + margin(1) + rows + border(2), min 3 for "no model loaded"
+    let proc_height = if proc_count > 0 {
+        (proc_count as u16 + 4).min(10) // cap at 10 rows
+    } else {
+        3 // "no model loaded" message
+    };
+
+    // Layout: CPU/GPU chart on top, processes, Power + RAM on bottom
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(8),   // CPU+GPU combined chart (gets most space)
-            Constraint::Length(7), // Power + RAM side by side
+            Constraint::Min(8),              // CPU+GPU chart (gets remaining space)
+            Constraint::Length(proc_height),  // Processes table
+            Constraint::Length(7),            // Power + RAM side by side
         ])
         .split(area);
 
@@ -1275,11 +1327,14 @@ fn render_node_detail(
         .legend_position(Some(ratatui::widgets::LegendPosition::TopRight));
     f.render_widget(chart, rows[0]);
 
+    // ── Processes table ──
+    render_process_table(f, snap, rows[1]);
+
     // ── Bottom row: Power chart + RAM gauge ──
     let bot_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(rows[1]);
+        .split(rows[2]);
 
     // Power chart
     let power_points: Vec<(f64, f64)> = history
@@ -1346,33 +1401,35 @@ fn render_node_detail(
     f.render_widget(ram_block, bot_cols[1]);
 
     if let Some(s) = snap {
-        let ratio = if s.ram_total_bytes > 0 {
-            s.ram_used_bytes as f64 / s.ram_total_bytes as f64
+        // Use app memory (not total used which includes file cache)
+        let app_ratio = if s.ram_total_bytes > 0 {
+            s.ram_app_bytes as f64 / s.ram_total_bytes as f64
         } else {
             0.0
         };
-        let ram_color = if ratio > 0.9 {
+        let ram_color = if app_ratio > 0.9 {
             Color::Red
-        } else if ratio > 0.7 {
+        } else if app_ratio > 0.7 {
             Color::Yellow
         } else {
             Color::Cyan
         };
 
-        // Stack: gauge + text info
+        // Stack: label + gauge + cache + gpu footprint
         let ram_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // label
+                Constraint::Length(1), // label (app memory)
                 Constraint::Length(1), // gauge
-                Constraint::Length(1), // details
+                Constraint::Length(1), // cache info
+                Constraint::Length(1), // gpu footprint
                 Constraint::Min(0),
             ])
             .split(ram_inner);
 
         let label = Line::from(vec![
             Span::styled(
-                format!(" {:.0}G", s.ram_used_gib()),
+                format!(" {:.0}G", s.ram_app_gib()),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
@@ -1382,7 +1439,7 @@ fn render_node_detail(
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                format!("  ({:.0}%)", ratio * 100.0),
+                format!("  ({:.0}%)", app_ratio * 100.0),
                 Style::default().fg(ram_color),
             ),
         ]);
@@ -1394,8 +1451,18 @@ fn render_node_detail(
                     .fg(ram_color)
                     .bg(Color::Rgb(30, 30, 40)),
             )
-            .ratio(ratio.min(1.0));
+            .ratio(app_ratio.min(1.0));
         f.render_widget(gauge, ram_rows[1]);
+
+        // Show cached memory
+        let cache_line = Line::from(vec![
+            Span::styled(" Cache: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.0}G", s.ram_cached_gib()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(cache_line), ram_rows[2]);
 
         // GPU footprint if processes running
         let gpu_footprint: f64 = s
@@ -1411,9 +1478,117 @@ fn render_node_detail(
                     Style::default().fg(Color::Magenta),
                 ),
             ]);
-            f.render_widget(Paragraph::new(ft_line), ram_rows[2]);
+            f.render_widget(Paragraph::new(ft_line), ram_rows[3]);
         }
     }
+}
+
+/// Process table shown in node detail view — model, port, framework, RAM.
+fn render_process_table(
+    f: &mut Frame,
+    snap: Option<&asmi_core::NodeSnapshot>,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " Processes ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let Some(s) = snap else {
+        f.render_widget(block, area);
+        return;
+    };
+
+    if s.processes.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let msg = Paragraph::new(Line::from(vec![
+            Span::styled(" no model loaded", Style::default().fg(Color::DarkGray)),
+        ]));
+        f.render_widget(msg, inner);
+        return;
+    }
+
+    let header_cells = ["Framework", "Backend", "Model", "Port", "RAM", "CPU%"]
+        .iter()
+        .map(|h| {
+            Cell::from(*h).style(
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let proc_rows: Vec<Row> = s
+        .processes
+        .iter()
+        .map(|p| {
+            let model_name = if let Some(m) = p.server_models.first() {
+                m.id.rsplit('/').next().unwrap_or(&m.id).to_string()
+            } else if let Some(m) = p.model.as_deref() {
+                m.rsplit('/').next().unwrap_or(m).to_string()
+            } else {
+                "no model".to_string()
+            };
+
+            let port_s = p
+                .port
+                .map(|port| format!("{port}"))
+                .unwrap_or_else(|| "--".to_string());
+
+            let ram_s = p
+                .footprint_mb
+                .map(|mb| {
+                    if mb >= 1024.0 {
+                        format!("{:.1}G", mb / 1024.0)
+                    } else {
+                        format!("{:.0}M", mb)
+                    }
+                })
+                .unwrap_or_else(|| "--".to_string());
+
+            let backend = format_backend(p.distributed.as_ref());
+            let backend_color = match p.distributed {
+                Some(asmi_core::DistributedBackend::Jaccl) => Color::Green,
+                Some(asmi_core::DistributedBackend::Ring) => Color::Blue,
+                None => Color::DarkGray,
+            };
+
+            Row::new(vec![
+                Cell::from(p.framework.to_string())
+                    .style(Style::default().fg(Color::Blue)),
+                Cell::from(backend)
+                    .style(Style::default().fg(backend_color)),
+                Cell::from(model_name).style(Style::default().fg(Color::Magenta)),
+                Cell::from(port_s).style(Style::default().fg(Color::Yellow)),
+                Cell::from(ram_s).style(Style::default().fg(Color::Cyan)),
+                Cell::from(format!("{:.0}%", p.cpu_percent))
+                    .style(Style::default().fg(usage_color(p.cpu_percent))),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(12), // Framework
+        Constraint::Length(8),  // Backend
+        Constraint::Min(20),    // Model
+        Constraint::Length(6),  // Port
+        Constraint::Length(8),  // RAM
+        Constraint::Length(6),  // CPU%
+    ];
+
+    let table = Table::new(proc_rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1);
+
+    f.render_widget(table, area);
 }
 
 fn render_footer(
@@ -1453,6 +1628,15 @@ fn usage_color(percent: f64) -> Color {
     }
 }
 
+/// Format the distributed backend for display.
+/// Shows [local] when no distributed backend, [jaccl] or [ring] otherwise.
+fn format_backend(backend: Option<&asmi_core::DistributedBackend>) -> String {
+    match backend {
+        Some(d) => format!("[{d}]"),
+        None => "[local]".to_string(),
+    }
+}
+
 /// GPU color: on Apple Silicon, 100% is normal (model serving).
 /// Only idle is noteworthy.
 fn gpu_color(percent: f64) -> Color {
@@ -1468,8 +1652,8 @@ fn gpu_color(percent: f64) -> Color {
 /// Print a one-shot table (like nvidia-smi default output)
 fn print_table(state: &ClusterState) {
     let agg = &state.aggregates;
-    println!("+{:-<82}+", "");
-    println!("| {:<80} |", format!(
+    println!("+{:-<92}+", "");
+    println!("| {:<90} |", format!(
         "{}   {}  nodes: {}/{}  power: {:.1}W  RAM: {:.0}/{:.0}GB",
         bin_name(),
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -1479,10 +1663,10 @@ fn print_table(state: &ClusterState) {
         agg.total_ram_used_gib(),
         agg.total_ram_total_gib(),
     ));
-    println!("+{:-<82}+", "");
-    println!("| {:<10} {:<10} {:<6} {:<6} {:<12} {:<8} {:<6} {:<14} |",
-        "Node", "TB", "CPU%", "GPU%", "RAM", "Power", "RDMA", "Model");
-    println!("|{:-<82}|", "");
+    println!("+{:-<92}+", "");
+    println!("| {:<10} {:<10} {:<6} {:<6} {:<12} {:<7} {:<8} {:<6} {:<17} |",
+        "Node", "TB", "CPU%", "GPU%", "RAM", "Cache", "Power", "RDMA", "Model");
+    println!("|{:-<92}|", "");
 
     for name in state.sorted_hostnames() {
         if let Some(snap) = state.snapshots.get(&name) {
@@ -1490,18 +1674,16 @@ fn print_table(state: &ClusterState) {
                 "--".to_string()
             } else {
                 snap.processes.iter().map(|p| {
-                    let name = if let Some(m) = p.server_models.first() {
+                    let model_name = if let Some(m) = p.server_models.first() {
                         m.id.rsplit('/').next().unwrap_or(&m.id).to_string()
                     } else if let Some(m) = p.model.as_deref() {
                         m.rsplit('/').next().unwrap_or(m).to_string()
                     } else {
-                        p.framework.to_string()
+                        "no model".to_string()
                     };
-                    if let Some(dist) = &p.distributed {
-                        format!("{name} [{dist}]")
-                    } else {
-                        name
-                    }
+                    let port_str = p.port.map(|port| format!(":{port}")).unwrap_or_default();
+                    let backend_str = format_backend(p.distributed.as_ref());
+                    format!("{model_name}{port_str} {backend_str}")
                 }).collect::<Vec<_>>().join(", ")
             };
             let scan = state.scan_results.iter().find(|r| r.hostname == name);
@@ -1516,20 +1698,22 @@ fn print_table(state: &ClusterState) {
                     format!("{a}/{t}")
                 })
                 .unwrap_or_else(|| "--".to_string());
-            println!("| {:<10} {:<10} {:>4.0}% {:>4.0}% {:>4.0}/{:<4.0}GB {:>5.1}W  {:<6} {:<14} |",
+            let cache_g = format!("{:.0}G", snap.ram_cached_gib());
+            println!("| {:<10} {:<10} {:>4.0}% {:>4.0}% {:>4.0}/{:<4.0}GB {:<7} {:>5.1}W  {:<6} {:<17} |",
                 name,
                 tb_speed,
                 snap.cpu_percent,
                 snap.gpu_percent,
-                snap.ram_used_gib(),
+                snap.ram_app_gib(),
                 snap.ram_total_gib(),
+                cache_g,
                 snap.total_watts(),
                 rdma_info,
                 proc_desc,
             );
         }
     }
-    println!("+{:-<82}+", "");
+    println!("+{:-<92}+", "");
 }
 
 /// Print JSON output
@@ -1722,7 +1906,33 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: 
         });
     }
 
-    // Build axum router
+    // Thunderbolt cache — populated by background scan loop (60s)
+    let thunderbolt_cache: Arc<tokio::sync::RwLock<Option<(serde_json::Value, std::time::Instant)>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    {
+        let tb_cache = Arc::clone(&thunderbolt_cache);
+        let tb_hostname = hostname.clone();
+        tokio::spawn(async move {
+            loop {
+                let data = daemon::scan_thunderbolt(&tb_hostname).await;
+                *tb_cache.write().await = Some((data, std::time::Instant::now()));
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    // Build axum router — init all managed MLX servers in parallel
+    let managers: Vec<_> = futures::future::join_all(
+        serve::MANAGED_PORTS.iter().map(|&(port, engine)| {
+            serve::ServeManager::restore(port, engine)
+        })
+    ).await;
+
+    let mut serve_managers = std::collections::HashMap::new();
+    for (i, mgr) in managers.into_iter().enumerate() {
+        serve_managers.insert(serve::MANAGED_PORTS[i].0, mgr);
+    }
+
     let app_state = daemon::AppState {
         snapshot,
         cluster_state,
@@ -1731,17 +1941,43 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: 
         started_at,
         metrics_tx: metrics_tx.clone(),
         model_cache,
+        thunderbolt_cache,
         runtime,
+        serve_managers: Arc::new(serve_managers),
     };
 
     let app = daemon::build_router(app_state);
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!(%addr, "HTTP server listening");
+    let base = format!("http://{hostname}:{port}");
+    let name = bin_name();
     if cluster_hub {
-        eprintln!("{} cluster hub: http://{hostname}:{port}/cluster", bin_name());
+        eprintln!("{name} cluster hub: {base}");
     } else {
-        eprintln!("{} daemon: http://{hostname}:{port}/metrics", bin_name());
+        eprintln!("{name} daemon: {base}");
+    }
+    eprintln!("  GET  /metrics          Node snapshot (CPU, GPU, RAM, power)");
+    eprintln!("  GET  /health           Daemon liveness + uptime");
+    eprintln!("  GET  /health/setup     Setup validation (MLX, RDMA, SSH, disk)");
+    eprintln!("  GET  /health/network   Thunderbolt service validation");
+    eprintln!("  POST /health/network/fix  Auto-repair TB service names");
+    eprintln!("  GET  /processes        Running MLX/VLM processes");
+    eprintln!("  GET  /models           Local model inventory");
+    eprintln!("  GET  /runtime          Python/MLX/macOS versions");
+    eprintln!("  GET  /logs?name=asmi   Tail log files");
+    eprintln!("  GET  /stream           SSE live metrics stream");
+    eprintln!("  GET  /serve/status     All server states (or ?port=N)");
+    eprintln!("  POST /serve/load       Load model (?port=N)");
+    eprintln!("  POST /serve/stop       Stop server (?port=N)");
+    eprintln!("  POST /serve/reload     Reload model (?port=N)");
+    let ports_str: Vec<String> = serve::MANAGED_PORTS.iter().map(|(p, e)| format!("{p}({e})")).collect();
+    eprintln!("  Managed ports: {}", ports_str.join(", "));
+    if cluster_hub {
+        eprintln!("  GET  /cluster          All node snapshots (hub mode)");
+        eprintln!("  GET  /nodes            Known node hostnames");
+        eprintln!("  GET  /jaccl/config     RDMA topology for JACCL");
+        eprintln!("  POST /jaccl/config     Generate JACCL hostfile");
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

@@ -16,10 +16,16 @@ pub struct LocalModel {
 }
 
 /// Default directories to scan for models (macOS).
+/// Creates ~/Models if it doesn't exist (canonical model storage).
 pub fn default_model_dirs() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let models_dir = home.join("Models");
+    // Ensure ~/Models exists on every node
+    if !models_dir.exists() {
+        let _ = std::fs::create_dir_all(&models_dir);
+    }
     vec![
-        home.join("Models"),
+        models_dir,
         home.join(".cache/huggingface/hub"),
     ]
 }

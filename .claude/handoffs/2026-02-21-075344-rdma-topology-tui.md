@@ -167,7 +167,7 @@ The `hostfile_jaccl()` method generates a 2-node JACCL hostfile correctly (teste
 ### Environment Variables
 
 - No env vars required for mlx-top itself
-- MLX distributed uses: MLX_METAL_FAST_SYNCH, MLX_JACCL_COORDINATOR, MLX_JACCL_DEVICES, MLX_RANK, MLX_HOSTFILE
+- MLX distributed uses: MLX_METAL_FAST_SYNCH, MLX_JACCL_COORDINATOR, MLX_IBV_DEVICES, MLX_RANK, MLX_HOSTFILE
 
 ## Related Resources
 

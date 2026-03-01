@@ -74,7 +74,7 @@ impl NodeSnapshot {
         (self.cpu_watts + self.gpu_watts + self.ane_watts) / 1000.0
     }
 
-    /// RAM used in GiB.
+    /// RAM used in GiB (includes file cache — legacy).
     pub fn ram_used_gib(&self) -> f64 {
         self.ram_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
@@ -82,6 +82,16 @@ impl NodeSnapshot {
     /// RAM total in GiB.
     pub fn ram_total_gib(&self) -> f64 {
         self.ram_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// App RAM in GiB (active + wired + compressor — what processes actually need).
+    pub fn ram_app_gib(&self) -> f64 {
+        self.ram_app_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Cached RAM in GiB (speculative + inactive — file cache, reclaimable).
+    pub fn ram_cached_gib(&self) -> f64 {
+        self.ram_cached_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 }
 
@@ -305,10 +315,16 @@ pub struct MlxServerInfo {
 pub struct ClusterAggregates {
     /// Total combined power draw in watts.
     pub total_watts: f64,
-    /// Total RAM used in bytes across all nodes.
+    /// Total RAM used in bytes across all nodes (includes file cache — legacy).
     pub total_ram_used_bytes: u64,
     /// Total RAM capacity in bytes across all nodes.
     pub total_ram_total_bytes: u64,
+    /// Total app RAM in bytes (active + wired + compressor).
+    #[serde(default)]
+    pub total_ram_app_bytes: u64,
+    /// Total cached RAM in bytes (file cache, reclaimable).
+    #[serde(default)]
+    pub total_ram_cached_bytes: u64,
     /// Average CPU utilisation (percent) across all online nodes.
     pub cpu_avg_percent: f64,
     /// Average GPU utilisation (percent) across all online nodes.
@@ -332,6 +348,8 @@ impl ClusterAggregates {
         let total_watts: f64 = online.iter().map(|s| s.total_watts()).sum();
         let total_ram_used: u64 = online.iter().map(|s| s.ram_used_bytes).sum();
         let total_ram_total: u64 = online.iter().map(|s| s.ram_total_bytes).sum();
+        let total_ram_app: u64 = online.iter().map(|s| s.ram_app_bytes).sum();
+        let total_ram_cached: u64 = online.iter().map(|s| s.ram_cached_bytes).sum();
         let cpu_avg = if n > 0.0 {
             online.iter().map(|s| s.cpu_percent).sum::<f64>() / n
         } else {
@@ -370,6 +388,8 @@ impl ClusterAggregates {
             total_watts,
             total_ram_used_bytes: total_ram_used,
             total_ram_total_bytes: total_ram_total,
+            total_ram_app_bytes: total_ram_app,
+            total_ram_cached_bytes: total_ram_cached,
             cpu_avg_percent: cpu_avg,
             gpu_avg_percent: gpu_avg,
             nodes_online: online.len(),
@@ -379,7 +399,7 @@ impl ClusterAggregates {
         }
     }
 
-    /// Total RAM used in GiB.
+    /// Total RAM used in GiB (includes file cache — legacy).
     pub fn total_ram_used_gib(&self) -> f64 {
         self.total_ram_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
@@ -387,6 +407,16 @@ impl ClusterAggregates {
     /// Total RAM capacity in GiB.
     pub fn total_ram_total_gib(&self) -> f64 {
         self.total_ram_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Total app RAM in GiB (what processes actually need).
+    pub fn total_ram_app_gib(&self) -> f64 {
+        self.total_ram_app_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Total cached RAM in GiB (file cache, reclaimable).
+    pub fn total_ram_cached_gib(&self) -> f64 {
+        self.total_ram_cached_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 }
 
@@ -498,6 +528,12 @@ pub enum ClusterEvent {
         rdma_device: String,
         port_state: PortState,
     },
+    /// Thunderbolt network service naming issues detected on a node.
+    /// Fires when duplicate or non-r1o-prefixed services are found.
+    ThunderboltServiceIssue {
+        hostname: String,
+        issues: Vec<String>,
+    },
 }
 
 /// Sink for emitting cluster events. Cheap to clone, silently drops if
@@ -535,6 +571,161 @@ pub struct ModelServerMetadata {
     pub context_length: Option<u64>,
     pub max_tokens: Option<u64>,
 }
+
+// ---------------------------------------------------------------------------
+// MLX serve lifecycle (merged from mlx_daemon.py)
+// ---------------------------------------------------------------------------
+
+/// Lifecycle state of the managed MLX server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServeState {
+    Idle,
+    Bare,
+    Loading,
+    Ready,
+    Error,
+}
+
+impl fmt::Display for ServeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Idle => write!(f, "idle"),
+            Self::Bare => write!(f, "bare"),
+            Self::Loading => write!(f, "loading"),
+            Self::Ready => write!(f, "ready"),
+            Self::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// ML serving engine variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ServeEngine {
+    #[serde(rename = "mlx_lm")]
+    MlxLm,
+    #[serde(rename = "mlx_vlm")]
+    MlxVlm,
+    #[serde(rename = "vllm_mlx")]
+    VllmMlx,
+}
+
+impl Default for ServeEngine {
+    fn default() -> Self {
+        Self::MlxLm
+    }
+}
+
+impl fmt::Display for ServeEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MlxLm => write!(f, "mlx_lm"),
+            Self::MlxVlm => write!(f, "mlx_vlm"),
+            Self::VllmMlx => write!(f, "vllm_mlx"),
+        }
+    }
+}
+
+/// Distributed vs single-node serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServeBackend {
+    Single,
+    Jaccl,
+}
+
+impl Default for ServeBackend {
+    fn default() -> Self {
+        Self::Single
+    }
+}
+
+impl fmt::Display for ServeBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single => write!(f, "single"),
+            Self::Jaccl => write!(f, "jaccl"),
+        }
+    }
+}
+
+/// Per-engine command configuration — replaces the Python ENGINES dict.
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    /// Binary to invoke (e.g. "mlx_lm.server", "uvicorn", "vllm").
+    pub binary: &'static str,
+    /// Extra args after the binary (e.g. ["serve"] for vllm).
+    pub binary_args: &'static [&'static str],
+    /// Uvicorn app string (e.g. "mlx_vlm.server:app"). None for non-uvicorn engines.
+    pub uvicorn_app: Option<&'static str>,
+    /// Flag to pass the model path (e.g. "--model"). None if models load lazily.
+    pub model_flag: Option<&'static str>,
+    /// HTTP paths to poll for health (tried in order).
+    pub health_endpoints: &'static [&'static str],
+}
+
+impl ServeEngine {
+    /// Get the command configuration for this engine.
+    pub fn config(self) -> EngineConfig {
+        match self {
+            Self::MlxLm => EngineConfig {
+                binary: "mlx_lm.server",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: Some("--model"),
+                health_endpoints: &["/v1/models", "/models", "/health"],
+            },
+            Self::MlxVlm => EngineConfig {
+                binary: "uvicorn",
+                binary_args: &[],
+                uvicorn_app: Some("mlx_vlm.server:app"),
+                model_flag: None, // models load lazily via chat body
+                health_endpoints: &["/models", "/health", "/v1/models"],
+            },
+            Self::VllmMlx => EngineConfig {
+                binary: "vllm",
+                binary_args: &["serve"],
+                uvicorn_app: None,
+                model_flag: Some("--model"),
+                health_endpoints: &["/v1/models", "/health"],
+            },
+        }
+    }
+}
+
+/// Read-only snapshot of the serve manager state, returned by status endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeStatus {
+    pub state: ServeState,
+    pub model: Option<String>,
+    pub engine: ServeEngine,
+    pub backend: ServeBackend,
+    pub port: u16,
+    pub pid: Option<u32>,
+    pub port_verified: bool,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+/// Request body for POST /serve/load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadRequest {
+    #[serde(default)]
+    pub model_path: Option<String>,
+    #[serde(default = "default_backend_str")]
+    pub backend: String,
+    pub hostfile: Option<String>,
+    #[serde(default)]
+    pub engine: ServeEngine,
+}
+
+fn default_backend_str() -> String {
+    "auto".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
 
 /// Errors from cluster monitoring operations.
 #[derive(Debug, thiserror::Error)]

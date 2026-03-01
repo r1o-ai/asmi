@@ -176,7 +176,7 @@ The user's CLAUDE.md rules: never suggest models, always ask. No hardcoded hostn
 ### Environment Variables
 
 - No special env vars required for mlx-top itself
-- MLX distributed inference uses: MLX_JACCL_COORDINATOR, MLX_JACCL_DEVICES, MLX_RANK, MLX_HOSTFILE, MLX_METAL_FAST_SYNCH
+- MLX distributed inference uses: MLX_JACCL_COORDINATOR, MLX_IBV_DEVICES, MLX_RANK, MLX_HOSTFILE, MLX_METAL_FAST_SYNCH
 
 ## Related Resources
 

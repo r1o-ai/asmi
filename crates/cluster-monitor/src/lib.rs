@@ -62,9 +62,14 @@ pub use scanner::{
 };
 pub use ssh::{SshResult, local_run, ssh_run};
 pub use types::{
-    ClusterAggregates, ClusterEvent, DistributedBackend, EventSink, MetricsHistory,
-    MlxServerInfo, ModelServerMetadata, MonitorError, NodeSnapshot, PortState, ProcessFramework,
-    ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, TaskEnergy,
+    ClusterAggregates, ClusterEvent, DistributedBackend, EngineConfig, EventSink, LoadRequest,
+    MetricsHistory, MlxServerInfo, ModelServerMetadata, MonitorError, NodeSnapshot, PortState,
+    ProcessFramework, ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
+    ServeEngine, ServeState, ServeStatus, TaskEnergy,
 };
 pub use models::{LocalModel, default_model_dirs, parse_model_name, scan_models};
-pub use health::{CheckResult, SetupChecks, run_setup_checks};
+pub use health::{
+    CheckResult, SetupChecks, ThunderboltFixResult, ThunderboltServiceStatus,
+    find_thunderbolt_issues, fix_thunderbolt_services, parse_thunderbolt_services,
+    run_setup_checks, validate_thunderbolt_services,
+};

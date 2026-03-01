@@ -711,7 +711,7 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
         let port: Option<u16> = extract_flag_value(command, "--port")
             .and_then(|p| p.parse().ok());
 
-        // Detect distributed backend from --backend flag or env hints
+        // Detect distributed backend from --backend flag
         let distributed = extract_flag_value(command, "--backend").and_then(|b| {
             match b.as_str() {
                 "jaccl" => Some(DistributedBackend::Jaccl),

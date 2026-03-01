@@ -1,5 +1,6 @@
-use axum::{extract::State, response::Json, routing::get, Router};
+use axum::{extract::State, response::Json, routing::{get, post}, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -12,7 +13,9 @@ pub struct AppState {
     pub started_at: std::time::Instant,
     pub metrics_tx: tokio::sync::broadcast::Sender<String>,
     pub model_cache: Arc<RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>>,
+    pub thunderbolt_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     pub runtime: Arc<RuntimeInfo>,
+    pub serve_managers: Arc<HashMap<u16, crate::serve::ServeManager>>,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -369,11 +372,292 @@ async fn setup_handler() -> Json<serde_json::Value> {
         .unwrap_or(serde_json::json!({"error": "check failed"})))
 }
 
+/// GET /arp → ARP table entries on Thunderbolt/bridge interfaces (en*).
+/// Used by the web layer to correlate TB links across nodes:
+/// if node A sees remote IP X on en3, and node B owns IP X on en5, that's a cable.
+async fn arp_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let output = match tokio::process::Command::new("arp")
+        .args(["-an"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Json(serde_json::json!({ "hostname": state.hostname, "peers": [] })),
+    };
+
+    // Parse: ? (169.254.89.126) at 0a:e0:af:... on en3 ifscope [ethernet]
+    let mut peers = Vec::new();
+    for line in output.lines() {
+        // Skip incomplete entries and non-ethernet
+        if line.contains("incomplete") || !line.contains("ifscope") {
+            continue;
+        }
+        // Extract IP, interface
+        let ip = line.split('(').nth(1).and_then(|s| s.split(')').next());
+        let iface = line.split(" on ").nth(1).and_then(|s| s.split_whitespace().next());
+        if let (Some(ip), Some(iface)) = (ip, iface) {
+            // Only TB/bridge interfaces (en2-en31, bridge*)
+            if (iface.starts_with("en") && iface.len() <= 4) || iface.starts_with("bridge") {
+                peers.push(serde_json::json!({
+                    "ip": ip,
+                    "interface": iface,
+                }));
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "hostname": state.hostname,
+        "peers": peers,
+    }))
+}
+
+/// Scan Thunderbolt device tree via system_profiler. Called by background cache loop.
+pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
+    let output = match tokio::process::Command::new("system_profiler")
+        .args(["SPThunderboltDataType", "-json"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return serde_json::json!({
+            "hostname": hostname, "ports": [], "error": "system_profiler failed"
+        }),
+    };
+
+    let json: serde_json::Value = match serde_json::from_slice(&output) {
+        Ok(v) => v,
+        Err(_) => return serde_json::json!({
+            "hostname": hostname, "ports": [], "error": "json parse failed"
+        }),
+    };
+
+    // Walk the SPThunderboltDataType array → each bus has _items for connected devices.
+    let mut ports = Vec::new();
+    if let Some(buses) = json.get("SPThunderboltDataType").and_then(|v| v.as_array()) {
+        for bus in buses {
+            let port_tag = bus.get("receptacle_1_tag");
+            let receptacle = port_tag
+                .and_then(|t| t.get("receptacle_id_key"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u64>().ok());
+            let speed = port_tag
+                .and_then(|t| t.get("current_speed_key"))
+                .and_then(|v| v.as_str());
+            let status = port_tag
+                .and_then(|t| t.get("receptacle_status_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let connected = status.contains("connected");
+
+            fn find_apple_devices(items: &[serde_json::Value], results: &mut Vec<(String, String)>) {
+                for item in items {
+                    let vendor = item.get("vendor_name_key").and_then(|v| v.as_str()).unwrap_or("");
+                    let device_name = item.get("device_name_key").and_then(|v| v.as_str()).unwrap_or("");
+                    let display_name = item.get("_name").and_then(|v| v.as_str()).unwrap_or("");
+                    if vendor.contains("Apple") && !device_name.is_empty() {
+                        results.push((display_name.to_string(), device_name.to_string()));
+                    }
+                    if let Some(sub) = item.get("_items").and_then(|v| v.as_array()) {
+                        find_apple_devices(sub, results);
+                    }
+                }
+            }
+
+            let mut devices = Vec::new();
+            if let Some(items) = bus.get("_items").and_then(|v| v.as_array()) {
+                find_apple_devices(items, &mut devices);
+            }
+
+            let port_json = if devices.is_empty() {
+                serde_json::json!({
+                    "port": receptacle,
+                    "connected": connected,
+                    "speed": speed,
+                })
+            } else {
+                serde_json::json!({
+                    "port": receptacle,
+                    "connected": true,
+                    "speed": speed,
+                    "devices": devices.iter().map(|(name, model)| {
+                        serde_json::json!({ "name": name, "model_id": model })
+                    }).collect::<Vec<_>>(),
+                })
+            };
+            ports.push(port_json);
+        }
+    }
+
+    serde_json::json!({
+        "hostname": hostname,
+        "ports": ports,
+    })
+}
+
+/// GET /thunderbolt → cached Thunderbolt device tree (refreshed every 60s).
+async fn thunderbolt_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cache = state.thunderbolt_cache.read().await;
+    match cache.as_ref() {
+        Some((data, scanned_at)) => {
+            let mut result = data.clone();
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("scan_age_seconds".to_string(),
+                    serde_json::json!(scanned_at.elapsed().as_secs()));
+            }
+            Json(result)
+        }
+        None => Json(serde_json::json!({
+            "hostname": state.hostname,
+            "ports": [],
+            "scan_age_seconds": null,
+        })),
+    }
+}
+
+/// GET /health/network → validate local Thunderbolt network service names
+async fn network_health_handler() -> Json<serde_json::Value> {
+    let status = asmi_core::validate_thunderbolt_services().await;
+    Json(serde_json::to_value(&status)
+        .unwrap_or(serde_json::json!({"error": "check failed"})))
+}
+
+/// POST /health/network/fix → auto-repair Thunderbolt service names
+async fn network_fix_handler() -> Json<serde_json::Value> {
+    let result = asmi_core::fix_thunderbolt_services().await;
+    Json(serde_json::to_value(&result)
+        .unwrap_or(serde_json::json!({"error": "fix failed"})))
+}
+
+// ---------------------------------------------------------------------------
+// Serve lifecycle endpoints (replaces mlx_daemon.py on port 19079)
+// ---------------------------------------------------------------------------
+
+/// Query params for serve endpoints — optional ?port= (defaults to 19080).
+#[derive(Deserialize)]
+struct ServeQuery {
+    port: Option<u16>,
+}
+
+/// Default MLX server port (backwards compatible).
+const DEFAULT_SERVE_PORT: u16 = 19080;
+
+/// Look up the ServeManager for a given port. Falls back to default.
+fn get_manager(state: &AppState, port: Option<u16>) -> Option<&crate::serve::ServeManager> {
+    let p = port.unwrap_or(DEFAULT_SERVE_PORT);
+    state.serve_managers.get(&p)
+}
+
+/// GET /serve/status → serve status.
+/// No ?port= → returns all servers: {"servers": [...]}
+/// ?port=19080 → returns single ServeStatus for that port
+async fn serve_status_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+) -> Json<serde_json::Value> {
+    if let Some(port) = q.port {
+        // Single-port query
+        match get_manager(&state, Some(port)) {
+            Some(mgr) => {
+                let status = mgr.status().await;
+                Json(serde_json::to_value(&status)
+                    .unwrap_or(serde_json::json!({"error": "serialize failed"})))
+            }
+            None => Json(serde_json::json!({"error": format!("unknown port: {port}")})),
+        }
+    } else {
+        // All ports → {"servers": [...]}
+        let mut servers = Vec::new();
+        for mgr in state.serve_managers.values() {
+            servers.push(mgr.status().await);
+        }
+        // Sort by port for deterministic output
+        servers.sort_by_key(|s| s.port);
+        Json(serde_json::json!({"servers": servers}))
+    }
+}
+
+/// POST /serve/load → begin loading a model.
+/// Infers port from ?port= or engine default (MlxVlm→19082, else→19080).
+async fn serve_load_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+    Json(req): Json<asmi_core::LoadRequest>,
+) -> Json<serde_json::Value> {
+    // model_path is required for explicit loads (bare start is boot-only)
+    match &req.model_path {
+        Some(p) if p.is_empty() => {
+            return Json(serde_json::json!({"error": "model_path required"}));
+        }
+        None => {
+            return Json(serde_json::json!({"error": "model_path required"}));
+        }
+        _ => {}
+    }
+
+    // Infer port: explicit ?port= > engine default
+    let port = q.port.unwrap_or_else(|| match req.engine {
+        asmi_core::ServeEngine::MlxVlm => 19082,
+        _ => DEFAULT_SERVE_PORT,
+    });
+
+    match get_manager(&state, Some(port)) {
+        Some(mgr) => {
+            let engine = req.engine;
+            mgr.load(req).await;
+            Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port}))
+        }
+        None => Json(serde_json::json!({"error": format!("unknown port: {port}")})),
+    }
+}
+
+/// POST /serve/stop → stop the running server on a port.
+async fn serve_stop_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+) -> Json<serde_json::Value> {
+    match get_manager(&state, q.port) {
+        Some(mgr) => {
+            mgr.stop().await;
+            Json(serde_json::json!({"ok": true, "port": q.port.unwrap_or(DEFAULT_SERVE_PORT)}))
+        }
+        None => Json(serde_json::json!({"error": format!("unknown port: {}", q.port.unwrap_or(DEFAULT_SERVE_PORT))})),
+    }
+}
+
+/// POST /serve/reload → reload the current model on a port.
+async fn serve_reload_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+) -> Json<serde_json::Value> {
+    match get_manager(&state, q.port) {
+        Some(mgr) => {
+            let status = mgr.status().await;
+            match status.model {
+                Some(model) => {
+                    let req = asmi_core::LoadRequest {
+                        model_path: Some(model),
+                        backend: status.backend.to_string(),
+                        hostfile: None,
+                        engine: status.engine,
+                    };
+                    mgr.load(req).await;
+                    Json(serde_json::json!({"ok": true, "state": "loading", "port": status.port}))
+                }
+                None => Json(serde_json::json!({"error": "no model loaded"})),
+            }
+        }
+        None => Json(serde_json::json!({"error": format!("unknown port: {}", q.port.unwrap_or(DEFAULT_SERVE_PORT))})),
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/health/setup", get(setup_handler))
+        .route("/health/network", get(network_health_handler))
+        .route("/health/network/fix", post(network_fix_handler))
         .route("/processes", get(processes_handler))
         .route("/models", get(models_handler))
         .route("/logs", get(logs_handler))
@@ -382,5 +666,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))
         .route("/jaccl/config", get(jaccl_config_handler).post(jaccl_generate_handler))
+        .route("/arp", get(arp_handler))
+        .route("/thunderbolt", get(thunderbolt_handler))
+        .route("/serve/status", get(serve_status_handler))
+        .route("/serve/load", post(serve_load_handler))
+        .route("/serve/stop", post(serve_stop_handler))
+        .route("/serve/reload", post(serve_reload_handler))
         .with_state(state)
 }
