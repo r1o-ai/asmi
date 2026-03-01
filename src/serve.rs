@@ -312,11 +312,12 @@ async fn do_load_inner(
         (program, cmd_args)
     };
 
-    // Spawn
+    // Spawn — truncate log so read_log_tail reads only this run's output
     let log_path = format!("/tmp/r1o-mlx-server-{port}.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_path)?;
     let log_stderr = log_file.try_clone()?;
 
