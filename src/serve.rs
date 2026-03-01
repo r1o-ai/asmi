@@ -339,12 +339,26 @@ async fn do_load_inner(
 
     let child_pid = child.id().unwrap_or(0);
 
-    // Poll health endpoints (detect early crash via child.try_wait)
+    // Race health polling against child exit detection.
+    // If the process crashes, child.wait() resolves immediately — no 60s timeout.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()?;
 
-    let health_result = poll_health(&client, port, cfg.health_endpoints, 60, &mut child, &log_path).await;
+    let health_result = tokio::select! {
+        exit_result = child.wait() => {
+            // Process exited before health check passed — read log for real error
+            let detail = read_log_tail(&log_path, 15).await;
+            let code_str = match exit_result {
+                Ok(status) => status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                Err(e) => format!("wait error: {e}"),
+            };
+            Err(format!("server exited during startup (exit {code_str}): {detail}"))
+        }
+        result = poll_health(&client, port, cfg.health_endpoints, 60) => {
+            result
+        }
+    };
 
     let mut s = inner.write().await;
     match health_result {
@@ -381,8 +395,7 @@ async fn do_load_inner(
             s.state = ServeState::Error;
             s.error = Some(crash_msg.clone());
             tracing::error!(%crash_msg, port, "server process crashed during startup");
-            // Child already exited — no need to kill, but clean up handle
-            let _ = child.try_wait();
+            // Child already exited — no need to kill
         }
     }
 
@@ -427,33 +440,16 @@ fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     }
 }
 
-/// Poll health endpoints until one returns 200, the child process exits, or timeout.
-/// Returns Ok(true) if healthy, Ok(false) if timed out, Err(msg) if process crashed.
+/// Poll health endpoints until one returns 200 or timeout.
+/// Returns Ok(true) on success, Ok(false) on timeout.
 async fn poll_health(
     client: &reqwest::Client,
     port: u16,
     endpoints: &[&str],
     timeout_secs: u64,
-    child: &mut tokio::process::Child,
-    log_path: &str,
 ) -> Result<bool, String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
-        // Check if child process has exited (non-blocking)
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Process exited — read the log for the real error
-                let detail = read_log_tail(log_path, 15).await;
-                return Err(format!(
-                    "server exited during startup (exit {}): {}",
-                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
-                    detail,
-                ));
-            }
-            Ok(None) => {} // still running — continue polling
-            Err(_) => {}   // can't check — continue polling
-        }
-
         for ep in endpoints {
             let url = format!("http://127.0.0.1:{port}{ep}");
             if let Ok(resp) = client.get(&url).send().await {
@@ -463,12 +459,7 @@ async fn poll_health(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            // Timed out — also read log for any hints
-            let detail = read_log_tail(log_path, 10).await;
-            if detail.is_empty() {
-                return Ok(false);
-            }
-            return Err(format!("timeout waiting for health check — log: {detail}"));
+            return Ok(false);
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
