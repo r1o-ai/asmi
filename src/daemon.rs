@@ -16,6 +16,7 @@ pub struct AppState {
     pub thunderbolt_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     pub runtime: Arc<RuntimeInfo>,
     pub serve_managers: Arc<HashMap<u16, crate::serve::ServeManager>>,
+    pub share_manager: crate::serve::ShareManager,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -651,6 +652,35 @@ async fn serve_reload_handler(
     }
 }
 
+/// POST /serve/share — start a distributed share session.
+async fn serve_share_handler(
+    State(state): State<AppState>,
+    Json(req): Json<asmi_core::ShareRequest>,
+) -> Json<serde_json::Value> {
+    if req.model_path.is_empty() {
+        return Json(serde_json::json!({"error": "model_path required"}));
+    }
+    state.share_manager.start(req).await;
+    Json(serde_json::json!({"ok": true, "state": "loading"}))
+}
+
+/// GET /serve/share/status — share session status.
+async fn serve_share_status_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let status = state.share_manager.status().await;
+    Json(serde_json::to_value(&status)
+        .unwrap_or(serde_json::json!({"error": "serialize failed"})))
+}
+
+/// POST /serve/share/stop — stop the running share session.
+async fn serve_share_stop_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    state.share_manager.stop().await;
+    Json(serde_json::json!({"ok": true}))
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -672,5 +702,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
         .route("/serve/reload", post(serve_reload_handler))
+        .route("/serve/share", post(serve_share_handler))
+        .route("/serve/share/status", get(serve_share_status_handler))
+        .route("/serve/share/stop", post(serve_share_stop_handler))
         .with_state(state)
 }

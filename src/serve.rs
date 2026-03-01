@@ -3,7 +3,7 @@
 //! Manages per-port MLX server subprocesses. Each port has its own
 //! ServeManager with independent state file for crash recovery.
 
-use asmi_core::{LoadRequest, ServeBackend, ServeEngine, ServeState, ServeStatus};
+use asmi_core::{LoadRequest, ServeBackend, ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -518,6 +518,322 @@ async fn persist_state(s: &ManagedServer) {
         "model": s.model,
         "backend": s.backend.to_string(),
         "engine": s.engine,
+    });
+    let _ = tokio::fs::write(&sf, serde_json::to_string_pretty(&data).unwrap_or_default()).await;
+}
+
+// ===========================================================================
+// ShareManager — manages a single mlx_lm.share distributed session
+// ===========================================================================
+
+/// Share session log file.
+const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
+
+/// Persistent state file for share crash recovery.
+fn share_state_file() -> PathBuf {
+    r1o_dir().join("share-state.json")
+}
+
+/// Internal mutable state for the share session.
+struct ManagedShare {
+    state: ServeState,
+    model: Option<String>,
+    backend: ServeBackend,
+    child: Option<tokio::process::Child>,
+    pid: Option<u32>,
+    load_started: Option<std::time::Instant>,
+    error: Option<String>,
+}
+
+/// Thread-safe share manager. Clone-friendly (wraps Arc).
+#[derive(Clone)]
+pub struct ShareManager {
+    inner: Arc<RwLock<ManagedShare>>,
+}
+
+impl ShareManager {
+    /// Create a new idle share manager.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ManagedShare {
+                state: ServeState::Idle,
+                model: None,
+                backend: ServeBackend::Single,
+                child: None,
+                pid: None,
+                load_started: None,
+                error: None,
+            })),
+        }
+    }
+
+    /// Create a share manager and restore from persisted state.
+    /// If saved state has a model → restart the share session.
+    pub async fn restore() -> Self {
+        let mgr = Self::new();
+        let sf = share_state_file();
+        if sf.exists() {
+            if let Ok(data) = tokio::fs::read_to_string(&sf).await {
+                if let Ok(saved) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(model) = saved.get("model").and_then(|v| v.as_str()) {
+                        if !model.is_empty() {
+                            let backend = saved
+                                .get("backend")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("auto")
+                                .to_string();
+                            let hostfile = saved
+                                .get("hostfile")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let req = ShareRequest {
+                                model_path: model.to_string(),
+                                backend,
+                                hostfile,
+                            };
+                            tracing::info!(model, "restoring last share session");
+                            mgr.start(req).await;
+                            return mgr;
+                        }
+                    }
+                }
+            }
+        }
+        mgr
+    }
+
+    /// Start a share session. Spawns a background task and returns immediately.
+    pub async fn start(&self, req: ShareRequest) {
+        {
+            let mut s = self.inner.write().await;
+            // Kill any existing share process
+            kill_share_child(&mut s).await;
+            s.state = ServeState::Loading;
+            s.error = None;
+            s.load_started = Some(std::time::Instant::now());
+        }
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            do_share(inner, req).await;
+        });
+    }
+
+    /// Stop the running share session.
+    pub async fn stop(&self) {
+        let mut s = self.inner.write().await;
+        kill_share_child(&mut s).await;
+        s.state = ServeState::Idle;
+        s.model = None;
+        s.error = None;
+        persist_share_state(&s).await;
+    }
+
+    /// Get a read-only status snapshot.
+    pub async fn status(&self) -> ShareStatus {
+        let s = self.inner.read().await;
+        let elapsed = s
+            .load_started
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        ShareStatus {
+            state: s.state,
+            model: s.model.clone(),
+            backend: s.backend,
+            pid: s.pid,
+            elapsed_ms: elapsed,
+            error: s.error.clone(),
+        }
+    }
+}
+
+/// Background share task — spawns mlx_lm.share and monitors via log output.
+async fn do_share(inner: Arc<RwLock<ManagedShare>>, req: ShareRequest) {
+    let result = do_share_inner(&inner, &req).await;
+    if let Err(e) = result {
+        let mut s = inner.write().await;
+        s.state = ServeState::Error;
+        s.error = Some(e.to_string());
+    }
+}
+
+async fn do_share_inner(
+    inner: &Arc<RwLock<ManagedShare>>,
+    req: &ShareRequest,
+) -> Result<(), anyhow::Error> {
+    {
+        let mut s = inner.write().await;
+        kill_share_child(&mut s).await;
+    }
+
+    // Expand ~ in model path
+    let mut model_path = req.model_path.clone();
+    if model_path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            model_path = format!("{}/{}", home.display(), &model_path[2..]);
+        }
+    }
+
+    // Resolve backend
+    let backend = resolve_backend(&req.backend, req.hostfile.as_deref());
+
+    // Build command: python3 -m mlx_lm.share --model <path>
+    let py = resolve_python().to_string();
+    let cfg = ServeEngine::MlxLmShare.config();
+    let mut cmd_args: Vec<String> = vec![
+        "-m".into(),
+        cfg.binary.to_string(),
+    ];
+    if let Some(flag) = cfg.model_flag {
+        cmd_args.push(flag.into());
+        cmd_args.push(model_path.clone());
+    }
+
+    // JACCL distributed wrapper
+    let (final_program, final_args) = if backend == ServeBackend::Jaccl {
+        let hf = req
+            .hostfile
+            .clone()
+            .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
+        let jaccl_py = resolve_python().to_string();
+        let mut jaccl_args = vec![
+            "-m".to_string(),
+            "mlx.launch".to_string(),
+            "--hostfile".to_string(),
+            hf,
+            "--backend".to_string(),
+            "jaccl".to_string(),
+            "--".to_string(),
+            py,
+        ];
+        jaccl_args.extend(cmd_args);
+        (jaccl_py, jaccl_args)
+    } else {
+        (py, cmd_args)
+    };
+
+    // Truncate log for fresh output
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(SHARE_LOG_PATH)?;
+    let log_stderr = log_file.try_clone()?;
+
+    tracing::info!(
+        program = %final_program,
+        args = ?final_args,
+        log_path = SHARE_LOG_PATH,
+        "spawning mlx_lm.share"
+    );
+
+    let mut child = Command::new(&final_program)
+        .args(&final_args)
+        .env("MLX_METAL_FAST_SYNCH", "1")
+        .stdout(log_file)
+        .stderr(log_stderr)
+        .kill_on_drop(false)
+        .spawn()?;
+
+    let child_pid = child.id().unwrap_or(0);
+
+    // Race log-based readiness against child exit (early crash detection).
+    // share has no HTTP endpoint — we scan the log for readiness markers.
+    let readiness_result = tokio::select! {
+        exit_result = child.wait() => {
+            let detail = read_log_tail(SHARE_LOG_PATH, 15).await;
+            let code_str = match exit_result {
+                Ok(status) => status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                Err(e) => format!("wait error: {e}"),
+            };
+            Err(format!("share exited during startup (exit {code_str}): {detail}"))
+        }
+        result = poll_share_log(SHARE_LOG_PATH, 120) => {
+            result
+        }
+    };
+
+    let mut s = inner.write().await;
+    match readiness_result {
+        Ok(true) => {
+            s.pid = Some(child_pid);
+            s.child = Some(child);
+            s.model = Some(model_path);
+            s.backend = backend;
+            s.state = ServeState::Ready;
+            tracing::info!(pid = child_pid, model = ?req.model_path, "share session ready");
+            persist_share_state(&s).await;
+        }
+        Ok(false) => {
+            s.state = ServeState::Error;
+            let detail = read_log_tail(SHARE_LOG_PATH, 10).await;
+            s.error = Some(format!("timeout waiting for share readiness (120s): {detail}"));
+            let _ = child.kill().await;
+        }
+        Err(crash_msg) => {
+            s.state = ServeState::Error;
+            s.error = Some(crash_msg.clone());
+            tracing::error!(%crash_msg, "share process crashed during startup");
+        }
+    }
+
+    Ok(())
+}
+
+/// Poll the share log file for readiness markers.
+/// Returns Ok(true) when ready, Ok(false) on timeout.
+async fn poll_share_log(log_path: &str, timeout_secs: u64) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
+            // Readiness markers from mlx_lm.share output
+            if content.contains("Starting endpoint")
+                || content.contains("Connected to")
+                || content.contains("Listening on")
+            {
+                return Ok(true);
+            }
+            // Error markers — fail fast
+            if content.contains("Error:") || content.contains("Exception:") {
+                let detail = read_log_tail(log_path, 10).await;
+                return Err(format!("share error: {detail}"));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Kill the existing share child process (SIGTERM → 5s → SIGKILL).
+async fn kill_share_child(s: &mut ManagedShare) {
+    if let Some(ref mut child) = s.child {
+        if let Some(pid) = s.pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = child.kill().await;
+            }
+        }
+    }
+    s.child = None;
+    s.pid = None;
+}
+
+/// Persist share state for crash recovery.
+async fn persist_share_state(s: &ManagedShare) {
+    let sf = share_state_file();
+    if let Some(parent) = sf.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let data = serde_json::json!({
+        "model": s.model,
+        "backend": s.backend.to_string(),
     });
     let _ = tokio::fs::write(&sf, serde_json::to_string_pretty(&data).unwrap_or_default()).await;
 }

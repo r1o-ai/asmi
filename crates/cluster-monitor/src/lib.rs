@@ -65,7 +65,7 @@ pub use types::{
     ClusterAggregates, ClusterEvent, DistributedBackend, EngineConfig, EventSink, LoadRequest,
     MetricsHistory, MlxServerInfo, ModelServerMetadata, MonitorError, NodeSnapshot, PortState,
     ProcessFramework, ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
-    ServeEngine, ServeState, ServeStatus, TaskEnergy,
+    ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy,
 };
 pub use models::{LocalModel, default_model_dirs, parse_model_name, scan_models};
 pub use health::{

@@ -608,6 +608,8 @@ pub enum ServeEngine {
     MlxVlm,
     #[serde(rename = "vllm_mlx")]
     VllmMlx,
+    #[serde(rename = "mlx_lm_share")]
+    MlxLmShare,
 }
 
 impl Default for ServeEngine {
@@ -622,6 +624,7 @@ impl fmt::Display for ServeEngine {
             Self::MlxLm => write!(f, "mlx_lm"),
             Self::MlxVlm => write!(f, "mlx_vlm"),
             Self::VllmMlx => write!(f, "vllm_mlx"),
+            Self::MlxLmShare => write!(f, "mlx_lm_share"),
         }
     }
 }
@@ -689,6 +692,14 @@ impl ServeEngine {
                 model_flag: Some("--model"),
                 health_endpoints: &["/v1/models", "/health"],
             },
+            Self::MlxLmShare => EngineConfig {
+                binary: "mlx_lm.share",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: Some("--model"),
+                // share has no HTTP server — readiness checked via log output
+                health_endpoints: &[],
+            },
         }
     }
 }
@@ -721,6 +732,29 @@ pub struct LoadRequest {
 
 fn default_backend_str() -> String {
     "auto".to_string()
+}
+
+/// Request body for POST /serve/share.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareRequest {
+    /// Model path or HuggingFace repo ID (required — no bare share).
+    pub model_path: String,
+    /// Backend: "auto" | "jaccl" (defaults to auto, resolves to jaccl if hostfile exists).
+    #[serde(default = "default_backend_str")]
+    pub backend: String,
+    /// JACCL hostfile path. Falls back to ~/.r1o/hostfiles/default.json.
+    pub hostfile: Option<String>,
+}
+
+/// Read-only snapshot of the share session state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareStatus {
+    pub state: ServeState,
+    pub model: Option<String>,
+    pub backend: ServeBackend,
+    pub pid: Option<u32>,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

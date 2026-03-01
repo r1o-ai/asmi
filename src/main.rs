@@ -1933,6 +1933,9 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: 
         serve_managers.insert(serve::MANAGED_PORTS[i].0, mgr);
     }
 
+    // Restore share session (separate from port-based serve managers)
+    let share_manager = serve::ShareManager::restore().await;
+
     let app_state = daemon::AppState {
         snapshot,
         cluster_state,
@@ -1944,6 +1947,7 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: 
         thunderbolt_cache,
         runtime,
         serve_managers: Arc::new(serve_managers),
+        share_manager,
     };
 
     let app = daemon::build_router(app_state);
@@ -1971,6 +1975,9 @@ async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: 
     eprintln!("  POST /serve/load       Load model (?port=N)");
     eprintln!("  POST /serve/stop       Stop server (?port=N)");
     eprintln!("  POST /serve/reload     Reload model (?port=N)");
+    eprintln!("  POST /serve/share      Start distributed share session");
+    eprintln!("  GET  /serve/share/status Share session status");
+    eprintln!("  POST /serve/share/stop  Stop share session");
     let ports_str: Vec<String> = serve::MANAGED_PORTS.iter().map(|(p, e)| format!("{p}({e})")).collect();
     eprintln!("  Managed ports: {}", ports_str.join(", "));
     if cluster_hub {
