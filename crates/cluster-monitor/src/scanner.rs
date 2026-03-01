@@ -18,7 +18,64 @@ use crate::types::*;
 use crate::types::ModelServerMetadata;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Static regexes (compiled once, reused across all scan calls)
+// ---------------------------------------------------------------------------
+
+// parse_ifconfig_bridges + parse_ifconfig_all_ips (shared interface regex)
+static IFACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\w+):\s+flags=").unwrap()
+});
+
+// parse_ifconfig_bridges — 169.254.x.x only
+static INET_LINK_LOCAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+inet\s+(169\.254\.\d+\.\d+)\s").unwrap()
+});
+
+// parse_ifconfig_all_ips — any IPv4
+static INET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+inet\s+(\d+\.\d+\.\d+\.\d+)\s").unwrap()
+});
+
+// parse_arp_table + discover_thunderbolt_bridge
+static ARP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+(\S+)\s+on\s+(\S+)").unwrap()
+});
+
+// parse_ibv_devinfo
+static DEVICE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"hca_id:\s+(\S+)").unwrap()
+});
+static STATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"state:\s+(PORT_\w+)").unwrap()
+});
+
+// parse_system_profiler
+static SP_DEVICE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+Device Name:\s+(.+)$").unwrap()
+});
+static SP_SPEED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+Speed:\s+(.+)$").unwrap()
+});
+static SP_STATUS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s+Status:\s+(.+)$").unwrap()
+});
+
+// parse_mlx_processes
+static MLX_PORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"--port\s+(\d+)").unwrap()
+});
+static MLX_MODEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"--model\s+(\S+)").unwrap()
+});
+
+// parse_ping_latency
+static PING_LATENCY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"round-trip\s+\S+\s*=\s*[\d.]+/([\d.]+)/").unwrap()
+});
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -562,11 +619,8 @@ async fn discover_thunderbolt_bridge(config: &ClusterConfig) -> Vec<DiscoveredPe
     // Map from interface → local 169.254 IP (for RDMA link mapping)
     let bridge_ips: HashMap<String, String> = bridges.iter().cloned().collect();
 
-    let arp_re = Regex::new(r"(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+(\S+)\s+on\s+(\S+)")
-        .expect("valid regex");
-
     for line in arp_output.lines() {
-        if let Some(caps) = arp_re.captures(line) {
+        if let Some(caps) = ARP_RE.captures(line) {
             let _arp_host = caps.get(1).unwrap().as_str();
             let ip = caps.get(2).unwrap().as_str();
             let mac = caps.get(3).unwrap().as_str();
@@ -680,13 +734,10 @@ pub fn parse_ifconfig_bridges(text: &str) -> Vec<(String, String)> {
     let mut results = Vec::new();
     let mut current_iface: Option<String> = None;
 
-    let iface_re = Regex::new(r"^(\w+):\s+flags=").expect("valid regex");
-    let inet_re = Regex::new(r"^\s+inet\s+(169\.254\.\d+\.\d+)\s").expect("valid regex");
-
     for line in text.lines() {
-        if let Some(caps) = iface_re.captures(line) {
+        if let Some(caps) = IFACE_RE.captures(line) {
             current_iface = Some(caps.get(1).unwrap().as_str().to_string());
-        } else if let Some(caps) = inet_re.captures(line) {
+        } else if let Some(caps) = INET_LINK_LOCAL_RE.captures(line) {
             if let Some(ref iface) = current_iface {
                 let ip = caps.get(1).unwrap().as_str().to_string();
                 results.push((iface.clone(), ip));
@@ -705,13 +756,10 @@ pub fn parse_ifconfig_all_ips(text: &str) -> HashMap<String, Vec<String>> {
     let mut results: HashMap<String, Vec<String>> = HashMap::new();
     let mut current_iface: Option<String> = None;
 
-    let iface_re = Regex::new(r"^(\w+):\s+flags=").expect("valid regex");
-    let inet_re = Regex::new(r"^\s+inet\s+(\d+\.\d+\.\d+\.\d+)\s").expect("valid regex");
-
     for line in text.lines() {
-        if let Some(caps) = iface_re.captures(line) {
+        if let Some(caps) = IFACE_RE.captures(line) {
             current_iface = Some(caps.get(1).unwrap().as_str().to_string());
-        } else if let Some(caps) = inet_re.captures(line) {
+        } else if let Some(caps) = INET_RE.captures(line) {
             if let Some(ref iface) = current_iface {
                 let ip = caps.get(1).unwrap().as_str().to_string();
                 results.entry(iface.clone()).or_default().push(ip);
@@ -794,13 +842,11 @@ fn extract_tailscale_peer(value: &serde_json::Value) -> Option<DiscoveredPeer> {
 /// (Thunderbolt link-local) — these are always direct-connected Macs.
 /// LAN entries are deferred to `ssh_prefilter` which tests connectivity.
 pub fn parse_arp_table(text: &str, filter_non_ssh: bool) -> Vec<DiscoveredPeer> {
-    let re = Regex::new(r"^(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+(\S+)\s+on\s+(\S+)")
-        .expect("valid regex");
 
     let mut peers_map: HashMap<String, DiscoveredPeer> = HashMap::new();
 
     for line in text.lines() {
-        if let Some(caps) = re.captures(line) {
+        if let Some(caps) = ARP_RE.captures(line) {
             let hostname = caps.get(1).unwrap().as_str();
             let ip = caps.get(2).unwrap().as_str();
             let mac = caps.get(3).unwrap().as_str();
@@ -871,14 +917,11 @@ pub fn parse_rdma_status(text: &str) -> RdmaStatus {
 
 /// Parse `ibv_devinfo` output for device names and port states.
 fn parse_ibv_devinfo(text: &str) -> Vec<RdmaDevice> {
-    let device_re = Regex::new(r"hca_id:\s+(\S+)").expect("valid regex");
-    let state_re = Regex::new(r"state:\s+(PORT_\w+)").expect("valid regex");
-
     let mut devices = Vec::new();
     let mut current_device: Option<String> = None;
 
     for line in text.lines() {
-        if let Some(caps) = device_re.captures(line) {
+        if let Some(caps) = DEVICE_RE.captures(line) {
             // If we had a previous device without a state, mark it unknown
             if let Some(ref name) = current_device {
                 devices.push(RdmaDevice {
@@ -887,7 +930,7 @@ fn parse_ibv_devinfo(text: &str) -> Vec<RdmaDevice> {
                 });
             }
             current_device = Some(caps.get(1).unwrap().as_str().to_string());
-        } else if let Some(caps) = state_re.captures(line) {
+        } else if let Some(caps) = STATE_RE.captures(line) {
             if let Some(name) = current_device.take() {
                 let state_str = caps.get(1).unwrap().as_str();
                 let port_state = PortState::from_ibstat(state_str);
@@ -918,27 +961,21 @@ fn parse_system_profiler(text: &str) -> Vec<DiscoveredPeer> {
     //   ...
     //   Status: Device connected
 
-    // We look for indented "Device Name:" entries that are children of bus entries
-    // and are actual Mac devices (not docks/peripherals).
-    let device_re = Regex::new(r"^\s+Device Name:\s+(.+)$").expect("valid regex");
-    let speed_re = Regex::new(r"^\s+Speed:\s+(.+)$").expect("valid regex");
-    let status_re = Regex::new(r"^\s+Status:\s+(.+)$").expect("valid regex");
-
     // We want to find "Mac*" device names under "Status: Device connected" ports
     let mut in_connected_port = false;
     let mut current_speed: Option<String> = None;
 
     for line in text.lines() {
-        if let Some(caps) = status_re.captures(line) {
+        if let Some(caps) = SP_STATUS_RE.captures(line) {
             let status = caps.get(1).unwrap().as_str().trim();
             in_connected_port = status == "Device connected";
         }
 
-        if let Some(caps) = speed_re.captures(line) {
+        if let Some(caps) = SP_SPEED_RE.captures(line) {
             current_speed = Some(caps.get(1).unwrap().as_str().trim().to_string());
         }
 
-        if let Some(caps) = device_re.captures(line) {
+        if let Some(caps) = SP_DEVICE_RE.captures(line) {
             let name = caps.get(1).unwrap().as_str().trim();
             // Only pick up Mac devices (Mac Studio, Mac mini, MacBook Pro, etc.)
             // and only when under a connected port. Also skip the "self" bus entries
@@ -968,8 +1005,6 @@ fn parse_system_profiler(text: &str) -> Vec<DiscoveredPeer> {
 /// Parse MLX server processes from `ps aux` output.
 fn parse_mlx_processes(text: &str) -> Vec<ProcessInfo> {
     let mut processes = Vec::new();
-    let port_re = Regex::new(r"--port\s+(\d+)").expect("valid regex");
-    let model_re = Regex::new(r"--model\s+(\S+)").expect("valid regex");
 
     for line in text.lines() {
         let line = line.trim();
@@ -994,12 +1029,12 @@ fn parse_mlx_processes(text: &str) -> Vec<ProcessInfo> {
         let cpu_percent: f64 = fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let mem_percent: f64 = fields.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
 
-        let port = port_re
+        let port = MLX_PORT_RE
             .captures(line)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse().ok());
 
-        let model = model_re
+        let model = MLX_MODEL_RE
             .captures(line)
             .and_then(|c| c.get(1))
             .map(|m| {
@@ -1077,8 +1112,7 @@ pub fn parse_v1_models_metadata(json: &str) -> Vec<ModelServerMetadata> {
 /// Parse ping output for round-trip latency in ms.
 fn parse_ping_latency(output: &str) -> Option<f64> {
     // macOS ping: "round-trip min/avg/max/stddev = 0.123/0.456/0.789/0.012 ms"
-    let re = Regex::new(r"round-trip\s+\S+\s*=\s*[\d.]+/([\d.]+)/").expect("valid regex");
-    re.captures(output)
+    PING_LATENCY_RE.captures(output)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse().ok())
 }

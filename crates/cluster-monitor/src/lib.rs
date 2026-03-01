@@ -49,6 +49,23 @@ pub mod types;
 pub mod models;
 pub mod health;
 
+/// Resolve the best python3 binary. Homebrew python has the real MLX install;
+/// the system /usr/bin/python3 (3.9.6) has an older version.
+/// Returns the path as a string so callers can use it with Command::new().
+pub fn resolve_python() -> &'static str {
+    // Candidates in priority order
+    const CANDIDATES: &[&str] = &[
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+    ];
+    for p in CANDIDATES {
+        if std::path::Path::new(p).exists() {
+            return p;
+        }
+    }
+    "python3" // fallback to PATH
+}
+
 pub use aggregator::ClusterState;
 pub use collector::{
     collect_node_metrics, parse_footprint, parse_powermetrics_text, parse_ps_mlx,
@@ -67,7 +84,7 @@ pub use types::{
     ProcessFramework, ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
     ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy,
 };
-pub use models::{LocalModel, default_model_dirs, parse_model_name, scan_models};
+pub use models::{LocalModel, DiscoveredVolume, default_model_dirs, discover_volumes, external_model_dirs, parse_model_name, scan_models};
 pub use health::{
     CheckResult, SetupChecks, ThunderboltFixResult, ThunderboltServiceStatus,
     find_thunderbolt_issues, fix_thunderbolt_services, parse_thunderbolt_services,

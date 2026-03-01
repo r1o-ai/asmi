@@ -1,7 +1,11 @@
 //! MLX server lifecycle manager — Rust port of mlx_daemon.py.
 //!
 //! Manages per-port MLX server subprocesses. Each port has its own
-//! ServeManager with independent state file for crash recovery.
+//! `ProcessManager<HttpHealth>` (aliased as `ServeManager`) with independent
+//! state file for crash recovery.
+//!
+//! The share session is managed by `ProcessManager<LogMonitor>` (aliased as
+//! `ShareManager`).
 
 use asmi_core::{LoadRequest, ServeBackend, ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus};
 use std::path::PathBuf;
@@ -11,12 +15,19 @@ use tokio::sync::RwLock;
 
 use crate::daemon::resolve_python;
 
+// ===========================================================================
+// Constants and helpers
+// ===========================================================================
+
 /// Managed ports and their default engines.
 /// This is the single source of truth for which ports asmi auto-starts.
 pub const MANAGED_PORTS: &[(u16, ServeEngine)] = &[
     (19080, ServeEngine::MlxLm),
     (19082, ServeEngine::MlxVlm),
 ];
+
+/// Share session log file.
+const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
 
 /// r1o config directory (~/.r1o/).
 fn r1o_dir() -> PathBuf {
@@ -35,45 +46,319 @@ fn legacy_state_file() -> PathBuf {
     r1o_dir().join("serve-state.json")
 }
 
+/// Persistent state file for share crash recovery.
+fn share_state_file() -> PathBuf {
+    r1o_dir().join("share-state.json")
+}
+
 /// Default JACCL hostfile location.
 fn default_hostfile() -> PathBuf {
     r1o_dir().join("hostfiles/default.json")
 }
 
+/// Resolve "auto" backend to single or jaccl based on hostfile existence.
+fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
+    if backend == "single" {
+        return ServeBackend::Single;
+    }
+    let hf = hostfile
+        .map(PathBuf::from)
+        .unwrap_or_else(default_hostfile);
+    if hf.exists() && (backend == "jaccl" || backend == "auto") {
+        ServeBackend::Jaccl
+    } else {
+        ServeBackend::Single
+    }
+}
+
+/// Read the last N lines from a log file (best-effort).
+async fn read_log_tail(path: &str, lines: usize) -> String {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => {
+            let tail: Vec<&str> = content.lines().rev().take(lines).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            // Find the most useful line: last Python exception or traceback line
+            let useful = tail.iter().find(|l| {
+                l.contains("Error:") || l.contains("Exception:") || l.contains("error:")
+            });
+            if let Some(line) = useful {
+                line.trim().to_string()
+            } else {
+                tail.join("\n").trim().to_string()
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Verify a process owns the expected port via lsof.
+async fn verify_port_owner(pid: u32, port: u16) -> bool {
+    let output = Command::new("/usr/sbin/lsof")
+        .args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-P",
+            "-n",
+        ])
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.contains(&format!(":{port}"))
+        }
+        _ => false,
+    }
+}
+
+// ===========================================================================
+// ReadinessCheck trait + implementations
+// ===========================================================================
+
+/// Trait for polling a child process until it signals readiness.
+/// Returns `Ok(true)` = ready, `Ok(false)` = timeout, `Err(msg)` = crash/error.
+pub trait ReadinessCheck: Send + Sync + 'static {
+    fn poll_ready(
+        &self,
+        child: &mut tokio::process::Child,
+        timeout_secs: u64,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+}
+
+/// HTTP health-check readiness (for serve managers).
+#[derive(Clone)]
+pub struct HttpHealth {
+    port: u16,
+    endpoints: Vec<&'static str>,
+}
+
+impl ReadinessCheck for HttpHealth {
+    async fn poll_ready(
+        &self,
+        child: &mut tokio::process::Child,
+        timeout_secs: u64,
+    ) -> Result<bool, String> {
+        let log_path = format!("/tmp/r1o-mlx-server-{}.log", self.port);
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        let port = self.port;
+        let endpoints: Vec<&str> = self.endpoints.clone();
+
+        tokio::select! {
+            exit_result = child.wait() => {
+                let detail = read_log_tail(&log_path, 15).await;
+                let code_str = match exit_result {
+                    Ok(status) => status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    Err(e) => format!("wait error: {e}"),
+                };
+                Err(format!("server exited during startup (exit {code_str}): {detail}"))
+            }
+            result = poll_health(&client, port, &endpoints, timeout_secs) => {
+                result
+            }
+        }
+    }
+}
+
+/// Poll health endpoints until one returns 200 or timeout.
+/// Returns Ok(true) on success, Ok(false) on timeout.
+async fn poll_health(
+    client: &reqwest::Client,
+    port: u16,
+    endpoints: &[&str],
+    timeout_secs: u64,
+) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        for ep in endpoints {
+            let url = format!("http://127.0.0.1:{port}{ep}");
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    return Ok(true);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Log-file readiness monitor (for share manager).
+#[derive(Clone)]
+pub struct LogMonitor {
+    log_path: String,
+    ready_markers: Vec<&'static str>,
+    error_markers: Vec<&'static str>,
+}
+
+impl ReadinessCheck for LogMonitor {
+    async fn poll_ready(
+        &self,
+        child: &mut tokio::process::Child,
+        timeout_secs: u64,
+    ) -> Result<bool, String> {
+        let log_path = self.log_path.clone();
+        let ready_markers = self.ready_markers.clone();
+        let error_markers = self.error_markers.clone();
+
+        tokio::select! {
+            exit_result = child.wait() => {
+                let detail = read_log_tail(&log_path, 15).await;
+                let code_str = match exit_result {
+                    Ok(status) => status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    Err(e) => format!("wait error: {e}"),
+                };
+                Err(format!("share exited during startup (exit {code_str}): {detail}"))
+            }
+            result = poll_log(&log_path, &ready_markers, &error_markers, timeout_secs) => {
+                result
+            }
+        }
+    }
+}
+
+/// Poll a log file for readiness/error markers.
+/// Returns Ok(true) when ready, Ok(false) on timeout, Err on error markers.
+async fn poll_log(
+    log_path: &str,
+    ready_markers: &[&str],
+    error_markers: &[&str],
+    timeout_secs: u64,
+) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
+            if ready_markers.iter().any(|m| content.contains(m)) {
+                return Ok(true);
+            }
+            if error_markers.iter().any(|m| content.contains(m)) {
+                let detail = read_log_tail(log_path, 10).await;
+                return Err(format!("share error: {detail}"));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+// ===========================================================================
+// ManagedProcess — unified inner state
+// ===========================================================================
+
 /// Internal mutable state behind the RwLock.
-struct ManagedServer {
+struct ManagedProcess {
     state: ServeState,
     model: Option<String>,
     engine: ServeEngine,
     backend: ServeBackend,
-    port: u16,
+    port: Option<u16>,
     child: Option<tokio::process::Child>,
     pid: Option<u32>,
     load_started: Option<std::time::Instant>,
     error: Option<String>,
 }
 
-/// Thread-safe serve manager. Clone-friendly (wraps Arc).
-#[derive(Clone)]
-pub struct ServeManager {
-    inner: Arc<RwLock<ManagedServer>>,
+/// Kill the existing child process (SIGTERM → 5s → SIGKILL).
+async fn kill_child(s: &mut ManagedProcess) {
+    if let Some(ref mut child) = s.child {
+        if let Some(pid) = s.pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = child.kill().await;
+            }
+        }
+    }
+    s.child = None;
+    s.pid = None;
 }
+
+/// Persist model/engine/backend to disk for crash recovery.
+/// Uses `port` to select the file path: Some(port) → serve state, None → share state.
+async fn persist_state(s: &ManagedProcess) {
+    let sf = match s.port {
+        Some(port) => state_file(port),
+        None => share_state_file(),
+    };
+    if let Some(parent) = sf.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let mut data = serde_json::json!({
+        "model": s.model,
+        "backend": s.backend.to_string(),
+    });
+    // Serve state also persists engine
+    if s.port.is_some() {
+        data.as_object_mut().unwrap().insert("engine".to_string(), serde_json::to_value(s.engine).unwrap());
+    }
+    let _ = tokio::fs::write(&sf, serde_json::to_string_pretty(&data).unwrap_or_default()).await;
+}
+
+// ===========================================================================
+// ProcessManager<R> — generic manager
+// ===========================================================================
+
+/// Thread-safe process manager. Clone-friendly (wraps Arc).
+/// Generic over the readiness-check strategy.
+#[derive(Clone)]
+pub struct ProcessManager<R: ReadinessCheck> {
+    inner: Arc<RwLock<ManagedProcess>>,
+    readiness: Arc<R>,
+}
+
+impl<R: ReadinessCheck> ProcessManager<R> {
+    /// Stop the running process and return to idle.
+    pub async fn stop(&self) {
+        let mut s = self.inner.write().await;
+        kill_child(&mut s).await;
+        s.state = ServeState::Idle;
+        s.model = None;
+        s.error = None;
+        persist_state(&s).await;
+    }
+}
+
+// ===========================================================================
+// ServeManager = ProcessManager<HttpHealth>
+// ===========================================================================
+
+/// Backward-compatible type alias.
+pub type ServeManager = ProcessManager<HttpHealth>;
 
 impl ServeManager {
     /// Create a new idle manager.
     pub fn new(port: u16, engine: ServeEngine) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(ManagedServer {
+            inner: Arc::new(RwLock::new(ManagedProcess {
                 state: ServeState::Idle,
                 model: None,
                 engine,
                 backend: ServeBackend::default(),
-                port,
+                port: Some(port),
                 child: None,
                 pid: None,
                 load_started: None,
                 error: None,
             })),
+            readiness: Arc::new(HttpHealth {
+                port,
+                endpoints: engine.config().health_endpoints.to_vec(),
+            }),
         }
     }
 
@@ -138,6 +423,14 @@ impl ServeManager {
             s.error = None;
             s.load_started = Some(std::time::Instant::now());
         }
+        // Update readiness endpoints for the new engine
+        let readiness = Arc::new(HttpHealth {
+            port: {
+                let s = self.inner.read().await;
+                s.port.unwrap_or(19080)
+            },
+            endpoints: engine.config().health_endpoints.to_vec(),
+        });
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let req = LoadRequest {
@@ -146,7 +439,7 @@ impl ServeManager {
                 hostfile: None,
                 engine,
             };
-            do_load(inner, req).await;
+            do_serve_load(inner, readiness, req).await;
         });
     }
 
@@ -158,25 +451,24 @@ impl ServeManager {
             s.error = None;
             s.load_started = Some(std::time::Instant::now());
         }
+        // Update readiness endpoints for the requested engine
+        let readiness = Arc::new(HttpHealth {
+            port: {
+                let s = self.inner.read().await;
+                s.port.unwrap_or(19080)
+            },
+            endpoints: req.engine.config().health_endpoints.to_vec(),
+        });
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            do_load(inner, req).await;
+            do_serve_load(inner, readiness, req).await;
         });
-    }
-
-    /// Stop the running server and return to idle.
-    pub async fn stop(&self) {
-        let mut s = self.inner.write().await;
-        kill_child(&mut s).await;
-        s.state = ServeState::Idle;
-        s.model = None;
-        s.error = None;
-        persist_state(&s).await;
     }
 
     /// Get a read-only status snapshot.
     pub async fn status(&self) -> ServeStatus {
         let s = self.inner.read().await;
+        let port = s.port.unwrap_or(19080);
         let elapsed = s
             .load_started
             .map(|t| t.elapsed().as_millis() as u64)
@@ -184,7 +476,7 @@ impl ServeManager {
         let port_verified = if s.pid.is_some()
             && (s.state == ServeState::Ready || s.state == ServeState::Bare)
         {
-            verify_port_owner(s.pid.unwrap(), s.port).await
+            verify_port_owner(s.pid.unwrap(), port).await
         } else {
             false
         };
@@ -193,7 +485,7 @@ impl ServeManager {
             model: s.model.clone(),
             engine: s.engine,
             backend: s.backend,
-            port: s.port,
+            port,
             pid: s.pid,
             port_verified,
             elapsed_ms: elapsed,
@@ -202,9 +494,9 @@ impl ServeManager {
     }
 }
 
-/// Background load task — mirrors Python's _do_load.
-async fn do_load(inner: Arc<RwLock<ManagedServer>>, req: LoadRequest) {
-    let result = do_load_inner(&inner, &req).await;
+/// Background serve load task.
+async fn do_serve_load(inner: Arc<RwLock<ManagedProcess>>, readiness: Arc<HttpHealth>, req: LoadRequest) {
+    let result = do_serve_load_inner(&inner, &readiness, &req).await;
     if let Err(e) = result {
         let mut s = inner.write().await;
         s.state = ServeState::Error;
@@ -212,14 +504,15 @@ async fn do_load(inner: Arc<RwLock<ManagedServer>>, req: LoadRequest) {
     }
 }
 
-async fn do_load_inner(
-    inner: &Arc<RwLock<ManagedServer>>,
+async fn do_serve_load_inner(
+    inner: &Arc<RwLock<ManagedProcess>>,
+    readiness: &Arc<HttpHealth>,
     req: &LoadRequest,
 ) -> Result<(), anyhow::Error> {
     let (port, engine) = {
         let mut s = inner.write().await;
         kill_child(&mut s).await;
-        (s.port, req.engine)
+        (s.port.unwrap_or(19080), req.engine)
     };
 
     let is_bare = req.model_path.is_none();
@@ -339,26 +632,8 @@ async fn do_load_inner(
 
     let child_pid = child.id().unwrap_or(0);
 
-    // Race health polling against child exit detection.
-    // If the process crashes, child.wait() resolves immediately — no 60s timeout.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()?;
-
-    let health_result = tokio::select! {
-        exit_result = child.wait() => {
-            // Process exited before health check passed — read log for real error
-            let detail = read_log_tail(&log_path, 15).await;
-            let code_str = match exit_result {
-                Ok(status) => status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
-                Err(e) => format!("wait error: {e}"),
-            };
-            Err(format!("server exited during startup (exit {code_str}): {detail}"))
-        }
-        result = poll_health(&client, port, cfg.health_endpoints, 60) => {
-            result
-        }
-    };
+    // Use the readiness check (HTTP health polling racing against child exit).
+    let health_result = readiness.poll_ready(&mut child, 60).await;
 
     let mut s = inner.write().await;
     match health_result {
@@ -402,168 +677,37 @@ async fn do_load_inner(
     Ok(())
 }
 
-/// Kill the existing child process (SIGTERM → 5s → SIGKILL).
-async fn kill_child(s: &mut ManagedServer) {
-    if let Some(ref mut child) = s.child {
-        // Try SIGTERM via nix for clean shutdown
-        if let Some(pid) = s.pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        // Wait up to 5s for graceful exit
-        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                // Force kill
-                let _ = child.kill().await;
-            }
-        }
-    }
-    s.child = None;
-    s.pid = None;
-}
-
-/// Resolve "auto" backend to single or jaccl based on hostfile existence.
-fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
-    if backend == "single" {
-        return ServeBackend::Single;
-    }
-    let hf = hostfile
-        .map(PathBuf::from)
-        .unwrap_or_else(default_hostfile);
-    if hf.exists() && (backend == "jaccl" || backend == "auto") {
-        ServeBackend::Jaccl
-    } else {
-        ServeBackend::Single
-    }
-}
-
-/// Poll health endpoints until one returns 200 or timeout.
-/// Returns Ok(true) on success, Ok(false) on timeout.
-async fn poll_health(
-    client: &reqwest::Client,
-    port: u16,
-    endpoints: &[&str],
-    timeout_secs: u64,
-) -> Result<bool, String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        for ep in endpoints {
-            let url = format!("http://127.0.0.1:{port}{ep}");
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() {
-                    return Ok(true);
-                }
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-}
-
-/// Read the last N lines from a log file (best-effort).
-async fn read_log_tail(path: &str, lines: usize) -> String {
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => {
-            let tail: Vec<&str> = content.lines().rev().take(lines).collect();
-            let tail: Vec<&str> = tail.into_iter().rev().collect();
-            // Find the most useful line: last Python exception or traceback line
-            let useful = tail.iter().find(|l| {
-                l.contains("Error:") || l.contains("Exception:") || l.contains("error:")
-            });
-            if let Some(line) = useful {
-                line.trim().to_string()
-            } else {
-                tail.join("\n").trim().to_string()
-            }
-        }
-        Err(_) => String::new(),
-    }
-}
-
-/// Verify a process owns the expected port via lsof.
-async fn verify_port_owner(pid: u32, port: u16) -> bool {
-    let output = Command::new("/usr/sbin/lsof")
-        .args([
-            "-a",
-            "-p",
-            &pid.to_string(),
-            "-iTCP",
-            "-sTCP:LISTEN",
-            "-P",
-            "-n",
-        ])
-        .output()
-        .await;
-    match output {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            stdout.contains(&format!(":{port}"))
-        }
-        _ => false,
-    }
-}
-
-/// Persist model/engine/backend to disk for crash recovery.
-async fn persist_state(s: &ManagedServer) {
-    let sf = state_file(s.port);
-    if let Some(parent) = sf.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let data = serde_json::json!({
-        "model": s.model,
-        "backend": s.backend.to_string(),
-        "engine": s.engine,
-    });
-    let _ = tokio::fs::write(&sf, serde_json::to_string_pretty(&data).unwrap_or_default()).await;
-}
-
 // ===========================================================================
-// ShareManager — manages a single mlx_lm.share distributed session
+// ShareManager = ProcessManager<LogMonitor>
 // ===========================================================================
 
-/// Share session log file.
-const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
-
-/// Persistent state file for share crash recovery.
-fn share_state_file() -> PathBuf {
-    r1o_dir().join("share-state.json")
-}
-
-/// Internal mutable state for the share session.
-struct ManagedShare {
-    state: ServeState,
-    model: Option<String>,
-    backend: ServeBackend,
-    child: Option<tokio::process::Child>,
-    pid: Option<u32>,
-    load_started: Option<std::time::Instant>,
-    error: Option<String>,
-}
-
-/// Thread-safe share manager. Clone-friendly (wraps Arc).
-#[derive(Clone)]
-pub struct ShareManager {
-    inner: Arc<RwLock<ManagedShare>>,
-}
+/// Backward-compatible type alias.
+pub type ShareManager = ProcessManager<LogMonitor>;
 
 impl ShareManager {
     /// Create a new idle share manager.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(ManagedShare {
+            inner: Arc::new(RwLock::new(ManagedProcess {
                 state: ServeState::Idle,
                 model: None,
+                engine: ServeEngine::MlxLmShare,
                 backend: ServeBackend::Single,
+                port: None,
                 child: None,
                 pid: None,
                 load_started: None,
                 error: None,
             })),
+            readiness: Arc::new(LogMonitor {
+                log_path: SHARE_LOG_PATH.to_string(),
+                ready_markers: vec![
+                    "Starting endpoint",
+                    "Connected to",
+                    "Listening on",
+                ],
+                error_markers: vec!["Error:", "Exception:"],
+            }),
         }
     }
 
@@ -606,26 +750,16 @@ impl ShareManager {
     pub async fn start(&self, req: ShareRequest) {
         {
             let mut s = self.inner.write().await;
-            // Kill any existing share process
-            kill_share_child(&mut s).await;
+            kill_child(&mut s).await;
             s.state = ServeState::Loading;
             s.error = None;
             s.load_started = Some(std::time::Instant::now());
         }
         let inner = self.inner.clone();
+        let readiness = self.readiness.clone();
         tokio::spawn(async move {
-            do_share(inner, req).await;
+            do_share_load(inner, readiness, req).await;
         });
-    }
-
-    /// Stop the running share session.
-    pub async fn stop(&self) {
-        let mut s = self.inner.write().await;
-        kill_share_child(&mut s).await;
-        s.state = ServeState::Idle;
-        s.model = None;
-        s.error = None;
-        persist_share_state(&s).await;
     }
 
     /// Get a read-only status snapshot.
@@ -646,9 +780,9 @@ impl ShareManager {
     }
 }
 
-/// Background share task — spawns mlx_lm.share and monitors via log output.
-async fn do_share(inner: Arc<RwLock<ManagedShare>>, req: ShareRequest) {
-    let result = do_share_inner(&inner, &req).await;
+/// Background share load task.
+async fn do_share_load(inner: Arc<RwLock<ManagedProcess>>, readiness: Arc<LogMonitor>, req: ShareRequest) {
+    let result = do_share_load_inner(&inner, &readiness, &req).await;
     if let Err(e) = result {
         let mut s = inner.write().await;
         s.state = ServeState::Error;
@@ -656,13 +790,14 @@ async fn do_share(inner: Arc<RwLock<ManagedShare>>, req: ShareRequest) {
     }
 }
 
-async fn do_share_inner(
-    inner: &Arc<RwLock<ManagedShare>>,
+async fn do_share_load_inner(
+    inner: &Arc<RwLock<ManagedProcess>>,
+    readiness: &Arc<LogMonitor>,
     req: &ShareRequest,
 ) -> Result<(), anyhow::Error> {
     {
         let mut s = inner.write().await;
-        kill_share_child(&mut s).await;
+        kill_child(&mut s).await;
     }
 
     // Expand ~ in model path
@@ -736,21 +871,8 @@ async fn do_share_inner(
 
     let child_pid = child.id().unwrap_or(0);
 
-    // Race log-based readiness against child exit (early crash detection).
-    // share has no HTTP endpoint — we scan the log for readiness markers.
-    let readiness_result = tokio::select! {
-        exit_result = child.wait() => {
-            let detail = read_log_tail(SHARE_LOG_PATH, 15).await;
-            let code_str = match exit_result {
-                Ok(status) => status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
-                Err(e) => format!("wait error: {e}"),
-            };
-            Err(format!("share exited during startup (exit {code_str}): {detail}"))
-        }
-        result = poll_share_log(SHARE_LOG_PATH, 120) => {
-            result
-        }
-    };
+    // Use the readiness check (log monitoring racing against child exit, 120s timeout).
+    let readiness_result = readiness.poll_ready(&mut child, 120).await;
 
     let mut s = inner.write().await;
     match readiness_result {
@@ -761,7 +883,7 @@ async fn do_share_inner(
             s.backend = backend;
             s.state = ServeState::Ready;
             tracing::info!(pid = child_pid, model = ?req.model_path, "share session ready");
-            persist_share_state(&s).await;
+            persist_state(&s).await;
         }
         Ok(false) => {
             s.state = ServeState::Error;
@@ -777,63 +899,4 @@ async fn do_share_inner(
     }
 
     Ok(())
-}
-
-/// Poll the share log file for readiness markers.
-/// Returns Ok(true) when ready, Ok(false) on timeout.
-async fn poll_share_log(log_path: &str, timeout_secs: u64) -> Result<bool, String> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
-            // Readiness markers from mlx_lm.share output
-            if content.contains("Starting endpoint")
-                || content.contains("Connected to")
-                || content.contains("Listening on")
-            {
-                return Ok(true);
-            }
-            // Error markers — fail fast
-            if content.contains("Error:") || content.contains("Exception:") {
-                let detail = read_log_tail(log_path, 10).await;
-                return Err(format!("share error: {detail}"));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
-
-/// Kill the existing share child process (SIGTERM → 5s → SIGKILL).
-async fn kill_share_child(s: &mut ManagedShare) {
-    if let Some(ref mut child) = s.child {
-        if let Some(pid) = s.pid {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
-        }
-        match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
-            Ok(_) => {}
-            Err(_) => {
-                let _ = child.kill().await;
-            }
-        }
-    }
-    s.child = None;
-    s.pid = None;
-}
-
-/// Persist share state for crash recovery.
-async fn persist_share_state(s: &ManagedShare) {
-    let sf = share_state_file();
-    if let Some(parent) = sf.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    let data = serde_json::json!({
-        "model": s.model,
-        "backend": s.backend.to_string(),
-    });
-    let _ = tokio::fs::write(&sf, serde_json::to_string_pretty(&data).unwrap_or_default()).await;
 }

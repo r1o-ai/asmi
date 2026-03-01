@@ -4,6 +4,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+// ---------------------------------------------------------------------------
+// Typed API error — returns proper HTTP status codes instead of 200 + error JSON
+// ---------------------------------------------------------------------------
+
+enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    Internal(String),
+}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, message) = match self {
+            ApiError::BadRequest(msg) => (axum::http::StatusCode::BAD_REQUEST, msg),
+            ApiError::NotFound(msg) => (axum::http::StatusCode::NOT_FOUND, msg),
+            ApiError::Internal(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg),
+        };
+        let body = axum::Json(serde_json::json!({"error": message}));
+        (status, body).into_response()
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub snapshot: Arc<RwLock<Option<asmi_core::NodeSnapshot>>>,
@@ -29,22 +51,9 @@ pub struct RuntimeInfo {
     pub macos_version: Option<String>,
 }
 
-/// Resolve the best python3 binary. Homebrew python has the real MLX install;
-/// the system /usr/bin/python3 (3.9.6) has an older version.
-/// Returns the path as a string so callers can use it with Command::new().
-pub fn resolve_python() -> &'static str {
-    // Candidates in priority order
-    const CANDIDATES: &[&str] = &[
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3",
-    ];
-    for p in CANDIDATES {
-        if std::path::Path::new(p).exists() {
-            return p;
-        }
-    }
-    "python3" // fallback to PATH
-}
+/// Re-export from asmi_core so `crate::daemon::resolve_python` still works
+/// for serve.rs and other consumers in the binary crate.
+pub use asmi_core::resolve_python;
 
 /// Probe the local Python environment for ML framework versions.
 pub async fn probe_runtime() -> RuntimeInfo {
@@ -100,11 +109,12 @@ pub async fn probe_runtime() -> RuntimeInfo {
     }
 }
 
-async fn metrics_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn metrics_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let snap = state.snapshot.read().await;
     match snap.as_ref() {
-        Some(s) => Json(serde_json::to_value(s).unwrap_or(serde_json::json!({"error": "serialize failed"}))),
-        None => Json(serde_json::json!({"error": "no data yet", "hostname": state.hostname})),
+        Some(s) => Ok(Json(serde_json::to_value(s)
+            .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?)),
+        None => Err(ApiError::NotFound(format!("no data yet (hostname: {})", state.hostname))),
     }
 }
 
@@ -133,17 +143,15 @@ async fn processes_handler(State(state): State<AppState>) -> Json<serde_json::Va
 }
 
 /// GET /cluster → Vec<NodeSnapshot> for all polled nodes (hub mode only)
-async fn cluster_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn cluster_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     match &state.cluster_state {
         Some(cs) => {
             let s = cs.read().await;
             let snapshots: Vec<&asmi_core::NodeSnapshot> = s.snapshots.values().collect();
-            Json(serde_json::to_value(&snapshots)
-                .unwrap_or(serde_json::json!([])))
+            Ok(Json(serde_json::to_value(&snapshots)
+                .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?))
         }
-        None => Json(serde_json::json!({
-            "error": "not running in cluster hub mode (start with --cluster)"
-        })),
+        None => Err(ApiError::BadRequest("not running in cluster hub mode (start with --cluster)".into())),
     }
 }
 
@@ -186,22 +194,18 @@ async fn stream_handler(
 async fn jaccl_config_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let nm = state.node_map.read().await;
 
     if nm.rdma_links.is_empty() {
-        return Json(serde_json::json!({
-            "success": false,
-            "error": "No RDMA links discovered. Run `asmi` TUI scan first to discover RDMA topology."
-        }));
+        return Err(ApiError::NotFound(
+            "No RDMA links discovered. Run `asmi` TUI scan first to discover RDMA topology.".into(),
+        ));
     }
 
     let hostfile_json = nm.hostfile_jaccl(&state.hostname);
     if hostfile_json == "[]" {
-        return Json(serde_json::json!({
-            "success": false,
-            "error": "No RDMA-connected nodes found in topology"
-        }));
+        return Err(ApiError::NotFound("No RDMA-connected nodes found in topology".into()));
     }
 
     // Parse the JSON string from hostfile_jaccl and optionally filter by requested hosts
@@ -224,19 +228,15 @@ async fn jaccl_config_handler(
             };
 
             let count = filtered.as_array().map(|a| a.len()).unwrap_or(0);
-            Json(serde_json::json!({
+            Ok(Json(serde_json::json!({
                 "success": true,
                 "hosts": filtered,
                 "nodeCount": count,
                 "rdma_links_total": nm.rdma_links.len(),
                 "local_hostname": state.hostname,
-            }))
+            })))
         }
-        Err(e) => Json(serde_json::json!({
-            "success": false,
-            "error": format!("Failed to build JACCL matrix: {e}"),
-            "raw": hostfile_json,
-        })),
+        Err(e) => Err(ApiError::Internal(format!("Failed to build JACCL matrix: {e}"))),
     }
 }
 
@@ -244,31 +244,20 @@ async fn jaccl_config_handler(
 async fn jaccl_generate_handler(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let nm = state.node_map.read().await;
 
     if nm.rdma_links.is_empty() {
-        return Json(serde_json::json!({
-            "success": false,
-            "error": "No RDMA links discovered. Run `asmi` TUI scan first."
-        }));
+        return Err(ApiError::NotFound("No RDMA links discovered. Run `asmi` TUI scan first.".into()));
     }
 
     let hostfile_json = nm.hostfile_jaccl(&state.hostname);
-    let hosts: serde_json::Value = match serde_json::from_str(&hostfile_json) {
-        Ok(v) => v,
-        Err(e) => return Json(serde_json::json!({
-            "success": false,
-            "error": format!("Failed to build matrix: {e}"),
-        })),
-    };
+    let hosts: serde_json::Value = serde_json::from_str(&hostfile_json)
+        .map_err(|e| ApiError::Internal(format!("Failed to build matrix: {e}")))?;
 
     let count = hosts.as_array().map(|a| a.len()).unwrap_or(0);
     if count == 0 {
-        return Json(serde_json::json!({
-            "success": false,
-            "error": "No RDMA-connected nodes found",
-        }));
+        return Err(ApiError::NotFound("No RDMA-connected nodes found".into()));
     }
 
     // Optionally write to disk if 'write' flag is set
@@ -279,30 +268,21 @@ async fn jaccl_generate_handler(
         let pretty = serde_json::to_string_pretty(&hosts).unwrap_or_default();
         // Write via local file (asmi runs on the coordinator)
         let expanded = path.replace('~', &std::env::var("HOME").unwrap_or_default());
-        match std::fs::write(&expanded, &pretty) {
-            Ok(()) => {
-                tracing::info!(path = %expanded, nodes = count, "wrote JACCL hostfile");
-            }
-            Err(e) => {
-                return Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("Failed to write hostfile: {e}"),
-                    "hosts": hosts,
-                }));
-            }
-        }
+        std::fs::write(&expanded, &pretty)
+            .map_err(|e| ApiError::Internal(format!("Failed to write hostfile: {e}")))?;
+        tracing::info!(path = %expanded, nodes = count, "wrote JACCL hostfile");
     }
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "success": true,
         "action": if should_write { "generate" } else { "discover" },
         "hosts": hosts,
         "nodeCount": count,
         "path": if should_write { Some(&path) } else { None },
-    }))
+    })))
 }
 
-/// GET /models → cached local model file listing
+/// GET /models → cached local model file listing (now includes external volumes)
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let cache = state.model_cache.read().await;
     let (models, scanned_at) = match cache.as_ref() {
@@ -315,10 +295,19 @@ async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value
     }))
 }
 
+/// GET /volumes → discover mounted external volumes with size info
+async fn volumes_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let volumes = asmi_core::discover_volumes();
+    Json(serde_json::json!({
+        "hostname": state.hostname,
+        "volumes": volumes,
+    }))
+}
+
 /// GET /logs?name=mlx-server&lines=50 → tail server log files
 async fn logs_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let name = params.get("name").cloned().unwrap_or_else(|| "mlx-server".to_string());
     let lines: usize = params.get("lines")
         .and_then(|l| l.parse().ok())
@@ -331,46 +320,39 @@ async fn logs_handler(
         "vllm" | "vllm_mlx" => "/tmp/r1o-vllm_mlx-server.log",
         "asmi" | "daemon" => "~/Library/Logs/asmi-daemon.log",
         _ => {
-            return Json(serde_json::json!({
-                "error": format!("unknown log name: {name}"),
-                "known_names": ["mlx-server", "mlx-vlm", "vllm", "asmi"],
-            }));
+            return Err(ApiError::BadRequest(format!(
+                "unknown log name: {name} (known: mlx-server, mlx-vlm, vllm, asmi)"
+            )));
         }
     };
 
     let expanded = log_path.replace('~', &std::env::var("HOME").unwrap_or_default());
 
-    match std::fs::read_to_string(&expanded) {
-        Ok(content) => {
-            let all_lines: Vec<&str> = content.lines().collect();
-            let start = all_lines.len().saturating_sub(lines);
-            let tail: Vec<&str> = all_lines[start..].to_vec();
-            Json(serde_json::json!({
-                "name": name,
-                "path": expanded,
-                "lines": tail,
-                "total_lines": all_lines.len(),
-            }))
-        }
-        Err(e) => Json(serde_json::json!({
-            "name": name,
-            "path": expanded,
-            "error": format!("could not read log: {e}"),
-        })),
-    }
+    let content = std::fs::read_to_string(&expanded)
+        .map_err(|e| ApiError::Internal(format!("could not read log {expanded}: {e}")))?;
+
+    let all_lines: Vec<&str> = content.lines().collect();
+    let start = all_lines.len().saturating_sub(lines);
+    let tail: Vec<&str> = all_lines[start..].to_vec();
+    Ok(Json(serde_json::json!({
+        "name": name,
+        "path": expanded,
+        "lines": tail,
+        "total_lines": all_lines.len(),
+    })))
 }
 
 /// GET /runtime → Python/MLX/macOS version info (cached at startup)
-async fn runtime_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(state.runtime.as_ref())
-        .unwrap_or(serde_json::json!({"error": "no runtime info"})))
+async fn runtime_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::to_value(state.runtime.as_ref())
+        .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?))
 }
 
 /// GET /health/setup → run setup validation checks
-async fn setup_handler() -> Json<serde_json::Value> {
+async fn setup_handler() -> Result<Json<serde_json::Value>, ApiError> {
     let checks = asmi_core::run_setup_checks().await;
-    Json(serde_json::to_value(&checks)
-        .unwrap_or(serde_json::json!({"error": "check failed"})))
+    Ok(Json(serde_json::to_value(&checks)
+        .map_err(|e| ApiError::Internal(format!("check failed: {e}")))?))
 }
 
 /// GET /arp → ARP table entries on Thunderbolt/bridge interfaces (en*).
@@ -517,17 +499,17 @@ async fn thunderbolt_handler(State(state): State<AppState>) -> Json<serde_json::
 }
 
 /// GET /health/network → validate local Thunderbolt network service names
-async fn network_health_handler() -> Json<serde_json::Value> {
+async fn network_health_handler() -> Result<Json<serde_json::Value>, ApiError> {
     let status = asmi_core::validate_thunderbolt_services().await;
-    Json(serde_json::to_value(&status)
-        .unwrap_or(serde_json::json!({"error": "check failed"})))
+    Ok(Json(serde_json::to_value(&status)
+        .map_err(|e| ApiError::Internal(format!("check failed: {e}")))?))
 }
 
 /// POST /health/network/fix → auto-repair Thunderbolt service names
-async fn network_fix_handler() -> Json<serde_json::Value> {
+async fn network_fix_handler() -> Result<Json<serde_json::Value>, ApiError> {
     let result = asmi_core::fix_thunderbolt_services().await;
-    Json(serde_json::to_value(&result)
-        .unwrap_or(serde_json::json!({"error": "fix failed"})))
+    Ok(Json(serde_json::to_value(&result)
+        .map_err(|e| ApiError::Internal(format!("fix failed: {e}")))?))
 }
 
 // ---------------------------------------------------------------------------
@@ -555,17 +537,14 @@ fn get_manager(state: &AppState, port: Option<u16>) -> Option<&crate::serve::Ser
 async fn serve_status_handler(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(port) = q.port {
         // Single-port query
-        match get_manager(&state, Some(port)) {
-            Some(mgr) => {
-                let status = mgr.status().await;
-                Json(serde_json::to_value(&status)
-                    .unwrap_or(serde_json::json!({"error": "serialize failed"})))
-            }
-            None => Json(serde_json::json!({"error": format!("unknown port: {port}")})),
-        }
+        let mgr = get_manager(&state, Some(port))
+            .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+        let status = mgr.status().await;
+        Ok(Json(serde_json::to_value(&status)
+            .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?))
     } else {
         // All ports → {"servers": [...]}
         let mut servers = Vec::new();
@@ -574,7 +553,7 @@ async fn serve_status_handler(
         }
         // Sort by port for deterministic output
         servers.sort_by_key(|s| s.port);
-        Json(serde_json::json!({"servers": servers}))
+        Ok(Json(serde_json::json!({"servers": servers})))
     }
 }
 
@@ -584,14 +563,14 @@ async fn serve_load_handler(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
     Json(req): Json<asmi_core::LoadRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // model_path is required for explicit loads (bare start is boot-only)
     match &req.model_path {
         Some(p) if p.is_empty() => {
-            return Json(serde_json::json!({"error": "model_path required"}));
+            return Err(ApiError::BadRequest("model_path required".into()));
         }
         None => {
-            return Json(serde_json::json!({"error": "model_path required"}));
+            return Err(ApiError::BadRequest("model_path required".into()));
         }
         _ => {}
     }
@@ -602,75 +581,65 @@ async fn serve_load_handler(
         _ => DEFAULT_SERVE_PORT,
     });
 
-    match get_manager(&state, Some(port)) {
-        Some(mgr) => {
-            let engine = req.engine;
-            mgr.load(req).await;
-            Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port}))
-        }
-        None => Json(serde_json::json!({"error": format!("unknown port: {port}")})),
-    }
+    let mgr = get_manager(&state, Some(port))
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+    let engine = req.engine;
+    mgr.load(req).await;
+    Ok(Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port})))
 }
 
 /// POST /serve/stop → stop the running server on a port.
 async fn serve_stop_handler(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
-) -> Json<serde_json::Value> {
-    match get_manager(&state, q.port) {
-        Some(mgr) => {
-            mgr.stop().await;
-            Json(serde_json::json!({"ok": true, "port": q.port.unwrap_or(DEFAULT_SERVE_PORT)}))
-        }
-        None => Json(serde_json::json!({"error": format!("unknown port: {}", q.port.unwrap_or(DEFAULT_SERVE_PORT))})),
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let port = q.port.unwrap_or(DEFAULT_SERVE_PORT);
+    let mgr = get_manager(&state, q.port)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+    mgr.stop().await;
+    Ok(Json(serde_json::json!({"ok": true, "port": port})))
 }
 
 /// POST /serve/reload → reload the current model on a port.
 async fn serve_reload_handler(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
-) -> Json<serde_json::Value> {
-    match get_manager(&state, q.port) {
-        Some(mgr) => {
-            let status = mgr.status().await;
-            match status.model {
-                Some(model) => {
-                    let req = asmi_core::LoadRequest {
-                        model_path: Some(model),
-                        backend: status.backend.to_string(),
-                        hostfile: None,
-                        engine: status.engine,
-                    };
-                    mgr.load(req).await;
-                    Json(serde_json::json!({"ok": true, "state": "loading", "port": status.port}))
-                }
-                None => Json(serde_json::json!({"error": "no model loaded"})),
-            }
-        }
-        None => Json(serde_json::json!({"error": format!("unknown port: {}", q.port.unwrap_or(DEFAULT_SERVE_PORT))})),
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let port = q.port.unwrap_or(DEFAULT_SERVE_PORT);
+    let mgr = get_manager(&state, q.port)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+    let status = mgr.status().await;
+    let model = status.model
+        .ok_or_else(|| ApiError::NotFound("no model loaded".into()))?;
+    let req = asmi_core::LoadRequest {
+        model_path: Some(model),
+        backend: status.backend.to_string(),
+        hostfile: None,
+        engine: status.engine,
+    };
+    mgr.load(req).await;
+    Ok(Json(serde_json::json!({"ok": true, "state": "loading", "port": status.port})))
 }
 
 /// POST /serve/share — start a distributed share session.
 async fn serve_share_handler(
     State(state): State<AppState>,
     Json(req): Json<asmi_core::ShareRequest>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     if req.model_path.is_empty() {
-        return Json(serde_json::json!({"error": "model_path required"}));
+        return Err(ApiError::BadRequest("model_path required".into()));
     }
     state.share_manager.start(req).await;
-    Json(serde_json::json!({"ok": true, "state": "loading"}))
+    Ok(Json(serde_json::json!({"ok": true, "state": "loading"})))
 }
 
 /// GET /serve/share/status — share session status.
 async fn serve_share_status_handler(
     State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let status = state.share_manager.status().await;
-    Json(serde_json::to_value(&status)
-        .unwrap_or(serde_json::json!({"error": "serialize failed"})))
+    Ok(Json(serde_json::to_value(&status)
+        .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?))
 }
 
 /// POST /serve/share/stop — stop the running share session.
@@ -690,6 +659,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/network/fix", post(network_fix_handler))
         .route("/processes", get(processes_handler))
         .route("/models", get(models_handler))
+        .route("/volumes", get(volumes_handler))
         .route("/logs", get(logs_handler))
         .route("/runtime", get(runtime_handler))
         .route("/cluster", get(cluster_handler))

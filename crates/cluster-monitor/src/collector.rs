@@ -12,7 +12,46 @@ use crate::ssh::{local_run, ssh_run};
 use crate::types::*;
 use chrono::Utc;
 use regex::Regex;
+use std::sync::LazyLock;
 use tracing::{debug, info, warn};
+
+// ---------------------------------------------------------------------------
+// Static regexes (compiled once, reused across all poll ticks)
+// ---------------------------------------------------------------------------
+
+// parse_powermetrics_text
+static POWER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(CPU|GPU|ANE) Power:\s+([\d.]+)\s+mW").unwrap()
+});
+static GPU_ACTIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"GPU HW active residency:\s+([\d.]+)%").unwrap()
+});
+static GPU_IDLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"GPU idle residency:\s+([\d.]+)%").unwrap()
+});
+static CPU_ACTIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^CPU \d+ active residency:\s+([\d.]+)%").unwrap()
+});
+
+// parse_vmstat_and_memsize
+static PAGE_SIZE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\(page size of (\d+) bytes\)").unwrap()
+});
+static PAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^Pages (\w[\w ]*\w):\s+(\d+)\.").unwrap()
+});
+
+// parse_ps_mlx
+static PS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(\S+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$"
+    ).unwrap()
+});
+
+// parse_footprint
+static FOOTPRINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Footprint:\s+([\d.]+)\s+(KB|MB|GB)").unwrap()
+});
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -506,11 +545,10 @@ pub fn parse_powermetrics_text(text: &str) -> PowerMetricsResult {
     //
     // There may be a second "GPU Power:" in the GPU section. We take the first
     // occurrence of each to stay consistent with Combined Power.
-    let power_re = Regex::new(r"(?m)^(CPU|GPU|ANE) Power:\s+([\d.]+)\s+mW").unwrap();
     let mut seen_cpu = false;
     let mut seen_gpu = false;
     let mut seen_ane = false;
-    for cap in power_re.captures_iter(text) {
+    for cap in POWER_RE.captures_iter(text) {
         let kind = &cap[1];
         let mw: f64 = cap[2].parse().unwrap_or(0.0);
         match kind {
@@ -531,13 +569,11 @@ pub fn parse_powermetrics_text(text: &str) -> PowerMetricsResult {
     }
 
     // GPU HW active residency: "GPU HW active residency: 100.00% (...)"
-    let gpu_re = Regex::new(r"GPU HW active residency:\s+([\d.]+)%").unwrap();
-    if let Some(cap) = gpu_re.captures(text) {
+    if let Some(cap) = GPU_ACTIVE_RE.captures(text) {
         result.gpu_percent = cap[1].parse().unwrap_or(0.0);
     } else {
         // Fallback: derive from GPU idle residency
-        let idle_re = Regex::new(r"GPU idle residency:\s+([\d.]+)%").unwrap();
-        if let Some(cap) = idle_re.captures(text) {
+        if let Some(cap) = GPU_IDLE_RE.captures(text) {
             let idle: f64 = cap[1].parse().unwrap_or(0.0);
             result.gpu_percent = 100.0 - idle;
         }
@@ -545,10 +581,9 @@ pub fn parse_powermetrics_text(text: &str) -> PowerMetricsResult {
 
     // CPU active residency: "CPU N active residency:  X.XX% (...)"
     // Average across all CPU cores
-    let cpu_re = Regex::new(r"(?m)^CPU \d+ active residency:\s+([\d.]+)%").unwrap();
     let mut sum = 0.0;
     let mut count = 0u32;
-    for cap in cpu_re.captures_iter(text) {
+    for cap in CPU_ACTIVE_RE.captures_iter(text) {
         sum += cap[1].parse::<f64>().unwrap_or(0.0);
         count += 1;
     }
@@ -605,21 +640,19 @@ pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
         .unwrap_or(0);
 
     // Parse page size from vm_stat header
-    let page_size_re = Regex::new(r"\(page size of (\d+) bytes\)").unwrap();
-    let page_size: u64 = page_size_re
+    let page_size: u64 = PAGE_SIZE_RE
         .captures(vmstat_text)
         .and_then(|c| c[1].parse().ok())
         .unwrap_or(16384);
 
     // Parse page counts
-    let page_re = Regex::new(r"(?m)^Pages (\w[\w ]*\w):\s+(\d+)\.").unwrap();
     let mut active: u64 = 0;
     let mut inactive: u64 = 0;
     let mut speculative: u64 = 0;
     let mut wired: u64 = 0;
     let mut compressor: u64 = 0;
 
-    for cap in page_re.captures_iter(vmstat_text) {
+    for cap in PAGE_RE.captures_iter(vmstat_text) {
         let name = &cap[1];
         let pages: u64 = cap[2].parse().unwrap_or(0);
         match name {
@@ -655,16 +688,9 @@ pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
 /// Filters out chrome-devtools-mcp watchdog, Microsoft Teams watchdog,
 /// and system watchdogd processes.
 pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
-    // Regex to split ps aux lines into 11 groups:
-    // user, pid, %cpu, %mem, vsz, rss, tt, stat, started, time, command
-    // The first 10 fields are whitespace-delimited, the 11th (command) is the rest.
-    let ps_re = Regex::new(
-        r"(?m)^\s*(\S+)\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$"
-    ).unwrap();
-
     let mut procs = Vec::new();
 
-    for cap in ps_re.captures_iter(text) {
+    for cap in PS_RE.captures_iter(text) {
         let command = &cap[11];
 
         // Filter out watchdog/noise processes
@@ -749,8 +775,7 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
 ///
 /// Returns footprint in MB.
 pub fn parse_footprint(text: &str) -> Option<f64> {
-    let re = Regex::new(r"Footprint:\s+([\d.]+)\s+(KB|MB|GB)").unwrap();
-    let cap = re.captures(text)?;
+    let cap = FOOTPRINT_RE.captures(text)?;
     let value: f64 = cap[1].parse().ok()?;
     let unit = &cap[2];
     let mb = match unit {

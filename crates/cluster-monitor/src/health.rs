@@ -3,19 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Resolve the best python3 binary (homebrew > system).
-fn resolve_python() -> &'static str {
-    const CANDIDATES: &[&str] = &[
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3",
-    ];
-    for p in CANDIDATES {
-        if std::path::Path::new(p).exists() {
-            return p;
-        }
-    }
-    "python3"
-}
+use crate::resolve_python;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
