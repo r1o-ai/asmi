@@ -39,6 +39,8 @@ pub struct AppState {
     pub runtime: Arc<RuntimeInfo>,
     pub serve_managers: Arc<HashMap<u16, crate::serve::ServeManager>>,
     pub share_manager: crate::serve::ShareManager,
+    pub peer_heartbeat: Arc<crate::serve::PeerHeartbeat>,
+    pub watchdog: Arc<crate::watchdog::Watchdog>,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -397,6 +399,18 @@ async fn arp_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 /// Scan Thunderbolt device tree via system_profiler. Called by background cache loop.
 pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
+    // Get this node's hardware model identifier (e.g., "Mac15,14", "Mac16,9")
+    // Used by the cable route to match TB device entries to specific hostnames.
+    let hw_model = tokio::process::Command::new("sysctl")
+        .args(["-n", "hw.model"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| if o.status.success() {
+            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        } else { None })
+        .unwrap_or_default();
+
     let output = match tokio::process::Command::new("system_profiler")
         .args(["SPThunderboltDataType", "-json"])
         .output()
@@ -404,7 +418,7 @@ pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
     {
         Ok(o) if o.status.success() => o.stdout,
         _ => return serde_json::json!({
-            "hostname": hostname, "ports": [], "error": "system_profiler failed"
+            "hostname": hostname, "hw_model": hw_model, "ports": [], "error": "system_profiler failed"
         }),
     };
 
@@ -474,6 +488,7 @@ pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
 
     serde_json::json!({
         "hostname": hostname,
+        "hw_model": hw_model,
         "ports": ports,
     })
 }
@@ -564,15 +579,12 @@ async fn serve_load_handler(
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
     Json(req): Json<asmi_core::LoadRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // model_path is required for explicit loads (bare start is boot-only)
-    match &req.model_path {
-        Some(p) if p.is_empty() => {
-            return Err(ApiError::BadRequest("model_path required".into()));
+    // Allow None model_path — starts an idle server (LM-Studio-style JIT).
+    // Reject empty string though, that's always a mistake.
+    if let Some(p) = &req.model_path {
+        if p.is_empty() {
+            return Err(ApiError::BadRequest("model_path must not be empty (omit field for idle start)".into()));
         }
-        None => {
-            return Err(ApiError::BadRequest("model_path required".into()));
-        }
-        _ => {}
     }
 
     // Infer port: explicit ?port= > engine default
@@ -583,6 +595,26 @@ async fn serve_load_handler(
 
     let mgr = get_manager(&state, Some(port))
         .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+
+    // Start peer heartbeat for JACCL distributed sessions
+    let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
+    if backend == asmi_core::ServeBackend::Jaccl {
+        let hf_path = req
+            .hostfile
+            .clone()
+            .unwrap_or_else(|| crate::serve::default_hostfile().to_string_lossy().to_string());
+        let peers = crate::serve::parse_hostfile_peers(&hf_path, &state.hostname);
+        if !peers.is_empty() {
+            state
+                .peer_heartbeat
+                .start(peers, 9090, state.serve_managers.clone(), state.share_manager.clone())
+                .await;
+        }
+    } else {
+        // Non-distributed load — stop heartbeat if running
+        state.peer_heartbeat.stop().await;
+    }
+
     let engine = req.engine;
     mgr.load(req).await;
     Ok(Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port})))
@@ -597,6 +629,7 @@ async fn serve_stop_handler(
     let mgr = get_manager(&state, q.port)
         .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
     mgr.stop().await;
+    state.peer_heartbeat.stop().await;
     Ok(Json(serde_json::json!({"ok": true, "port": port})))
 }
 
@@ -629,6 +662,21 @@ async fn serve_share_handler(
     if req.model_path.is_empty() {
         return Err(ApiError::BadRequest("model_path required".into()));
     }
+    // Start peer heartbeat for JACCL distributed sessions
+    let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
+    if backend == asmi_core::ServeBackend::Jaccl {
+        let hf_path = req
+            .hostfile
+            .clone()
+            .unwrap_or_else(|| crate::serve::default_hostfile().to_string_lossy().to_string());
+        let peers = crate::serve::parse_hostfile_peers(&hf_path, &state.hostname);
+        if !peers.is_empty() {
+            state
+                .peer_heartbeat
+                .start(peers, 9090, state.serve_managers.clone(), state.share_manager.clone())
+                .await;
+        }
+    }
     state.share_manager.start(req).await;
     Ok(Json(serde_json::json!({"ok": true, "state": "loading"})))
 }
@@ -647,7 +695,36 @@ async fn serve_share_stop_handler(
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
     state.share_manager.stop().await;
+    state.peer_heartbeat.stop().await;
     Json(serde_json::json!({"ok": true}))
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /watchdog/peers → RDMA peer heartbeat status.
+async fn peer_heartbeat_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let status = state.peer_heartbeat.status().await;
+    Json(serde_json::to_value(&status).unwrap_or_default())
+}
+
+/// GET /watchdog → full WatchdogReport (processes + gpu_lock + peer_heartbeat).
+async fn watchdog_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let report = state.watchdog.report().await;
+    Json(serde_json::to_value(&report).unwrap_or_default())
+}
+
+/// GET /watchdog/gpu-lock → GPU Lock detection status.
+async fn gpu_lock_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let status = state.watchdog.gpu_lock_status().await;
+    Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -675,5 +752,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/share", post(serve_share_handler))
         .route("/serve/share/status", get(serve_share_status_handler))
         .route("/serve/share/stop", post(serve_share_stop_handler))
+        .route("/watchdog", get(watchdog_handler))
+        .route("/watchdog/peers", get(peer_heartbeat_handler))
+        .route("/watchdog/gpu-lock", get(gpu_lock_handler))
         .with_state(state)
 }
