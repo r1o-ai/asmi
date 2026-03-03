@@ -2,6 +2,7 @@ mod cli;
 mod daemon;
 mod daemon_startup;
 mod serve;
+mod watchdog;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};

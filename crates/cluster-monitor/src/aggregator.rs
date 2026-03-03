@@ -185,6 +185,7 @@ mod tests {
             cpu_watts: 5000.0,  // 5W
             gpu_watts: 8000.0,  // 8W
             ane_watts: 100.0,   // 0.1W
+            power_source: None,
             cpu_percent: 25.0,
             gpu_percent: 60.0,
             ram_used_bytes: 128 * 1024 * 1024 * 1024, // 128 GiB
@@ -192,6 +193,10 @@ mod tests {
             ram_percent: 25.0,
             ram_app_bytes: 128 * 1024 * 1024 * 1024,
             ram_cached_bytes: 0,
+            cpu_clusters: vec![],
+            gpu_frequency_mhz: None,
+            disk_io: None,
+            network: None,
             cpu_temp_c: Some(42.0),
             gpu_temp_c: None,
             processes: vec![],

@@ -3,7 +3,7 @@ use asmi_core::ClusterConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{bin_name, daemon, serve};
+use crate::{bin_name, daemon, serve, watchdog};
 
 /// Collect hardware identity from `system_profiler SPHardwareDataType`.
 /// Returns (chip_model, serial_number, model_name). Runs synchronously (once at startup).
@@ -80,6 +80,29 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     let hw_serial = serial_number.clone();
     let hw_model = model_name.clone();
 
+    // Init all managed MLX servers (before poll loop so we can enrich metrics)
+    let managers: Vec<_> = futures::future::join_all(
+        serve::MANAGED_PORTS.iter().map(|&(port, engine)| {
+            serve::ServeManager::restore(port, engine)
+        })
+    ).await;
+
+    let mut serve_managers = std::collections::HashMap::new();
+    for (i, mgr) in managers.into_iter().enumerate() {
+        serve_managers.insert(serve::MANAGED_PORTS[i].0, mgr);
+    }
+    let serve_managers = Arc::new(serve_managers);
+
+    // Create IOReport energy subscription for ANE power monitoring.
+    // This uses the private IOReport framework (same data source as powermetrics)
+    // but doesn't require sudo. Created once, sampled every poll tick.
+    let energy_sub = asmi_core::ioreport::EnergySubscription::new(interval * 1000);
+    if energy_sub.is_some() {
+        tracing::info!("IOReport energy subscription active (no-sudo ANE power)");
+    } else {
+        tracing::warn!("IOReport unavailable — ANE power from powermetrics only");
+    }
+
     // Background polling loop — collect local metrics every N seconds
     {
         let snapshot = Arc::clone(&snapshot);
@@ -89,15 +112,65 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         let hw_serial = hw_serial.clone();
         let hw_model = hw_model.clone();
         let metrics_tx = metrics_tx.clone();
+        let serve_managers = Arc::clone(&serve_managers);
+        // Wrap in Mutex so we can mutate inside the async move block
+        let energy_sub = std::sync::Mutex::new(energy_sub);
         tokio::spawn(async move {
             loop {
                 let mut snap = asmi_core::collect_node_metrics(&hostname, &config, true).await;
                 snap.chip_model = hw_chip.clone();
                 snap.serial_number = hw_serial.clone();
                 snap.model_name = hw_model.clone();
+
+                // Sample IOReport for ANE power (no sudo required).
+                // If powermetrics returned 0 for ANE (common without sudo),
+                // use the IOReport value instead. Also enrich power_source.
+                if let Ok(mut sub_guard) = energy_sub.lock() {
+                    if let Some(ref mut sub) = *sub_guard {
+                        let sample = sub.sample();
+                        // IOReport ANE is authoritative — powermetrics needs sudo for ANE
+                        if snap.ane_watts == 0.0 && sample.ane_mw > 0.0 {
+                            snap.ane_watts = sample.ane_mw;
+                        }
+                        // Also backfill CPU/GPU if powermetrics failed (rare)
+                        if snap.cpu_watts == 0.0 && sample.cpu_mw > 0.0 {
+                            snap.cpu_watts = sample.cpu_mw;
+                        }
+                        if snap.gpu_watts == 0.0 && sample.gpu_mw > 0.0 {
+                            snap.gpu_watts = sample.gpu_mw;
+                        }
+                        snap.power_source = sample.power_source.clone();
+                    }
+                }
+
+                // Enrich processes with model names from serve managers.
+                // ps aux parsing misses models for engines that don't use --model
+                // (e.g. mlx_vlm loads via uvicorn, no --model flag on the CLI).
+                for proc in &mut snap.processes {
+                    if proc.model.is_none() {
+                        if let Some(port) = proc.port {
+                            if let Some(mgr) = serve_managers.get(&port) {
+                                let (state, model) = mgr.model_snapshot().await;
+                                if state == asmi_core::ServeState::Ready || state == asmi_core::ServeState::Loading {
+                                    if let Some(ref model_path) = model {
+                                        proc.model = Some(
+                                            model_path.trim_end_matches('/')
+                                                .rsplit('/')
+                                                .next()
+                                                .unwrap_or(model_path)
+                                                .to_string()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 tracing::debug!(
                     cpu = format!("{:.1}%", snap.cpu_percent),
                     gpu = format!("{:.1}%", snap.gpu_percent),
+                    ane_mw = format!("{:.0}", snap.ane_watts),
                     ram = format!("{:.1}/{:.1} GiB", snap.ram_used_gib(), snap.ram_total_gib()),
                     procs = snap.processes.len(),
                     "metrics collected"
@@ -188,19 +261,21 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         });
     }
 
-    // Build axum router — init all managed MLX servers in parallel
-    let managers: Vec<_> = futures::future::join_all(
-        serve::MANAGED_PORTS.iter().map(|&(port, engine)| {
-            serve::ServeManager::restore(port, engine)
-        })
-    ).await;
-
-    let mut serve_managers = std::collections::HashMap::new();
-    for (i, mgr) in managers.into_iter().enumerate() {
-        serve_managers.insert(serve::MANAGED_PORTS[i].0, mgr);
-    }
-
+    // Build axum router (serve_managers already created above for poll loop enrichment)
     let share_manager = serve::ShareManager::restore().await;
+
+    let peer_heartbeat = Arc::new(serve::PeerHeartbeat::new());
+
+    // Process watchdog — monitors inference processes and detects GPU Lock
+    let watchdog_config = watchdog::WatchdogConfig::default();
+    let wd = Arc::new(watchdog::Watchdog::new(
+        watchdog_config,
+        Arc::clone(&snapshot),
+        Arc::clone(&peer_heartbeat),
+    ));
+    // Start watchdog loop in background
+    wd.start().await;
+    tracing::info!("process watchdog started (5s interval)");
 
     let app_state = daemon::AppState {
         snapshot,
@@ -212,8 +287,10 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         model_cache,
         thunderbolt_cache,
         runtime,
-        serve_managers: Arc::new(serve_managers),
+        serve_managers,
         share_manager,
+        peer_heartbeat,
+        watchdog: wd,
     };
 
     let app = daemon::build_router(app_state);
@@ -244,6 +321,10 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     eprintln!("  POST /serve/share      Start distributed share session");
     eprintln!("  GET  /serve/share/status Share session status");
     eprintln!("  POST /serve/share/stop  Stop share session");
+    eprintln!("  GET  /ane              ANE power + status (IOReport)");
+    eprintln!("  GET  /watchdog          Full watchdog report");
+    eprintln!("  GET  /watchdog/peers    RDMA peer heartbeat status");
+    eprintln!("  GET  /watchdog/gpu-lock GPU Lock detection status");
     let ports_str: Vec<String> = serve::MANAGED_PORTS.iter().map(|(p, e)| format!("{p}({e})")).collect();
     eprintln!("  Managed ports: {}", ports_str.join(", "));
     if cluster_hub {

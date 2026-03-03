@@ -29,6 +29,13 @@ pub const MANAGED_PORTS: &[(u16, ServeEngine)] = &[
 /// Share session log file.
 const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
 
+/// Warmup timeout for bare server start (no model — should be fast).
+const WARMUP_TIMEOUT_BARE_SECS: u64 = 60;
+/// Warmup timeout for model loading (large models can take 5+ minutes on M3 Ultra).
+const WARMUP_TIMEOUT_MODEL_SECS: u64 = 300;
+/// Warmup timeout for distributed share session start.
+const WARMUP_TIMEOUT_SHARE_SECS: u64 = 300;
+
 /// r1o config directory (~/.r1o/).
 fn r1o_dir() -> PathBuf {
     dirs::home_dir()
@@ -52,12 +59,12 @@ fn share_state_file() -> PathBuf {
 }
 
 /// Default JACCL hostfile location.
-fn default_hostfile() -> PathBuf {
+pub fn default_hostfile() -> PathBuf {
     r1o_dir().join("hostfiles/default.json")
 }
 
 /// Resolve "auto" backend to single or jaccl based on hostfile existence.
-fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
+pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     if backend == "single" {
         return ServeBackend::Single;
     }
@@ -331,6 +338,23 @@ impl<R: ReadinessCheck> ProcessManager<R> {
         s.error = None;
         persist_state(&s).await;
     }
+
+    /// Emergency stop: SIGKILL immediately, no SIGTERM grace period.
+    /// Used when RDMA peer death is detected to prevent GPU Lock.
+    pub async fn emergency_stop(&self) {
+        let mut s = self.inner.write().await;
+        let pid = s.pid;
+        if let Some(ref mut child) = s.child {
+            tracing::warn!(pid = pid, "EMERGENCY STOP: sending SIGKILL to prevent GPU Lock");
+            let _ = child.kill().await;
+        }
+        s.child = None;
+        s.pid = None;
+        s.state = ServeState::Error;
+        s.model = None;
+        s.error = Some("emergency stop: RDMA peer death detected".to_string());
+        persist_state(&s).await;
+    }
 }
 
 // ===========================================================================
@@ -465,6 +489,13 @@ impl ServeManager {
         });
     }
 
+    /// Lightweight model info — just reads model + state from the lock.
+    /// No subprocess calls (unlike `status()` which runs `verify_port_owner`).
+    pub async fn model_snapshot(&self) -> (ServeState, Option<String>) {
+        let s = self.inner.read().await;
+        (s.state, s.model.clone())
+    }
+
     /// Get a read-only status snapshot.
     pub async fn status(&self) -> ServeStatus {
         let s = self.inner.read().await;
@@ -516,6 +547,11 @@ async fn do_serve_load_inner(
     };
 
     let is_bare = req.model_path.is_none();
+
+    // Engines with model_flag: None lazy-load models via request body (e.g. mlx_vlm).
+    // The server starts bare, then a warmup request pre-loads the model.
+    let cfg_check = engine.config();
+    let lazy_load = cfg_check.model_flag.is_none() && req.model_path.is_some();
 
     // Expand ~ in model path (no shell to do it for us)
     let mut req = req.clone();
@@ -632,8 +668,16 @@ async fn do_serve_load_inner(
 
     let child_pid = child.id().unwrap_or(0);
 
+    // Configurable warmup timeout: bare servers (and lazy-load servers that start bare)
+    // should start fast. Only engines that pre-load via --model need the long timeout.
+    let timeout_secs = if is_bare || lazy_load {
+        WARMUP_TIMEOUT_BARE_SECS
+    } else {
+        WARMUP_TIMEOUT_MODEL_SECS
+    };
+
     // Use the readiness check (HTTP health polling racing against child exit).
-    let health_result = readiness.poll_ready(&mut child, 60).await;
+    let health_result = readiness.poll_ready(&mut child, timeout_secs).await;
 
     let mut s = inner.write().await;
     match health_result {
@@ -653,6 +697,34 @@ async fn do_serve_load_inner(
                 tracing::info!(model = ?req.model_path, pid = child_pid, port, "server ready");
             }
             persist_state(&s).await;
+
+            // For lazy-load engines (model_flag: None with model_path), fire a warmup
+            // request to pre-load the model via /chat/completions. This is fire-and-forget:
+            // if it fails, the model loads on the first real user request instead.
+            if lazy_load {
+                if let Some(ref model_path) = req.model_path {
+                    let url = format!("http://localhost:{port}/chat/completions");
+                    let model_path = model_path.clone();
+                    tracing::info!(%url, model = %model_path, "firing warmup request for lazy-load engine");
+                    tokio::spawn(async move {
+                        let body = serde_json::json!({
+                            "model": model_path,
+                            "messages": [{"role": "user", "content": "warmup"}],
+                            "max_tokens": 1
+                        });
+                        match reqwest::Client::new()
+                            .post(&url)
+                            .json(&body)
+                            .timeout(std::time::Duration::from_secs(WARMUP_TIMEOUT_MODEL_SECS))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) => tracing::info!(status = %resp.status(), "warmup complete — model pre-loaded"),
+                            Err(e) => tracing::warn!(error = %e, "warmup failed — model will load on first request"),
+                        }
+                    });
+                }
+            }
         }
         Ok(true) => {
             s.state = ServeState::Error;
@@ -662,8 +734,14 @@ async fn do_serve_load_inner(
             let _ = child.kill().await;
         }
         Ok(false) => {
+            tracing::error!(
+                port, %engine, timeout_secs,
+                "warmup timeout exceeded — killing stuck process"
+            );
             s.state = ServeState::Error;
-            s.error = Some(format!("timeout waiting for health check ({engine})"));
+            s.error = Some(format!(
+                "warmup timeout exceeded ({timeout_secs}s) — process killed"
+            ));
             let _ = child.kill().await;
         }
         Err(crash_msg) => {
@@ -811,13 +889,14 @@ async fn do_share_load_inner(
     // Resolve backend
     let backend = resolve_backend(&req.backend, req.hostfile.as_deref());
 
-    // Build command: python3 -m mlx_lm.share --model <path>
+    // Build command: python3 -m mlx_lm share --model <path>
     let py = resolve_python().to_string();
     let cfg = ServeEngine::MlxLmShare.config();
     let mut cmd_args: Vec<String> = vec![
         "-m".into(),
         cfg.binary.to_string(),
     ];
+    cmd_args.extend(cfg.binary_args.iter().map(|s| s.to_string()));
     if let Some(flag) = cfg.model_flag {
         cmd_args.push(flag.into());
         cmd_args.push(model_path.clone());
@@ -858,7 +937,7 @@ async fn do_share_load_inner(
         program = %final_program,
         args = ?final_args,
         log_path = SHARE_LOG_PATH,
-        "spawning mlx_lm.share"
+        "spawning mlx_lm share"
     );
 
     let mut child = Command::new(&final_program)
@@ -871,8 +950,8 @@ async fn do_share_load_inner(
 
     let child_pid = child.id().unwrap_or(0);
 
-    // Use the readiness check (log monitoring racing against child exit, 120s timeout).
-    let readiness_result = readiness.poll_ready(&mut child, 120).await;
+    // Use the readiness check (log monitoring racing against child exit).
+    let readiness_result = readiness.poll_ready(&mut child, WARMUP_TIMEOUT_SHARE_SECS).await;
 
     let mut s = inner.write().await;
     match readiness_result {
@@ -886,9 +965,15 @@ async fn do_share_load_inner(
             persist_state(&s).await;
         }
         Ok(false) => {
+            tracing::error!(
+                timeout_secs = WARMUP_TIMEOUT_SHARE_SECS,
+                "share warmup timeout exceeded — killing stuck process"
+            );
             s.state = ServeState::Error;
             let detail = read_log_tail(SHARE_LOG_PATH, 10).await;
-            s.error = Some(format!("timeout waiting for share readiness (120s): {detail}"));
+            s.error = Some(format!(
+                "warmup timeout exceeded ({WARMUP_TIMEOUT_SHARE_SECS}s) — process killed: {detail}"
+            ));
             let _ = child.kill().await;
         }
         Err(crash_msg) => {
@@ -899,4 +984,360 @@ async fn do_share_load_inner(
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// PeerHeartbeat — detect RDMA peer death to prevent GPU Lock
+// ===========================================================================
+
+use asmi_core::{PeerHeartbeatStatus, PeerStatus};
+use tokio_util::sync::CancellationToken;
+
+/// How often to ping each peer (seconds).
+const HEARTBEAT_INTERVAL_SECS: u64 = 1;
+/// How many consecutive misses before triggering emergency stop.
+const HEARTBEAT_MISS_THRESHOLD: u32 = 3;
+
+/// RDMA peer heartbeat monitor. Pings each peer's asmi `/health` endpoint
+/// every second. If any peer misses 3 consecutive checks, kills all local
+/// inference processes to prevent GPU Lock from hung Metal command buffers.
+///
+/// Thread-safe via `Arc` — all methods take `&self`.
+pub struct PeerHeartbeat {
+    status: Arc<RwLock<PeerHeartbeatStatus>>,
+    state: tokio::sync::Mutex<HeartbeatState>,
+}
+
+struct HeartbeatState {
+    cancel: Option<CancellationToken>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PeerHeartbeat {
+    /// Create a new (inactive) peer heartbeat monitor.
+    pub fn new() -> Self {
+        Self {
+            status: Arc::new(RwLock::new(PeerHeartbeatStatus {
+                active: false,
+                peers: vec![],
+                session_start: None,
+            })),
+            state: tokio::sync::Mutex::new(HeartbeatState {
+                cancel: None,
+                handle: None,
+            }),
+        }
+    }
+
+    /// Start monitoring peers. Pings each peer's asmi health endpoint at `asmi_port`.
+    /// If any peer is unreachable for 3+ consecutive checks, triggers emergency stop
+    /// on all serve managers and the share manager.
+    pub async fn start(
+        &self,
+        peer_hostnames: Vec<String>,
+        asmi_port: u16,
+        serve_managers: Arc<std::collections::HashMap<u16, ServeManager>>,
+        share_manager: ShareManager,
+    ) {
+        // Stop any existing heartbeat first
+        self.stop().await;
+
+        if peer_hostnames.is_empty() {
+            return;
+        }
+
+        // Initialize status with peer list
+        {
+            let mut s = self.status.write().await;
+            s.active = true;
+            s.session_start = Some(chrono::Utc::now().to_rfc3339());
+            s.peers = peer_hostnames
+                .iter()
+                .map(|h| PeerStatus {
+                    hostname: h.clone(),
+                    reachable: true,
+                    last_seen: None,
+                    consecutive_misses: 0,
+                })
+                .collect();
+        }
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let status = self.status.clone();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_clone.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) => {
+                        // Ping all peers concurrently
+                        let results: Vec<bool> = futures::future::join_all(
+                            peer_hostnames.iter().map(|peer| {
+                                let client = client.clone();
+                                let url = format!("http://{}:{}/health", peer, asmi_port);
+                                async move {
+                                    matches!(
+                                        client.get(&url).send().await,
+                                        Ok(resp) if resp.status().is_success()
+                                    )
+                                }
+                            })
+                        ).await;
+
+                        // Update status and check for dead peers
+                        let mut any_dead = false;
+                        {
+                            let mut s = status.write().await;
+                            for (i, reachable) in results.iter().enumerate() {
+                                if let Some(ps) = s.peers.get_mut(i) {
+                                    if *reachable {
+                                        ps.reachable = true;
+                                        ps.last_seen = Some(chrono::Utc::now().to_rfc3339());
+                                        ps.consecutive_misses = 0;
+                                    } else {
+                                        ps.reachable = false;
+                                        ps.consecutive_misses += 1;
+                                        if ps.consecutive_misses >= HEARTBEAT_MISS_THRESHOLD {
+                                            tracing::error!(
+                                                peer = %ps.hostname,
+                                                misses = ps.consecutive_misses,
+                                                "RDMA peer unreachable for {}s — killing local inference to prevent GPU Lock",
+                                                ps.consecutive_misses
+                                            );
+                                            any_dead = true;
+                                        }
+                                    }
+                                }
+                            }
+                        } // release status lock before emergency stop
+
+                        if any_dead {
+                            // EMERGENCY: Kill all local inference to prevent GPU Lock
+                            for mgr in serve_managers.values() {
+                                mgr.emergency_stop().await;
+                            }
+                            share_manager.emergency_stop().await;
+
+                            // Mark heartbeat as inactive
+                            let mut s = status.write().await;
+                            s.active = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut st = self.state.lock().await;
+        st.cancel = Some(cancel);
+        st.handle = Some(handle);
+    }
+
+    /// Stop the heartbeat loop.
+    pub async fn stop(&self) {
+        let mut st = self.state.lock().await;
+        if let Some(cancel) = st.cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(handle) = st.handle.take() {
+            handle.abort();
+        }
+        let mut s = self.status.write().await;
+        s.active = false;
+    }
+
+    /// Get the current heartbeat status (lock-free read).
+    pub async fn status(&self) -> PeerHeartbeatStatus {
+        self.status.read().await.clone()
+    }
+}
+
+/// Parse peer hostnames from a JACCL hostfile (JSON array with "ssh" fields).
+/// Returns hostnames excluding `local_hostname`.
+pub fn parse_hostfile_peers(hostfile_path: &str, local_hostname: &str) -> Vec<String> {
+    let content = match std::fs::read_to_string(hostfile_path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let entries: Vec<serde_json::Value> = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            e.get("ssh")
+                .and_then(|v| v.as_str())
+                .and_then(|ssh| ssh.split('@').nth(1))
+                .map(|h| h.to_string())
+        })
+        .filter(|h| h != local_hostname)
+        .collect()
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_peer_heartbeat_detects_dead_peer() {
+        // Start a mock asmi health endpoint using axum
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"ok": true}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Create heartbeat with empty managers (emergency_stop is a no-op on empty)
+        let hb = Arc::new(PeerHeartbeat::new());
+        let managers = Arc::new(HashMap::<u16, ServeManager>::new());
+        let share = ShareManager::new();
+
+        hb.start(vec!["127.0.0.1".to_string()], port, managers, share)
+            .await;
+
+        // Let it detect the peer as alive
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let status = hb.status().await;
+        assert!(status.active, "heartbeat should be active");
+        assert_eq!(status.peers.len(), 1);
+        assert!(status.peers[0].reachable, "peer should be reachable");
+        assert_eq!(status.peers[0].consecutive_misses, 0);
+
+        // Kill the mock server → peer goes dark
+        mock_handle.abort();
+
+        // Wait for 3+ missed heartbeats (3s interval + buffer)
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+        let status = hb.status().await;
+        assert!(!status.peers[0].reachable, "peer should be unreachable");
+        assert!(
+            status.peers[0].consecutive_misses >= HEARTBEAT_MISS_THRESHOLD,
+            "should have >= {} misses, got {}",
+            HEARTBEAT_MISS_THRESHOLD,
+            status.peers[0].consecutive_misses
+        );
+        // Heartbeat should have deactivated after emergency stop
+        assert!(!status.active, "heartbeat should deactivate after peer death");
+
+        hb.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_peer_heartbeat_healthy_peer_stays_reachable() {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"ok": true}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mock_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let hb = Arc::new(PeerHeartbeat::new());
+        let managers = Arc::new(HashMap::<u16, ServeManager>::new());
+        let share = ShareManager::new();
+
+        hb.start(vec!["127.0.0.1".to_string()], port, managers, share)
+            .await;
+
+        // Let several cycles pass
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        let status = hb.status().await;
+        assert!(status.active);
+        assert!(status.peers[0].reachable);
+        assert_eq!(status.peers[0].consecutive_misses, 0);
+        assert!(status.peers[0].last_seen.is_some());
+
+        hb.stop().await;
+        mock_handle.abort();
+
+        let status = hb.status().await;
+        assert!(!status.active, "should be inactive after stop");
+    }
+
+    #[test]
+    fn test_parse_hostfile_peers() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test-hostfile.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"ssh": "ma@m3u2", "rdma": ["169.254.1.1"]},
+                {"ssh": "ma@m3u1", "rdma": ["169.254.1.2"]},
+                {"ssh": "ma@m3u3", "rdma": ["169.254.1.3"]}
+            ]"#,
+        )
+        .unwrap();
+
+        let peers = parse_hostfile_peers(path.to_str().unwrap(), "m3u2");
+        assert_eq!(peers, vec!["m3u1".to_string(), "m3u3".to_string()]);
+
+        let peers = parse_hostfile_peers(path.to_str().unwrap(), "m3u1");
+        assert_eq!(peers, vec!["m3u2".to_string(), "m3u3".to_string()]);
+
+        // Non-existent file returns empty
+        let peers = parse_hostfile_peers("/nonexistent/file.json", "m3u2");
+        assert!(peers.is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_warmup_timeout_returns_false() {
+        // Bind a port but never accept connections — simulates a stuck process
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Don't accept — the port is bound but nobody responds to HTTP
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        // poll_health with 2-second timeout should return Ok(false)
+        let start = std::time::Instant::now();
+        let result = poll_health(&client, port, &["/health"], 2).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.unwrap(), false, "should timeout, not succeed");
+        assert!(
+            elapsed.as_secs() >= 2,
+            "should have waited at least 2s, got {:?}",
+            elapsed
+        );
+
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_warmup_timeout_constants_are_sane() {
+        // Bare timeout should be shorter than model timeout
+        assert!(WARMUP_TIMEOUT_BARE_SECS < WARMUP_TIMEOUT_MODEL_SECS);
+        // Model timeout should be at least 5 minutes
+        assert!(WARMUP_TIMEOUT_MODEL_SECS >= 300);
+        // Share timeout should be at least 5 minutes
+        assert!(WARMUP_TIMEOUT_SHARE_SECS >= 300);
+    }
 }

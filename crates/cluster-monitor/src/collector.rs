@@ -48,6 +48,23 @@ static PS_RE: LazyLock<Regex> = LazyLock::new(|| {
     ).unwrap()
 });
 
+// parse_cpu_clusters (from powermetrics processor usage section)
+static CLUSTER_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(E\d+|P\d+)-Cluster").unwrap()
+});
+static CLUSTER_FREQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(E\d+|P\d+)-Cluster HW active frequency:\s+(\d+)\s+MHz").unwrap()
+});
+static CLUSTER_RES_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(E\d+|P\d+)-Cluster HW active residency:\s+([\d.]+)%").unwrap()
+});
+static CPU_FREQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^CPU (\d+) frequency:\s+(\d+)\s+MHz").unwrap()
+});
+static GPU_FREQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"GPU HW active frequency:\s+(\d+)\s+MHz").unwrap()
+});
+
 // parse_footprint
 static FOOTPRINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"Footprint:\s+([\d.]+)\s+(KB|MB|GB)").unwrap()
@@ -63,10 +80,11 @@ const CMD_POWERMETRICS: &str =
 const CMD_VMSTAT_SYSCTL: &str =
     "hostname -s; echo '---HOSTNAME---'; vm_stat; echo '---MEMSIZE---'; sysctl -n hw.memsize";
 
-/// Also captures mlx.launch (distributed launcher) and mlx_lm.share.
+/// Also captures mlx.launch (distributed launcher), mlx_lm.share, mlx_audio,
+/// llama.cpp (llama-server/llama-cli), and ollama.
 /// JACCL detection: --backend jaccl in args, or ps -E showing MLX_JACCL env vars.
 const CMD_PS_MLX: &str =
-    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch' | grep -v grep";
+    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch|mlx_audio|llama-server|llama-cli|ollama' | grep -v grep";
 
 /// RDMA status + ifconfig in one command to minimize SSH connections.
 const CMD_RDMA_NET: &str =
@@ -77,6 +95,17 @@ const CMD_RDMA_NET: &str =
 /// can persist from previous runs and cause false positives on single-node.
 const CMD_JACCL_ENV: &str =
     "ps aux | grep 'mlx\\.launch.*--backend' | grep -v grep | head -5";
+
+/// iostat: 2 samples, 1s apart. Take the second (real-time) sample.
+const CMD_IOSTAT: &str =
+    "iostat -d -C -K -c 2 -w 1 2>/dev/null";
+
+/// Full process listing with PPID for tree building.
+pub const CMD_PS_TREE: &str =
+    "ps -axo pid,ppid,pcpu,pmem,rss,comm";
+
+/// netstat -ib for network byte counters (used for delta-based throughput).
+pub const CMD_NETSTAT_IB: &str = "netstat -ib 2>/dev/null";
 
 /// Build the footprint command for a given PID.
 fn footprint_cmd(pid: u32) -> String {
@@ -179,13 +208,14 @@ async fn collect_via_ssh(
         }
     };
 
-    // 1. Run 5 commands in parallel
-    let (power_res, mem_res, ps_res, jaccl_res, rdma_net_res) = tokio::join!(
+    // 1. Run 6 commands in parallel
+    let (power_res, mem_res, ps_res, jaccl_res, rdma_net_res, iostat_res) = tokio::join!(
         run(CMD_POWERMETRICS),
         run(CMD_VMSTAT_SYSCTL),
         run(CMD_PS_MLX),
         run(CMD_JACCL_ENV),
         run(CMD_RDMA_NET),
+        run(CMD_IOSTAT),
     );
 
     // 2. Parse powermetrics
@@ -431,6 +461,7 @@ async fn collect_via_ssh(
         cpu_watts: power.cpu_mw,
         gpu_watts: power.gpu_mw,
         ane_watts: power.ane_mw,
+        power_source: None,
         cpu_percent: power.cpu_percent,
         gpu_percent: power.gpu_percent,
         ram_used_bytes: mem_stats.used_bytes,
@@ -438,6 +469,19 @@ async fn collect_via_ssh(
         ram_percent,
         ram_app_bytes: mem_stats.app_bytes,
         ram_cached_bytes: mem_stats.cached_bytes,
+        cpu_clusters: power.cpu_clusters,
+        gpu_frequency_mhz: power.gpu_frequency_mhz,
+        disk_io: match &iostat_res {
+            Ok(r) if r.has_output() => {
+                debug!(hostname, "iostat OK");
+                parse_iostat(&r.stdout)
+            }
+            _ => {
+                debug!(hostname, "iostat unavailable");
+                None
+            }
+        },
+        network: None,   // populated by daemon poll loop via netstat diff
         cpu_temp_c: None,
         gpu_temp_c: None,
         processes,
@@ -462,14 +506,20 @@ async fn probe_model_endpoints(
     let probes: Vec<_> = processes
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| p.port.map(|port| (i, port)))
-        .map(|(i, port)| {
+        .filter_map(|(i, p)| p.port.map(|port| (i, port, p.framework)))
+        .map(|(i, port, framework)| {
             let hostname = hostname.to_string();
             let config = config.clone();
             async move {
+                // Ollama uses /api/tags instead of /v1/models
+                let endpoint = if framework == ProcessFramework::Ollama {
+                    "/api/tags"
+                } else {
+                    "/v1/models"
+                };
                 let curl_cmd = format!(
-                    "curl -s --connect-timeout 2 --max-time 5 http://127.0.0.1:{}/v1/models 2>/dev/null",
-                    port
+                    "curl -s --connect-timeout 2 --max-time 5 http://127.0.0.1:{}{} 2>/dev/null",
+                    port, endpoint
                 );
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(8),
@@ -483,7 +533,11 @@ async fn probe_model_endpoints(
                 ).await;
                 let models = match result {
                     Ok(Ok(ref r)) if r.has_output() => {
-                        crate::scanner::parse_v1_models_metadata(&r.stdout)
+                        if framework == ProcessFramework::Ollama {
+                            crate::scanner::parse_ollama_tags(&r.stdout)
+                        } else {
+                            crate::scanner::parse_v1_models_metadata(&r.stdout)
+                        }
                     }
                     _ => Vec::new(),
                 };
@@ -514,6 +568,10 @@ pub struct PowerMetricsResult {
     pub cpu_percent: f64,
     /// GPU HW active residency (percent).
     pub gpu_percent: f64,
+    /// Per-cluster CPU breakdown (E0, P0, E1, P1, etc.).
+    pub cpu_clusters: Vec<CpuClusterInfo>,
+    /// GPU HW active frequency in MHz.
+    pub gpu_frequency_mhz: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +648,14 @@ pub fn parse_powermetrics_text(text: &str) -> PowerMetricsResult {
     if count > 0 {
         result.cpu_percent = sum / count as f64;
     }
+
+    // GPU HW active frequency
+    if let Some(cap) = GPU_FREQ_RE.captures(text) {
+        result.gpu_frequency_mhz = cap[1].parse().ok();
+    }
+
+    // Per-cluster CPU breakdown
+    result.cpu_clusters = parse_cpu_clusters(text);
 
     result
 }
@@ -703,27 +769,43 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
         }
 
         // Detect framework — check mlx.launch first since its command line
-        // contains the child command (e.g. "mlx.launch ... -- python -m mlx_lm.share")
+        // contains the child command (e.g. "mlx.launch ... -- python -m mlx_lm share")
         let framework = if command.contains("mlx.launch") {
             ProcessFramework::MlxLaunch
-        } else if command.contains("mlx_lm.server") {
+        } else if command.contains("mlx_lm.server") || command.contains("mlx_lm server") {
             ProcessFramework::MlxLm
-        } else if command.contains("mlx_lm.share") {
+        } else if command.contains("mlx_lm.share") || command.contains("mlx_lm share") {
             ProcessFramework::MlxLmShare
-        } else if command.contains("mlx_vlm.server") {
+        } else if command.contains("mlx_vlm.server") || command.contains("mlx_vlm server") {
             ProcessFramework::MlxVlm
         } else if command.contains("vllm_mlx") {
             ProcessFramework::VllmMlx
+        } else if command.contains("mlx_audio") {
+            ProcessFramework::MlxAudio
+        } else if command.contains("llama-server") || command.contains("llama-cli") {
+            ProcessFramework::LlamaCpp
+        } else if command.contains("ollama") {
+            ProcessFramework::Ollama
         } else {
-            continue; // Not an MLX process we care about
+            continue; // Not a recognised ML process
         };
 
         let pid: u32 = cap[2].parse().unwrap_or(0);
         let cpu_percent: f64 = cap[3].parse().unwrap_or(0.0);
         let mem_percent: f64 = cap[4].parse().unwrap_or(0.0);
 
-        // Extract model path: --model <path>
-        let model = extract_flag_value(command, "--model");
+        // Extract model path — llama.cpp uses -m, others use --model
+        let model = extract_flag_value(command, "--model")
+            .or_else(|| {
+                if framework == ProcessFramework::LlamaCpp {
+                    extract_flag_value(command, "-m")
+                } else if framework == ProcessFramework::Ollama {
+                    // `ollama run <model>` — model is the arg after "run"
+                    extract_flag_value(command, "run")
+                } else {
+                    None
+                }
+            });
 
         // Simplify model path to just the model name (last path component)
         let model = model.map(|m| {
@@ -733,9 +815,18 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
                 .to_string()
         });
 
-        // Extract port: --port <N>
+        // Extract port — llama.cpp also uses --port, ollama defaults to 11434
         let port: Option<u16> = extract_flag_value(command, "--port")
-            .and_then(|p| p.parse().ok());
+            .and_then(|p| p.parse().ok())
+            .or_else(|| {
+                if framework == ProcessFramework::Ollama
+                    && command.contains("ollama serve")
+                {
+                    Some(11434)
+                } else {
+                    None
+                }
+            });
 
         // Detect distributed backend from --backend flag
         let distributed = extract_flag_value(command, "--backend").and_then(|b| {
@@ -785,6 +876,378 @@ pub fn parse_footprint(text: &str) -> Option<f64> {
         _ => return None,
     };
     Some(mb)
+}
+
+// ---------------------------------------------------------------------------
+// CPU cluster / frequency parsing (from powermetrics)
+// ---------------------------------------------------------------------------
+
+/// Parse per-cluster CPU breakdown from powermetrics text.
+///
+/// Iterates line-by-line tracking which cluster header we're under, then
+/// assigns each `CPU N` line to its owning cluster. Also extracts cluster-level
+/// frequency and residency.
+pub fn parse_cpu_clusters(text: &str) -> Vec<CpuClusterInfo> {
+    // 1. Collect cluster-level frequency and residency
+    let mut cluster_freq: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut cluster_res: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    for cap in CLUSTER_FREQ_RE.captures_iter(text) {
+        let name = cap[1].to_string();
+        let freq: u32 = cap[2].parse().unwrap_or(0);
+        cluster_freq.insert(name, freq);
+    }
+    for cap in CLUSTER_RES_RE.captures_iter(text) {
+        let name = cap[1].to_string();
+        let res: f64 = cap[2].parse().unwrap_or(0.0);
+        cluster_res.insert(name, res);
+    }
+
+    // 2. Collect per-CPU frequency and residency
+    let mut cpu_freq: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut cpu_res: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+
+    for cap in CPU_FREQ_RE.captures_iter(text) {
+        let id: u32 = cap[1].parse().unwrap_or(0);
+        let freq: u32 = cap[2].parse().unwrap_or(0);
+        cpu_freq.insert(id, freq);
+    }
+    // Use a dedicated regex for per-CPU active residency with the CPU ID
+    static CPU_ACTIVE_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^CPU (\d+) active residency:\s+([\d.]+)%").unwrap()
+    });
+    for cap in CPU_ACTIVE_ID_RE.captures_iter(text) {
+        let id: u32 = cap[1].parse().unwrap_or(0);
+        let res: f64 = cap[2].parse().unwrap_or(0.0);
+        cpu_res.insert(id, res);
+    }
+
+    // 3. Walk line-by-line, tracking current cluster, assign CPUs to clusters
+    let mut current_cluster: Option<String> = None;
+    let mut cluster_cpus: std::collections::HashMap<String, Vec<u32>> = std::collections::HashMap::new();
+
+    // Sort cluster names by order of appearance
+    let mut cluster_order: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        if let Some(cap) = CLUSTER_HEADER_RE.captures(line) {
+            let name = cap[1].to_string();
+            if !cluster_cpus.contains_key(&name) {
+                cluster_order.push(name.clone());
+                cluster_cpus.insert(name.clone(), Vec::new());
+            }
+            current_cluster = Some(name);
+        } else if let Some(cap) = CPU_FREQ_RE.captures(line) {
+            let cpu_id: u32 = cap[1].parse().unwrap_or(0);
+            if let Some(ref cluster) = current_cluster {
+                cluster_cpus.entry(cluster.clone()).or_default().push(cpu_id);
+            }
+        }
+    }
+
+    // 4. Build CpuClusterInfo structs
+    cluster_order
+        .iter()
+        .map(|name| {
+            let cluster_type = if name.starts_with('E') {
+                ClusterType::Efficiency
+            } else {
+                ClusterType::Performance
+            };
+            let cpu_ids = cluster_cpus.get(name).cloned().unwrap_or_default();
+            let cores: Vec<CoreInfo> = cpu_ids
+                .iter()
+                .map(|&id| CoreInfo {
+                    id,
+                    frequency_mhz: cpu_freq.get(&id).copied().unwrap_or(0),
+                    active_residency: cpu_res.get(&id).copied().unwrap_or(0.0),
+                })
+                .collect();
+
+            CpuClusterInfo {
+                name: name.clone(),
+                cluster_type,
+                frequency_mhz: cluster_freq.get(name).copied().unwrap_or(0),
+                active_residency: cluster_res.get(name).copied().unwrap_or(0.0),
+                core_count: cores.len() as u32,
+                cores,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Disk I/O parsing (from iostat)
+// ---------------------------------------------------------------------------
+
+/// Parse `iostat -d -C -K -c 2 -w 1` output.
+///
+/// Takes the **second** sample (first is cumulative since boot).
+/// macOS iostat format:
+/// ```text
+///               disk0               disk3
+///     KB/t  tps  MB/s     KB/t  tps  MB/s
+///    21.91   29  0.62    54.03   72  3.79
+///     0.00    0  0.00     0.00    0  0.00
+/// ```
+pub fn parse_iostat(text: &str) -> Option<DiskIoStats> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 4 {
+        return None;
+    }
+
+    // First line: device names (e.g., "   disk0   disk3")
+    let device_names: Vec<String> = lines[0]
+        .split_whitespace()
+        .filter(|s| s.starts_with("disk"))
+        .map(|s| s.to_string())
+        .collect();
+
+    if device_names.is_empty() {
+        return None;
+    }
+
+    // Second line: headers (KB/t  tps  MB/s repeated)
+    // Third line: first sample (cumulative) — skip
+    // Fourth line: second sample (real-time) — use this
+    let data_line = if lines.len() >= 4 { lines[3] } else { lines[2] };
+    let values: Vec<f64> = data_line
+        .split_whitespace()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+
+    // Each device has 3 values: KB/t, tps, MB/s
+    let mut devices = Vec::new();
+    let mut total_mbps = 0.0;
+
+    for (i, name) in device_names.iter().enumerate() {
+        let base = i * 3;
+        if base + 2 < values.len() {
+            let kb_t = values[base];
+            let tps = values[base + 1];
+            let mbps = values[base + 2];
+            total_mbps += mbps;
+            devices.push(DiskDeviceIo {
+                name: name.clone(),
+                kb_per_transfer: kb_t,
+                transfers_per_sec: tps,
+                mb_per_sec: mbps,
+            });
+        }
+    }
+
+    Some(DiskIoStats {
+        devices,
+        // iostat doesn't split read/write — total_read_mbps and total_write_mbps
+        // are approximations. We report total as read (conservative) and 0 as write.
+        // For precise read/write split, we'd need `iostat -d -x` which isn't on macOS.
+        total_read_mbps: total_mbps,
+        total_write_mbps: 0.0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Network throughput parsing (from netstat -ib)
+// ---------------------------------------------------------------------------
+
+/// Raw byte counters from a single `netstat -ib` sample.
+#[derive(Debug, Clone)]
+pub struct NetstatSample {
+    /// Interface name → (ibytes, obytes)
+    pub counters: std::collections::HashMap<String, (u64, u64)>,
+}
+
+/// Parse `netstat -ib` output into byte counters per interface.
+///
+/// macOS format:
+/// ```text
+/// Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+/// en3   1500  <Link#13>     0a:e0:af:d0:79:f4  13802     0    9271342     7685     0    1145788     0
+/// ```
+///
+/// Only includes `en*` interfaces (Thunderbolt/Ethernet bridges).
+pub fn parse_netstat_ib(text: &str) -> NetstatSample {
+    let mut counters = std::collections::HashMap::new();
+
+    for line in text.lines().skip(1) {
+        // skip header
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 11 {
+            continue;
+        }
+        let name = parts[0];
+        // Only en* interfaces (TB bridges, ethernet)
+        if !name.starts_with("en") {
+            continue;
+        }
+        let ibytes: u64 = parts[6].parse().unwrap_or(0);
+        let obytes: u64 = parts[9].parse().unwrap_or(0);
+        if ibytes > 0 || obytes > 0 {
+            // netstat can list an interface multiple times (link + inet).
+            // Use the entry with higher byte counts (link-level row).
+            let entry = counters.entry(name.to_string()).or_insert((0u64, 0u64));
+            if ibytes > entry.0 {
+                *entry = (ibytes, obytes);
+            }
+        }
+    }
+
+    NetstatSample { counters }
+}
+
+/// Compute network throughput by diffing two netstat samples taken `interval_secs` apart.
+pub fn diff_netstat_samples(
+    prev: &NetstatSample,
+    curr: &NetstatSample,
+    interval_secs: f64,
+) -> NetworkStats {
+    let mut interfaces = Vec::new();
+    let mut total_rx: f64 = 0.0;
+    let mut total_tx: f64 = 0.0;
+
+    for (name, &(curr_rx, curr_tx)) in &curr.counters {
+        if let Some(&(prev_rx, prev_tx)) = prev.counters.get(name) {
+            // Handle counter wraparound (unlikely but safe)
+            let delta_rx = curr_rx.saturating_sub(prev_rx);
+            let delta_tx = curr_tx.saturating_sub(prev_tx);
+
+            if interval_secs > 0.0 {
+                let rx_bps = delta_rx as f64 / interval_secs;
+                let tx_bps = delta_tx as f64 / interval_secs;
+                let rx_mbps = (rx_bps * 8.0) / 1_000_000.0;
+                let tx_mbps = (tx_bps * 8.0) / 1_000_000.0;
+
+                // Only include interfaces with traffic
+                if delta_rx > 0 || delta_tx > 0 {
+                    total_rx += rx_mbps;
+                    total_tx += tx_mbps;
+                    interfaces.push(InterfaceStats {
+                        name: name.clone(),
+                        rx_bytes_sec: (rx_bps as u64),
+                        tx_bytes_sec: (tx_bps as u64),
+                        rx_mbps,
+                        tx_mbps,
+                    });
+                }
+            }
+        }
+    }
+
+    // Sort by name for deterministic output
+    interfaces.sort_by(|a, b| a.name.cmp(&b.name));
+
+    NetworkStats {
+        interfaces,
+        total_rx_mbps: total_rx,
+        total_tx_mbps: total_tx,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process tree parsing (on-demand)
+// ---------------------------------------------------------------------------
+
+/// Parse `ps -axo pid,ppid,pcpu,pmem,rss,comm` and build a process tree.
+///
+/// Query params control filtering:
+/// - `min_cpu`: only include processes with >N% CPU
+/// - `min_mem`: only include processes with >N% memory
+///
+/// Returns root-level processes with children nested.
+pub fn parse_process_tree(text: &str, min_cpu: f64, min_mem: f64) -> Vec<ProcessTreeNode> {
+    let mut all: Vec<ProcessTreeNode> = Vec::new();
+
+    for line in text.lines().skip(1) {
+        // skip header
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 6 {
+            continue;
+        }
+        let pid: u32 = match parts[0].parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let ppid: u32 = parts[1].parse().unwrap_or(0);
+        let cpu: f64 = parts[2].parse().unwrap_or(0.0);
+        let mem: f64 = parts[3].parse().unwrap_or(0.0);
+        let rss_kb: u64 = parts[4].parse().unwrap_or(0);
+        let name = parts[5..].join(" ");
+
+        all.push(ProcessTreeNode {
+            pid,
+            ppid,
+            name,
+            cpu_percent: cpu,
+            mem_percent: mem,
+            rss_bytes: rss_kb * 1024,
+            children: Vec::new(),
+        });
+    }
+
+    // Filter by thresholds (keep parent references even if below threshold)
+    let significant_pids: std::collections::HashSet<u32> = all
+        .iter()
+        .filter(|p| p.cpu_percent >= min_cpu || p.mem_percent >= min_mem)
+        .map(|p| p.pid)
+        .collect();
+
+    // Also keep parents of significant processes
+    let mut keep_pids = significant_pids.clone();
+    for p in &all {
+        if significant_pids.contains(&p.pid) {
+            keep_pids.insert(p.ppid);
+        }
+    }
+
+    let filtered: Vec<ProcessTreeNode> = all
+        .into_iter()
+        .filter(|p| keep_pids.contains(&p.pid))
+        .collect();
+
+    // Build tree: group children under parents
+    let pid_set: std::collections::HashSet<u32> = filtered.iter().map(|p| p.pid).collect();
+    let mut by_parent: std::collections::HashMap<u32, Vec<ProcessTreeNode>> = std::collections::HashMap::new();
+    let mut roots = Vec::new();
+
+    for p in filtered {
+        if !pid_set.contains(&p.ppid) {
+            // Parent not in our filtered set → this is a root
+            roots.push(p);
+        } else {
+            by_parent.entry(p.ppid).or_default().push(p);
+        }
+    }
+
+    // Recursively attach children
+    fn attach_children(
+        node: &mut ProcessTreeNode,
+        by_parent: &mut std::collections::HashMap<u32, Vec<ProcessTreeNode>>,
+    ) {
+        if let Some(mut children) = by_parent.remove(&node.pid) {
+            for child in &mut children {
+                attach_children(child, by_parent);
+            }
+            children.sort_by(|a, b| {
+                b.cpu_percent
+                    .partial_cmp(&a.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            node.children = children;
+        }
+    }
+
+    for root in &mut roots {
+        attach_children(root, &mut by_parent);
+    }
+
+    // Sort roots by CPU descending
+    roots.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    roots
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1491,209 @@ mod tests {
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].framework, ProcessFramework::MlxLaunch);
         assert_eq!(procs[0].distributed, Some(DistributedBackend::Ring));
+    }
+
+    #[test]
+    fn test_parse_ps_mlx_audio() {
+        let line = "ma  44444  15.0  10.0 100000 200000  ??  S  6:00AM  0:20.00 python -m mlx_audio.server --model /models/kokoro-tts --port 8030";
+        let procs = parse_ps_mlx(line);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].framework, ProcessFramework::MlxAudio);
+        assert_eq!(procs[0].model.as_deref(), Some("kokoro-tts"));
+        assert_eq!(procs[0].port, Some(8030));
+    }
+
+    #[test]
+    fn test_parse_ps_llama_server() {
+        let line = "ma  33333  25.0  40.0 100000 200000  ??  S  7:00AM  1:30.00 llama-server -m /models/llama3-8b.gguf --port 8080 --host 0.0.0.0";
+        let procs = parse_ps_mlx(line);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].framework, ProcessFramework::LlamaCpp);
+        assert_eq!(procs[0].model.as_deref(), Some("llama3-8b.gguf"));
+        assert_eq!(procs[0].port, Some(8080));
+    }
+
+    #[test]
+    fn test_parse_ps_llama_cli() {
+        let line = "ma  33334  50.0  35.0 100000 200000  ??  R  7:01AM  0:05.00 llama-cli -m /models/qwen3-8b.gguf --temp 0.7";
+        let procs = parse_ps_mlx(line);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].framework, ProcessFramework::LlamaCpp);
+        assert_eq!(procs[0].model.as_deref(), Some("qwen3-8b.gguf"));
+        assert_eq!(procs[0].port, None); // CLI mode, no port
+    }
+
+    #[test]
+    fn test_parse_ps_ollama_serve() {
+        let line = "ma  22222  3.0  5.0 100000 200000  ??  S  8:00AM  0:10.00 ollama serve";
+        let procs = parse_ps_mlx(line);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].framework, ProcessFramework::Ollama);
+        assert_eq!(procs[0].port, Some(11434));
+        assert_eq!(procs[0].model, None);
+    }
+
+    #[test]
+    fn test_parse_ps_ollama_run() {
+        let line = "ma  22223  80.0  60.0 100000 200000  ??  R  8:01AM  2:00.00 ollama run llama3:70b";
+        let procs = parse_ps_mlx(line);
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].framework, ProcessFramework::Ollama);
+        assert_eq!(procs[0].model.as_deref(), Some("llama3:70b"));
+    }
+
+    #[test]
+    fn test_parse_cpu_clusters() {
+        let text = include_str!("../testdata/powermetrics-text.txt");
+        let clusters = parse_cpu_clusters(text);
+
+        // M3 Ultra has 6 clusters: E0, P0, P1, E1, P2, P3
+        assert_eq!(clusters.len(), 6, "expected 6 clusters, got {}", clusters.len());
+
+        // E0: 4 efficiency cores (CPU 0-3)
+        let e0 = &clusters[0];
+        assert_eq!(e0.name, "E0");
+        assert_eq!(e0.cluster_type, ClusterType::Efficiency);
+        assert_eq!(e0.core_count, 4);
+        assert_eq!(e0.frequency_mhz, 2181);
+        assert!((e0.active_residency - 90.12).abs() < 0.01);
+        assert_eq!(e0.cores[0].id, 0);
+        assert_eq!(e0.cores[0].frequency_mhz, 2244);
+        assert!((e0.cores[0].active_residency - 67.95).abs() < 0.01);
+
+        // P0: 6 performance cores (CPU 4-9)
+        let p0 = &clusters[1];
+        assert_eq!(p0.name, "P0");
+        assert_eq!(p0.cluster_type, ClusterType::Performance);
+        assert_eq!(p0.core_count, 6);
+
+        // P2: 6 cores (CPU 20-25)
+        let p2 = &clusters[4];
+        assert_eq!(p2.name, "P2");
+        assert_eq!(p2.core_count, 6);
+        assert_eq!(p2.frequency_mhz, 3598);
+        assert!((p2.active_residency - 36.48).abs() < 0.01);
+
+        eprintln!(
+            "Parsed {} clusters: {}",
+            clusters.len(),
+            clusters
+                .iter()
+                .map(|c| format!("{}({}c, {}MHz, {:.1}%)", c.name, c.core_count, c.frequency_mhz, c.active_residency))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    #[test]
+    fn test_parse_powermetrics_includes_clusters_and_gpu_freq() {
+        let text = include_str!("../testdata/powermetrics-text.txt");
+        let result = parse_powermetrics_text(text);
+
+        // Should have cluster data
+        assert!(!result.cpu_clusters.is_empty(), "cpu_clusters should not be empty");
+        assert_eq!(result.cpu_clusters.len(), 6);
+
+        // GPU frequency should be extracted
+        assert_eq!(result.gpu_frequency_mhz, Some(1380));
+    }
+
+    #[test]
+    fn test_parse_iostat() {
+        let text = include_str!("../testdata/iostat.txt");
+        let stats = parse_iostat(text);
+
+        assert!(stats.is_some(), "should parse iostat output");
+        let stats = stats.unwrap();
+
+        assert_eq!(stats.devices.len(), 2);
+        assert_eq!(stats.devices[0].name, "disk0");
+        assert!((stats.devices[0].kb_per_transfer - 8.0).abs() < 0.01);
+        assert!((stats.devices[0].transfers_per_sec - 5.0).abs() < 0.01);
+        assert!((stats.devices[0].mb_per_sec - 0.04).abs() < 0.01);
+
+        assert_eq!(stats.devices[1].name, "disk3");
+        assert!((stats.devices[1].mb_per_sec - 1.88).abs() < 0.01);
+
+        // Total = 0.04 + 1.88 = 1.92
+        assert!((stats.total_read_mbps - 1.92).abs() < 0.01);
+
+        eprintln!("Parsed iostat: {:?}", stats);
+    }
+
+    #[test]
+    fn test_parse_iostat_empty() {
+        assert!(parse_iostat("").is_none());
+        assert!(parse_iostat("no data\n").is_none());
+    }
+
+    #[test]
+    fn test_parse_netstat_ib() {
+        let text = include_str!("../testdata/netstat-ib.txt");
+        let sample = parse_netstat_ib(text);
+
+        // Should have en0, en3, en5 (lo0 is skipped — not en*)
+        assert!(sample.counters.contains_key("en0"));
+        assert!(sample.counters.contains_key("en3"));
+        assert!(sample.counters.contains_key("en5"));
+        assert!(!sample.counters.contains_key("lo0"));
+
+        // en3 should use the link-level row (higher byte count: 9271342)
+        let (en3_rx, en3_tx) = sample.counters["en3"];
+        assert_eq!(en3_rx, 9271342);
+        assert_eq!(en3_tx, 1145788);
+
+        eprintln!("Parsed netstat: {:?}", sample.counters);
+    }
+
+    #[test]
+    fn test_diff_netstat_samples() {
+        let mut prev = NetstatSample { counters: std::collections::HashMap::new() };
+        prev.counters.insert("en3".to_string(), (1_000_000, 500_000));
+        prev.counters.insert("en5".to_string(), (2_000_000, 1_000_000));
+
+        let mut curr = NetstatSample { counters: std::collections::HashMap::new() };
+        curr.counters.insert("en3".to_string(), (2_000_000, 600_000));
+        curr.counters.insert("en5".to_string(), (3_000_000, 1_500_000));
+
+        let stats = diff_netstat_samples(&prev, &curr, 1.0);
+
+        assert_eq!(stats.interfaces.len(), 2);
+
+        // en3: delta_rx=1MB, delta_tx=100KB in 1s
+        let en3 = stats.interfaces.iter().find(|i| i.name == "en3").unwrap();
+        assert_eq!(en3.rx_bytes_sec, 1_000_000);
+        assert_eq!(en3.tx_bytes_sec, 100_000);
+        // 1MB/s = 8 Mbps
+        assert!((en3.rx_mbps - 8.0).abs() < 0.01);
+
+        eprintln!("Network stats: total_rx={:.1} Mbps, total_tx={:.1} Mbps", stats.total_rx_mbps, stats.total_tx_mbps);
+    }
+
+    #[test]
+    fn test_parse_process_tree() {
+        let text = "  PID  PPID  %CPU %MEM      RSS COMM\n\
+                     1     0   0.0  0.1    32768 /sbin/launchd\n\
+                     100   1   5.0  2.0   204800 /usr/sbin/some_daemon\n\
+                     200   1   0.5  0.3    65536 /usr/libexec/other\n\
+                     300  100  15.0  8.0  1048576 python3 -m mlx_lm.server\n\
+                     400  100   2.0  1.0   131072 python3 worker\n";
+
+        let tree = parse_process_tree(text, 1.0, 0.5);
+
+        // Should include PID 1 (parent of significant procs), 100, 300, 400
+        // PID 200 has 0.5% CPU and 0.3% mem → below both thresholds but
+        // it may be included as a parent (it's not a parent of anything significant)
+        assert!(!tree.is_empty());
+
+        // PID 300 (15% CPU) should be in the tree under PID 100
+        let has_mlx = tree.iter().any(|n| {
+            n.pid == 300 || n.children.iter().any(|c| c.pid == 300)
+                || n.children.iter().any(|c| c.children.iter().any(|gc| gc.pid == 300))
+        });
+        assert!(has_mlx, "should include the MLX server process");
+
+        eprintln!("Process tree roots: {:?}", tree.iter().map(|n| (n.pid, &n.name, n.children.len())).collect::<Vec<_>>());
     }
 
     #[tokio::test]

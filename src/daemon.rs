@@ -1,4 +1,4 @@
-use axum::{extract::State, response::Json, routing::{get, post}, Router};
+use axum::{extract::{Path, Query, State}, response::Json, routing::{get, post}, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -727,6 +727,184 @@ async fn gpu_lock_handler(
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
+// ---------------------------------------------------------------------------
+// v0.5 endpoints: process kill, process tree, disk, network
+// ---------------------------------------------------------------------------
+
+/// Query params for POST /processes/:pid/kill
+#[derive(Deserialize)]
+struct KillParams {
+    /// "term" (default) or "kill"
+    #[serde(default = "default_signal")]
+    signal: String,
+    /// Optional remote node hostname (default: local)
+    node: Option<String>,
+}
+
+fn default_signal() -> String {
+    "term".to_string()
+}
+
+/// POST /processes/:pid/kill — kill a process by PID.
+///
+/// Safety: refuses PID 0, PID 1, and the asmi daemon's own PID.
+/// Supports remote kill via SSH when ?node=hostname is specified.
+async fn kill_process_handler(
+    State(state): State<AppState>,
+    Path(pid): Path<u32>,
+    Query(params): Query<KillParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Safety checks
+    if pid == 0 || pid == 1 {
+        return Err(ApiError::BadRequest(format!("refusing to kill PID {pid} (system process)")));
+    }
+    let my_pid = std::process::id();
+    if pid == my_pid {
+        return Err(ApiError::BadRequest("refusing to kill the asmi daemon itself".into()));
+    }
+
+    let signal_name = match params.signal.to_lowercase().as_str() {
+        "term" | "sigterm" | "15" => "TERM",
+        "kill" | "sigkill" | "9" => "KILL",
+        other => return Err(ApiError::BadRequest(format!(
+            "unsupported signal: {other} (use 'term' or 'kill')"
+        ))),
+    };
+
+    let node = params.node.as_deref().unwrap_or("local");
+    let is_local = node == "local" || node == state.hostname;
+
+    if is_local {
+        // Local kill via nix
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let nix_signal = match signal_name {
+            "KILL" => Signal::SIGKILL,
+            _ => Signal::SIGTERM,
+        };
+        let nix_pid = Pid::from_raw(pid as i32);
+        kill(nix_pid, nix_signal).map_err(|e| {
+            ApiError::BadRequest(format!("kill({pid}, SIG{signal_name}) failed: {e}"))
+        })?;
+    } else {
+        // Remote kill via SSH
+        let cmd = format!("kill -{signal_name} {pid}");
+        let output = tokio::process::Command::new("ssh")
+            .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", node, &cmd])
+            .output()
+            .await
+            .map_err(|e| ApiError::Internal(format!("SSH to {node} failed: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApiError::BadRequest(format!(
+                "kill on {node} failed: {stderr}"
+            )));
+        }
+    }
+
+    tracing::warn!(pid, signal = signal_name, node, "process killed via API");
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "pid": pid,
+        "signal": format!("SIG{signal_name}"),
+        "node": node,
+    })))
+}
+
+/// Query params for GET /processes/tree
+#[derive(Deserialize)]
+struct TreeParams {
+    /// Minimum CPU% to include (default: 1.0)
+    min_cpu: Option<f64>,
+    /// Minimum MEM% to include (default: 0.5)
+    min_mem: Option<f64>,
+}
+
+/// GET /processes/tree — build a process tree from ps output.
+///
+/// On-demand endpoint (not part of the regular poll loop).
+async fn process_tree_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TreeParams>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let min_cpu = params.min_cpu.unwrap_or(1.0);
+    let min_mem = params.min_mem.unwrap_or(0.5);
+
+    let output = tokio::process::Command::new("sh")
+        .args(["-c", asmi_core::CMD_PS_TREE])
+        .output()
+        .await
+        .map_err(|e| ApiError::Internal(format!("ps failed: {e}")))?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let tree = asmi_core::parse_process_tree(&text, min_cpu, min_mem);
+
+    Ok(Json(serde_json::json!({
+        "hostname": state.hostname,
+        "min_cpu": min_cpu,
+        "min_mem": min_mem,
+        "processes": tree,
+    })))
+}
+
+/// GET /disk — latest disk I/O stats from the snapshot.
+async fn disk_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let snap = state.snapshot.read().await;
+    match snap.as_ref().and_then(|s| s.disk_io.as_ref()) {
+        Some(disk) => Ok(Json(serde_json::json!({
+            "hostname": state.hostname,
+            "disk_io": disk,
+        }))),
+        None => Err(ApiError::NotFound("no disk I/O data available yet".into())),
+    }
+}
+
+/// GET /network — latest network throughput stats.
+async fn network_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let snap = state.snapshot.read().await;
+    match snap.as_ref().and_then(|s| s.network.as_ref()) {
+        Some(net) => Ok(Json(serde_json::json!({
+            "hostname": state.hostname,
+            "network": net,
+        }))),
+        None => Err(ApiError::NotFound("no network data available yet".into())),
+    }
+}
+
+/// GET /ane — ANE (Apple Neural Engine) power and status.
+///
+/// Returns the current ANE power draw from the latest snapshot, along with
+/// CPU/GPU power for context. The `source` field indicates whether the ANE
+/// reading came from IOReport (no sudo) or powermetrics (needs sudo).
+async fn ane_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let snap = state.snapshot.read().await;
+    match snap.as_ref() {
+        Some(s) => {
+            let ane_active = s.ane_watts > 0.0;
+            Ok(Json(serde_json::json!({
+                "hostname": state.hostname,
+                "ane_watts": s.ane_watts,
+                "ane_active": ane_active,
+                "cpu_watts": s.cpu_watts,
+                "gpu_watts": s.gpu_watts,
+                "total_soc_mw": s.cpu_watts + s.gpu_watts + s.ane_watts,
+                "power_source": s.power_source,
+                "timestamp": s.timestamp,
+            })))
+        }
+        None => Err(ApiError::NotFound("no data yet — daemon still starting".into())),
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -755,5 +933,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/watchdog", get(watchdog_handler))
         .route("/watchdog/peers", get(peer_heartbeat_handler))
         .route("/watchdog/gpu-lock", get(gpu_lock_handler))
+        // v0.5: metrics parity + process management
+        .route("/processes/:pid/kill", post(kill_process_handler))
+        .route("/processes/tree", get(process_tree_handler))
+        .route("/disk", get(disk_handler))
+        .route("/network", get(network_handler))
+        .route("/ane", get(ane_handler))
         .with_state(state)
 }

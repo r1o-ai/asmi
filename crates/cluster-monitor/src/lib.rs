@@ -42,6 +42,7 @@
 pub mod aggregator;
 pub mod collector;
 pub mod config;
+pub mod ioreport;
 pub mod monitor;
 pub mod scanner;
 pub mod ssh;
@@ -68,8 +69,9 @@ pub fn resolve_python() -> &'static str {
 
 pub use aggregator::ClusterState;
 pub use collector::{
-    collect_node_metrics, parse_footprint, parse_powermetrics_text, parse_ps_mlx,
-    parse_vmstat_and_memsize, PowerMetricsResult,
+    collect_node_metrics, diff_netstat_samples, parse_cpu_clusters, parse_footprint,
+    parse_iostat, parse_netstat_ib, parse_powermetrics_text, parse_process_tree, parse_ps_mlx,
+    parse_vmstat_and_memsize, NetstatSample, PowerMetricsResult, CMD_NETSTAT_IB, CMD_PS_TREE,
 };
 pub use config::{ClusterConfig, DiscoveryMethod, NodeMap};
 pub use monitor::ClusterMonitor;
@@ -79,10 +81,13 @@ pub use scanner::{
 };
 pub use ssh::{SshResult, local_run, ssh_run};
 pub use types::{
-    ClusterAggregates, ClusterEvent, DistributedBackend, EngineConfig, EventSink, LoadRequest,
-    MetricsHistory, MlxServerInfo, ModelServerMetadata, MonitorError, NodeSnapshot, PortState,
-    ProcessFramework, ProcessInfo, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
-    ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy,
+    ClusterAggregates, ClusterEvent, ClusterType, CoreInfo, CpuClusterInfo, DiskDeviceIo,
+    DiskIoStats, DistributedBackend, EngineConfig, EventSink, GpuLockSeverity, GpuLockStatus,
+    InterfaceStats, LoadRequest, MetricsHistory, MlxServerInfo, ModelServerMetadata, MonitorError,
+    NetworkStats, NodeSnapshot, PeerHeartbeatStatus, PeerStatus, PortState, ProcessFramework,
+    ProcessInfo, ProcessTreeNode, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
+    ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy, WatchdogReport,
+    WatchdogVerdict, WatchedProcess,
 };
 pub use models::{LocalModel, DiscoveredVolume, default_model_dirs, discover_volumes, external_model_dirs, parse_model_name, scan_models};
 pub use health::{

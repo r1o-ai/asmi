@@ -32,6 +32,11 @@ pub struct NodeSnapshot {
     pub gpu_watts: f64,
     pub ane_watts: f64,
 
+    /// Power source: "Battery", "AC", or None if unknown.
+    /// Populated by IOReport when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_source: Option<String>,
+
     // Utilisation (percent)
     pub cpu_percent: f64,
     pub gpu_percent: f64,
@@ -51,6 +56,22 @@ pub struct NodeSnapshot {
     // Thermals (celsius, optional because not all sources report them)
     pub cpu_temp_c: Option<f64>,
     pub gpu_temp_c: Option<f64>,
+
+    // Per-cluster CPU breakdown (E0, P0, E1, P1, etc.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cpu_clusters: Vec<CpuClusterInfo>,
+
+    // GPU HW active frequency in MHz
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_frequency_mhz: Option<u32>,
+
+    // Disk I/O stats (from iostat)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_io: Option<DiskIoStats>,
+
+    // Network throughput stats (from netstat -ib diff)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkStats>,
 
     // Running processes of interest (MLX servers, watchdogs, etc.)
     pub processes: Vec<ProcessInfo>,
@@ -130,6 +151,12 @@ pub enum ProcessFramework {
     VllmMlx,
     #[serde(rename = "mlx-dist")]
     MlxLaunch,
+    #[serde(rename = "mlx-audio")]
+    MlxAudio,
+    #[serde(rename = "llama-cpp")]
+    LlamaCpp,
+    #[serde(rename = "ollama")]
+    Ollama,
     #[serde(rename = "watchdog")]
     Watchdog,
     #[serde(rename = "unknown")]
@@ -144,6 +171,9 @@ impl fmt::Display for ProcessFramework {
             Self::MlxVlm => write!(f, "mlx-vlm"),
             Self::VllmMlx => write!(f, "vllm-mlx"),
             Self::MlxLaunch => write!(f, "mlx-dist"),
+            Self::MlxAudio => write!(f, "mlx-audio"),
+            Self::LlamaCpp => write!(f, "llama-cpp"),
+            Self::Ollama => write!(f, "ollama"),
             Self::Watchdog => write!(f, "watchdog"),
             Self::Unknown => write!(f, "unknown"),
         }
@@ -178,6 +208,128 @@ pub struct TaskEnergy {
     pub pid: u32,
     pub energy_impact: f64,
     pub watts_share: f64,
+}
+
+// ---------------------------------------------------------------------------
+// CPU cluster / frequency info (from powermetrics)
+// ---------------------------------------------------------------------------
+
+/// Efficiency or Performance cluster type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClusterType {
+    Efficiency,
+    Performance,
+}
+
+impl fmt::Display for ClusterType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Efficiency => write!(f, "E"),
+            Self::Performance => write!(f, "P"),
+        }
+    }
+}
+
+/// Per-CPU-cluster breakdown from powermetrics (e.g., E0, P0, E1, P1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CpuClusterInfo {
+    /// Cluster name from powermetrics (e.g., "E0", "P0", "E1", "P1").
+    pub name: String,
+    /// Efficiency or Performance.
+    pub cluster_type: ClusterType,
+    /// HW active frequency in MHz.
+    pub frequency_mhz: u32,
+    /// HW active residency (percent).
+    pub active_residency: f64,
+    /// Number of CPU cores in this cluster.
+    pub core_count: u32,
+    /// Per-core detail.
+    pub cores: Vec<CoreInfo>,
+}
+
+/// Per-core info within a CPU cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreInfo {
+    /// CPU number (0-31).
+    pub id: u32,
+    /// Per-core frequency in MHz.
+    pub frequency_mhz: u32,
+    /// Per-core active residency (percent).
+    pub active_residency: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Disk I/O stats (from iostat)
+// ---------------------------------------------------------------------------
+
+/// Aggregated disk I/O statistics from `iostat`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskIoStats {
+    /// Per-device I/O.
+    pub devices: Vec<DiskDeviceIo>,
+    /// Total read throughput across all devices (MB/s).
+    pub total_read_mbps: f64,
+    /// Total write throughput across all devices (MB/s).
+    pub total_write_mbps: f64,
+}
+
+/// Per-device disk I/O from `iostat`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskDeviceIo {
+    /// Device name (e.g., "disk0", "disk3").
+    pub name: String,
+    /// KB per transfer.
+    pub kb_per_transfer: f64,
+    /// Transfers per second.
+    pub transfers_per_sec: f64,
+    /// Throughput in MB/s.
+    pub mb_per_sec: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Network throughput stats (from netstat -ib diff)
+// ---------------------------------------------------------------------------
+
+/// Network throughput statistics across interfaces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkStats {
+    /// Per-interface stats.
+    pub interfaces: Vec<InterfaceStats>,
+    /// Total receive throughput (Mbps).
+    pub total_rx_mbps: f64,
+    /// Total transmit throughput (Mbps).
+    pub total_tx_mbps: f64,
+}
+
+/// Per-interface network throughput.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceStats {
+    /// Interface name (e.g., "en3").
+    pub name: String,
+    /// Receive bytes per second.
+    pub rx_bytes_sec: u64,
+    /// Transmit bytes per second.
+    pub tx_bytes_sec: u64,
+    /// Receive throughput (Mbps).
+    pub rx_mbps: f64,
+    /// Transmit throughput (Mbps).
+    pub tx_mbps: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Process tree (on-demand, not polled)
+// ---------------------------------------------------------------------------
+
+/// A node in the process tree, built from `ps -axo pid,ppid,pcpu,pmem,rss,comm`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessTreeNode {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+    pub cpu_percent: f64,
+    pub mem_percent: f64,
+    pub rss_bytes: u64,
+    pub children: Vec<ProcessTreeNode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -672,18 +824,21 @@ impl ServeEngine {
     pub fn config(self) -> EngineConfig {
         match self {
             Self::MlxLm => EngineConfig {
-                binary: "mlx_lm.server",
-                binary_args: &[],
+                binary: "mlx_lm",
+                binary_args: &["server"],
                 uvicorn_app: None,
                 model_flag: Some("--model"),
                 health_endpoints: &["/v1/models", "/models", "/health"],
             },
             Self::MlxVlm => EngineConfig {
-                binary: "uvicorn",
-                binary_args: &[],
-                uvicorn_app: Some("mlx_vlm.server:app"),
-                model_flag: None, // models load lazily via chat body
-                health_endpoints: &["/models", "/health", "/v1/models"],
+                binary: "mlx_vlm",
+                binary_args: &["server"],
+                uvicorn_app: None,
+                // mlx_vlm.server does NOT support --model flag.
+                // Models load lazily via the `model` field in /chat/completions requests.
+                // See warmup logic in serve.rs for pre-loading after bare start.
+                model_flag: None,
+                health_endpoints: &["/health", "/models"],
             },
             Self::VllmMlx => EngineConfig {
                 binary: "vllm",
@@ -693,8 +848,8 @@ impl ServeEngine {
                 health_endpoints: &["/v1/models", "/health"],
             },
             Self::MlxLmShare => EngineConfig {
-                binary: "mlx_lm.share",
-                binary_args: &[],
+                binary: "mlx_lm",
+                binary_args: &["share"],
                 uvicorn_app: None,
                 model_flag: Some("--model"),
                 // share has no HTTP server — readiness checked via log output
@@ -755,6 +910,95 @@ pub struct ShareStatus {
     pub pid: Option<u32>,
     pub elapsed_ms: u64,
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog: process watchdog + GPU lock detection
+// ---------------------------------------------------------------------------
+
+/// Verdict for a watched inference process.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WatchdogVerdict {
+    Healthy,
+    Degraded { reason: String },
+    Stuck { reason: String, duration_secs: u64 },
+    Killed { reason: String, at: String },
+}
+
+/// A process being actively watched by the watchdog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchedProcess {
+    pub pid: u32,
+    pub framework: String,
+    pub verdict: WatchdogVerdict,
+    pub since: String,
+    pub port_reachable: Option<bool>,
+    pub cpu_percent: f64,
+}
+
+/// Full watchdog report aggregating all monitoring signals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchdogReport {
+    pub processes: Vec<WatchedProcess>,
+    pub gpu_lock: GpuLockStatus,
+    pub peer_heartbeat: PeerHeartbeatStatus,
+    pub last_check: String,
+}
+
+/// GPU Lock detection status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuLockStatus {
+    /// Whether GPU Lock is currently detected.
+    pub detected: bool,
+    /// PIDs suspected of causing the lock.
+    pub suspect_pids: Vec<u32>,
+    /// When the lock condition was first detected (ISO 8601).
+    pub since: Option<String>,
+    /// Current severity level.
+    pub severity: GpuLockSeverity,
+}
+
+/// Severity levels for GPU Lock detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GpuLockSeverity {
+    /// No GPU Lock detected.
+    None,
+    /// High CPU + low GPU, might recover on its own.
+    Suspected,
+    /// Sustained >15s, port unreachable — SIGTERM/SIGKILL attempted.
+    Confirmed,
+    /// SIGKILL sent but process still alive — requires manual reboot.
+    Unrecoverable,
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog: peer heartbeat
+// ---------------------------------------------------------------------------
+
+/// Status of the RDMA peer heartbeat monitor.
+/// Tracks whether each peer's asmi daemon is reachable. If a peer goes dark
+/// for 3+ consecutive checks (1s interval), the local inference is killed
+/// to prevent GPU Lock from hung RDMA operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHeartbeatStatus {
+    /// Whether the heartbeat loop is actively running.
+    pub active: bool,
+    /// Status of each monitored peer.
+    pub peers: Vec<PeerStatus>,
+    /// When the current monitoring session started (ISO 8601).
+    pub session_start: Option<String>,
+}
+
+/// Health status of a single RDMA peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub hostname: String,
+    pub reachable: bool,
+    /// Last time this peer responded to a health check (ISO 8601).
+    pub last_seen: Option<String>,
+    /// Number of consecutive missed health checks.
+    pub consecutive_misses: u32,
 }
 
 // ---------------------------------------------------------------------------
