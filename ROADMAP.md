@@ -1,31 +1,73 @@
 # asmi Roadmap
 
-## v0.1 — Initial Release (shipped)
+## v0.1 — Core Metrics + CLI (shipped)
 
-- Single binary: `asmi`
-- Clap CLI: `--hosts`, `--scan`, `--format`, `--watch`, `--interval`
-- Smart TTY detection (tui if interactive, table if piped)
-- Streaming/ephemeral output (`--watch --format table|json`)
-- Process detection: mlx_lm.server, mlx_lm.share, mlx_vlm.server, vllm_mlx, mlx.launch
-- JACCL/Ring distributed backend detection
-- 5 discovery methods (thunderbolt, tailscale, arp, system profiler, bonjour)
-- Parallel SSH metrics (powermetrics, vm_stat, ps, footprint)
-- RDMA status monitoring
-- Cluster aggregates with per-node history ring buffers
-- 43 tests with real captured testdata
+- [x] Single binary: `asmi`
+- [x] Clap CLI: `--hosts`, `--scan`, `--format`, `--watch`, `--interval`
+- [x] Smart TTY detection (table if piped, watch if interactive)
+- [x] Streaming/ephemeral output (`--watch --format table|json`)
+- [x] Process detection: mlx_lm.server, mlx_lm.share, mlx_vlm.server, vllm_mlx, mlx.launch
+- [x] JACCL/Ring distributed backend detection
+- [x] 5 discovery methods (thunderbolt, tailscale, arp, system profiler, bonjour)
+- [x] Parallel SSH metrics (powermetrics, vm_stat, ps, footprint)
+- [x] RDMA status monitoring
+- [x] Cluster aggregates with per-node history ring buffers
+- [x] NodeMap persistence (auto-discovers + saves nodes, aliases, RDMA links/IPs)
 
-## v0.2 — Metrics Parity
+## v0.2 — HTTP Daemon (shipped)
 
-Close the remaining gaps with nvidia-smi's core metrics.
+Axum-based daemon (`--serve`) running on each node via launchd. The data layer for the entire r1o ecosystem.
 
-- [ ] **Temperature** — populate `cpu_temp_c`/`gpu_temp_c` from IOKit SMC reads or `powermetrics --samplers smc` (`Tc0p`, `Tg0p` keys)
-- [ ] **Clock frequencies** — GPU and CPU cluster frequencies from powermetrics DVFS section
-- [ ] **Version header** — MLX version (`python -c "import mlx; print(mlx.__version__)"` via SSH) + macOS version (`sw_vers`) in TUI header and table output
-- [ ] **TB link speed** — show Thunderbolt link speed from `system_profiler` in TUI node table (data already in `DiscoveredPeer.link_speed`)
-- [ ] **RDMA status column** — show RDMA active device count per node in TUI (data already in `ScanResult.rdma`)
+- [x] **22 HTTP endpoints** on port 9090 (metrics, health, processes, models, volumes, logs, runtime, stream, serve lifecycle, JACCL, thunderbolt, ARP, cluster hub) — expanded to **26 endpoints** in v0.5
+- [x] **SSE streaming** — `/stream` pushes NodeSnapshot JSON on every poll tick
+- [x] **Runtime probing** — Python, MLX, vLLM, macOS versions cached at startup (`/runtime`)
+- [x] **Model inventory** — `/models` scans `~/Models/`, HF cache, external volumes; 60s cache refresh
+- [x] **Volume discovery** — `/volumes` enumerates mounted external drives
+- [x] **Thunderbolt device tree** — `/thunderbolt` via `system_profiler`, cached 60s
+- [x] **ARP topology** — `/arp` for TB link correlation across nodes
+- [x] **Setup validation** — `/health/setup` runs MLX/RDMA/SSH/disk checks
+- [x] **Network health** — `/health/network` validates TB service names; `/health/network/fix` auto-repairs
+- [x] **Log tailing** — `/logs?name=mlx-server&lines=50` for mlx-server, mlx-vlm, vllm, asmi logs
+- [x] **Cluster hub mode** — `--cluster` polls all remote nodes; `/cluster` and `/nodes` endpoints
+- [x] **JACCL hostfile** — `/jaccl/config` generates hostfile from discovered RDMA topology
+
+## v0.3 — MLX Server Lifecycle (shipped)
+
+Rust port of mlx_daemon.py. Manages per-port MLX server subprocesses with crash recovery.
+
+- [x] **ServeManager** — per-port process manager with state machine (idle → loading → ready → error)
+- [x] **Multi-engine** — managed ports: 19080 (mlx_lm), 19082 (mlx_vlm)
+- [x] **Load/stop/reload** — `/serve/load`, `/serve/stop`, `/serve/reload` with `?port=N`
+- [x] **Crash recovery** — per-port state files (`~/.r1o/serve-state-{port}.json`), early crash detection
+- [x] **Health polling** — detects process death, captures error from log tail
+- [x] **Distributed share** — `/serve/share` starts `mlx_lm.share` with JACCL/Ring backend
+- [x] **Share lifecycle** — `/serve/share/status`, `/serve/share/stop`
+- [x] **Backend resolution** — "auto" resolves to jaccl (if hostfile exists) or single
+
+## v0.4 — Daemon Management (shipped)
+
+- [x] **`asmi daemon status`** — health check all known nodes (online/offline + uptime)
+- [x] **`asmi daemon start/stop/restart`** — launchd bootstrap/bootout on target or all nodes
+- [x] **`asmi daemon deploy`** — scp binary + plist to remote nodes
+- [x] **`asmi daemon logs`** — tail daemon log on local or remote node
+
+## v0.5 — Metrics Parity + Process Management (shipped)
+
+Close remaining gaps with nvidia-smi and add process management.
+
+- [x] **CPU cluster breakdown** — per-cluster E/P frequency, residency, and per-core detail from powermetrics
+- [x] **GPU frequency** — GPU HW active frequency from powermetrics
+- [x] **Disk I/O** — `GET /disk` endpoint with per-device iostat metrics (KB/t, tps, MB/s)
+- [x] **Network throughput** — `GET /network` endpoint with per-interface bytes/sec and Mbps (netstat -ib delta)
+- [x] **Process tree** — `GET /processes/tree` with parent-child hierarchy, CPU/mem filtering
+- [x] **Process kill** — `POST /processes/:pid/kill` with signal selection, remote SSH kill, safety guards
+- [ ] **Temperature** — `cpu_temp_c`/`gpu_temp_c` from IOKit SMC reads or `powermetrics --samplers smc` (`Tc0p`, `Tg0p` keys)
 - [ ] **Performance state** — map powermetrics frequency/residency states to a simplified P-state indicator
+- [x] ~~Version header~~ — done in v0.2 (`/runtime` endpoint)
+- [x] ~~TB link speed~~ — done, shown in table output from scan results
+- [x] ~~RDMA status column~~ — done, active/total shown in table
 
-## v0.3 — Output Formats
+## v0.6 — Output Formats
 
 Scripting and pipeline support matching nvidia-smi's `--query-gpu` flexibility.
 
@@ -36,7 +78,7 @@ Scripting and pipeline support matching nvidia-smi's `--query-gpu` flexibility.
 - [ ] **Verbose query** — `--format verbose` dumping all collected data per node in structured text (like `nvidia-smi -q`)
 - [ ] **`--filename`** — native file output flag (currently works via pipe)
 
-## v0.4 — Subcommands
+## v0.7 — Monitoring Subcommands
 
 Dedicated monitoring views matching nvidia-smi's `dmon`, `pmon`, `topo`.
 
@@ -56,21 +98,20 @@ Dedicated monitoring views matching nvidia-smi's `dmon`, `pmon`, `topo`.
   - Columns: node, power, temp, cpu%, gpu%, ram, tb-rx, tb-tx
 - [ ] **TB throughput** — rx/tx bytes/sec from `netstat -I enN` or `nettop` on bridge interfaces
 
-## v0.5 — Storage & Device Discovery
+## v0.8 — Storage & Device Discovery
 
 Full cluster device inventory — not just compute nodes, but all attached storage, docks, and NAS devices.
 
-- [ ] **Storage volume discovery** — SSH to each node, run `diskutil list external` + `df -h` to enumerate attached drives (SSDs, HDDs, USB)
-- [ ] **Storage tier display** — show hot (SSD), warm (NAS), cold (archive) tiers per node in TUI, cross-ref with Supabase `storage_locations`
-- [ ] **Model location awareness** — which models are on which storage tier, ready-to-serve vs need-to-pull
-- [ ] **Dock topology** — parse `system_profiler SPThunderboltDataType` downstream devices to show what's behind each dock (e.g., mini2 via Prime TB5 dock)
-- [ ] **Thunderbolt bridge detection** — discover nodes behind docks via bridge0 IP (not just direct TB peers). Key pattern: `ifconfig bridge0` on remote node for dock-chained devices
-- [ ] **NAS health** — poll mini2's `/Volumes/NAS` usage, active transfer status, Seagate SMART data
-- [ ] **Network storage** — discover Buffalo/Synology NAS via `dns-sd -B _smb._tcp` + probe for health APIs
+- [x] ~~Volume discovery~~ — done in v0.2 (`/volumes` endpoint)
+- [x] ~~Model location awareness~~ — done in v0.2 (`/models` with volume + storage tier)
+- [x] ~~Dock topology~~ — done in v0.2 (`/thunderbolt` parses SPThunderboltDataType downstream devices)
+- [ ] **Storage tier display** — show hot (SSD), warm (NAS), cold (archive) tiers per node in table output
+- [ ] **NAS health** — poll NAS usage, active transfer status, SMART data
+- [ ] **Network storage** — discover NAS via `dns-sd -B _smb._tcp` + probe for health APIs
 - [ ] **`asmi storage`** — subcommand showing per-node storage summary: volumes, capacity, usage, tier, models stored
-- [ ] **Transfer monitoring** — detect active rsync/scp processes and show progress (source → dest, speed, ETA)
+- [ ] **Transfer monitoring** — detect active rsync/scp processes and show progress (source, dest, speed, ETA)
 
-## v0.6 — Metal Integration
+## v0.9 — Metal Integration
 
 GPU-level metrics via Metal APIs and IOKit for deeper profiling.
 
@@ -87,16 +128,21 @@ Coverage of nvidia-smi features (35 applicable, excluding 11 N/A):
 
 | Status | Count | % |
 |---|---|---|
-| Implemented | 21 | 60% |
-| Partial | 8 | 23% |
-| Feasible (planned) | 6 | 17% |
+| Implemented | 27 | 77% |
+| Partial | 5 | 14% |
+| Feasible (planned) | 3 | 9% |
 
 Features asmi has that nvidia-smi lacks:
 - Cluster-native multi-node monitoring (nvidia-smi is single-host only)
 - Dynamic node discovery (5 methods)
 - ML framework-aware process detection (model name, serving port)
 - Distributed inference tracking (JACCL/Ring)
-- Interactive TUI with keyboard navigation
+- HTTP daemon with SSE streaming (programmatic access)
+- MLX server lifecycle management (load/stop/reload/share)
+- JACCL hostfile generation from discovered RDMA topology
+- Thunderbolt device tree + ARP correlation
+- Crash recovery with persistent state files
+- Cluster-wide daemon management (deploy, start, stop across nodes)
 - Smart TTY detection for output format
 
 Features that don't apply (N/A):

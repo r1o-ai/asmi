@@ -2,6 +2,7 @@ mod cli;
 mod daemon;
 mod daemon_startup;
 mod serve;
+mod topology;
 mod watchdog;
 
 use anyhow::Result;
@@ -61,6 +62,18 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Discover TB5/RDMA mesh topology via mlx.distributed_config.
+    Topology {
+        /// Hosts to check (comma-separated). Defaults to config nodes.
+        #[arg(long, value_delimiter = ',')]
+        hosts: Vec<String>,
+        /// Output format.
+        #[arg(long, default_value = "table")]
+        format: TopologyFormat,
+        /// JACCL backend variant.
+        #[arg(long, default_value = "jaccl")]
+        backend: String,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -77,6 +90,13 @@ pub(crate) enum DaemonAction {
 pub(crate) enum Format {
     Table,
     Json,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub(crate) enum TopologyFormat {
+    Table,
+    Json,
+    Dot,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -123,6 +143,34 @@ async fn main() -> Result<()> {
     if let Some(command) = args.command {
         return match command {
             Command::Daemon { action } => cli::run_daemon(action, args.port).await,
+            Command::Topology {
+                hosts,
+                format,
+                backend,
+            } => {
+                let hosts = if hosts.is_empty() {
+                    let nm = asmi_core::config::NodeMap::load();
+                    nm.nodes.clone()
+                } else {
+                    hosts
+                };
+                if hosts.is_empty() {
+                    anyhow::bail!("No hosts specified. Use --hosts or configure nodes in ~/.config/asmi/config.json");
+                }
+                let report = topology::discover_topology(&hosts, &backend)?;
+                match format {
+                    TopologyFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    }
+                    TopologyFormat::Dot => {
+                        print!("{}", report.raw_dot);
+                    }
+                    TopologyFormat::Table => {
+                        print!("{}", topology::format_table(&report));
+                    }
+                }
+                Ok(())
+            }
         };
     }
 

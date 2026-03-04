@@ -1,0 +1,85 @@
+# asmi — Session Progress Log
+# Updated at end of each Claude session. Read at start of next.
+
+## Last Session: 2026-03-04 (Qwen 3.5 on ANE — Phase 0+1 Complete)
+
+### What Was Done
+- **Phase 0**: Integrated Bokhan ANE crate into workspace as `crates/ane-runtime/` (behind `--features ane`)
+- **Phase 1**: Implemented complete Qwen 3.5-0.8B forward pass (3030 lines across 16 files):
+  - `config.rs` — QwenConfig with hybrid attention type dispatch
+  - `weights/` — Multi-shard safetensors loader for 24 mixed layers (6 full + 18 DeltaNet)
+  - `executables.rs` — ANE graph builders: RMSNorm (6 ops), SiLU (2 ops), SwiGLU FFN, full attention with sigmoid output gate
+  - `deltanet.rs` — Complete CPU-side Gated DeltaNet recurrence (verified against fla reference)
+  - `rope.rs` — Partial RoPE (64 of 256 dims, theta=10M)
+  - `kv_cache.rs` — GQA-aware cache (2 KV heads, 6 full-attn layers only)
+  - `session.rs` — Full inference session: prefill + decode with 3-part attention split (projection ANE → CPU RoPE/norm → attention body ANE)
+  - `main.rs` — CLI entry with --model-path, --prompt, --max-tokens
+- All 11 unit tests passing, clean build
+
+### Key Architectural Decisions
+- **DeltaNet on CPU**: Qwen 3.5's "linear attention" is Gated DeltaNet (recurrent SSM, NOT traditional linear attention). 18/24 layers use fixed-size [128x128] state matrices. Sequential nature makes ANE compilation complex → CPU for now, ANE FFN still used.
+- **3-part attention split**: Projection kernel (ANE) → CPU (per-head Q/K RMSNorm + partial RoPE + GQA expansion) → Attention body kernel (ANE). Clean separation that avoids expressing position-dependent RoPE as ANE graph ops.
+- **72 ANE executables**: 6 full-attn layers × 3 × 2 phases + 18 DeltaNet layers × 1 × 2 phases = 72 (under 119 compile budget)
+
+### What's Next
+- Test on actual hardware with Qwen 3.5-0.8B weights (on m3u2 at ~/models/models--Qwen--Qwen3.5-0.8B)
+- Measure tok/s: expect 5-15 tok/s decode
+- Optimize: BLAS for lm_head logits (248K vocab), chunkwise parallel DeltaNet prefill
+- Phase 2: ANE prefill + GPU decode hybrid (HTTP or in-process via mlx-rs)
+
+### Environment State
+- Branch: main (uncommitted: Phase 0+1 implementation)
+- qwen_forward binary: `cargo run -p ane-runtime --bin qwen_forward -- --model-path <path>`
+- 11 tests pass: `cargo test -p ane-runtime --bin qwen_forward`
+
+---
+
+## Previous Session: 2026-03-04 (ANE Research Consolidation)
+
+### What Was Done
+- Consolidated ALL ANE research from multiple sessions into `docs/research/ane-deep-research-summary.md`
+- Discovered `/tmp/ane-analysis/` (maderix/ANE) — full ANE TRAINING implementation, not just inference
+- Extracted findings: 6-kernel training loop, compile budget restart, SRAM probing, backward pass on ANE
+- Updated memory files with corrected cluster specs (1.5TB total, 8 ANEs)
+- Set up this development harness (Anthropic two-agent pattern)
+
+### What Failed / Blockers
+- Background research agent from previous session lost on /clear (output not persisted)
+- No PreCompact hook yet — mid-session compactions can lose reasoning context
+
+### Key Decisions
+- MoE models (Qwen 3.5-35B-A3B) identified as ideal first ANE target (3B active, fits compile budget)
+- Harness pattern: progress.txt + features.json + CLAUDE.md instructions (Anthropic recommended)
+- Research docs canonical location: `docs/research/`
+
+### What's Next
+- Implement IOReport ANE power monitoring (plan ready at docs/plans/2026-03-02-ane-monitoring-and-compute.md)
+- Add /topology HTTP endpoints to daemon (Phase 3 from handoff)
+- Adapt Bokhan crate for MoE expert routing
+- Probe DirectPathClient for individual ANE die targeting on M3 Ultra
+
+### Environment State
+- Branch: main (uncommitted changes in src/main.rs, src/topology.rs)
+- asmi daemon on m3u2:9090 (stale, needs /topology endpoints)
+- Bokhan crate cloned at /tmp/ane-bokhan (builds, runs GPT-2)
+- maderix/ANE analysis at /tmp/ane-analysis (training implementation)
+- mlx-vlm on m3u2:19082 and m3u3:19082
+
+---
+
+## Session: 2026-03-04 (Topology + Cluster Cleanup)
+See `.claude/handoffs/2026-03-04-005942-asmi-topology-and-cluster-infra.md` for full details.
+- Implemented `asmi topology` CLI subcommand
+- Cleaned config.json (removed stale nodes)
+- Fixed JACCL hostfile references
+- Killed broken OpenClaw gateway
+
+## Session: 2026-03-01 (Gut TUI + Refactor)
+- Gutted TUI, split into modules, unified process managers
+- Typed errors, static regexes
+- Commit: d115892
+
+## Session: 2026-02-28 (Serve Module)
+- VLM lazy-load via warmup, IOReport telemetry, watchdog
+- /serve/share endpoint for distributed model sharing
+- Commits: 9666be1, b4d1aa0, 6358856, 7ffd248

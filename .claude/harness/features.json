@@ -1,0 +1,99 @@
+{
+  "project": "asmi (apple-smi)",
+  "description": "Apple Silicon cluster monitoring + ANE inference orchestration",
+  "updated": "2026-03-04",
+  "features": [
+    {
+      "id": "ane-power-01",
+      "ns": "ane",
+      "priority": 1,
+      "title": "IOReport ANE power monitoring",
+      "description": "Sudoless ANE power via Energy Model IOReport channel. GET /ane endpoint returning watts, power-gated status.",
+      "plan": "docs/plans/2026-03-02-ane-monitoring-and-compute.md",
+      "status": "pending",
+      "depends": []
+    },
+    {
+      "id": "ane-compute-02",
+      "ns": "ane",
+      "priority": 2,
+      "title": "ANE compute bridge (ObjC FFI)",
+      "description": "Rust FFI to _ANEInMemoryModel via ObjC bridge. Feature-gated (--features ane). POST /ane/eval endpoint.",
+      "plan": "docs/plans/2026-03-02-ane-monitoring-and-compute.md",
+      "status": "pending",
+      "depends": ["ane-power-01"]
+    },
+    {
+      "id": "ane-moe-03",
+      "ns": "ane",
+      "priority": 3,
+      "title": "MoE expert routing on ANE",
+      "description": "Extend Bokhan graph API for MoE: router on CPU, expert dispatch to ANE. Target: Qwen 3.5-35B-A3B (3B active).",
+      "status": "pending",
+      "depends": ["ane-compute-02"]
+    },
+    {
+      "id": "ane-dual-04",
+      "ns": "ane",
+      "priority": 4,
+      "title": "DirectPathClient — target individual ANE dies",
+      "description": "Probe H1xANELoadBalancerDirectPathClient to bypass load balancer and target ane0/ane1 on M3 Ultra. Pipeline parallelism within single node.",
+      "status": "pending",
+      "depends": ["ane-compute-02"]
+    },
+    {
+      "id": "topo-http-05",
+      "ns": "infra",
+      "priority": 1,
+      "title": "Add /topology HTTP endpoints to daemon",
+      "description": "GET /topology (JSON), GET /topology/dot, GET /topology/validate. 60s cache, follow thunderbolt_cache pattern. Phase 3 from topology handoff.",
+      "status": "pending",
+      "depends": []
+    },
+    {
+      "id": "jaccl-topo-06",
+      "ns": "infra",
+      "priority": 2,
+      "title": "Update /jaccl/config to use live topology",
+      "description": "Replace stale rdma_links in jaccl_config_handler with topology discovery. Proper error on incomplete mesh.",
+      "status": "pending",
+      "depends": ["topo-http-05"]
+    },
+    {
+      "id": "ane-spec-decode-07",
+      "ns": "ane",
+      "priority": 5,
+      "title": "Speculative decoding: ANE draft + GPU verify",
+      "description": "Mirror Speculative Decoding pattern. ANE runs 4-bit draft model, GPU verifies. Unified memory KV cache handoff.",
+      "status": "pending",
+      "depends": ["ane-moe-03"]
+    },
+    {
+      "id": "ane-rdma-pipeline-08",
+      "ns": "ane",
+      "priority": 6,
+      "title": "Cross-node ANE pipeline via RDMA",
+      "description": "Node A runs layers 0-N on ANE, ships activations via TB5 RDMA to Node B for layers N-2N. Requires JACCL integration.",
+      "status": "pending",
+      "depends": ["ane-dual-04", "jaccl-topo-06"]
+    },
+    {
+      "id": "ane-training-09",
+      "ns": "research",
+      "priority": 7,
+      "title": "Port maderix training loop to Rust/asmi",
+      "description": "Adapt the 6-kernel training loop (fwdAttn, fwdFFN, ffnBwd, sdpaBwd1, sdpaBwd2, qkvBwd) from ObjC to Rust via Bokhan's MIL API. Include exec() restart for compile budget.",
+      "status": "pending",
+      "depends": ["ane-compute-02"]
+    },
+    {
+      "id": "commit-pending-10",
+      "ns": "infra",
+      "priority": 0,
+      "title": "Commit uncommitted topology.rs and main.rs",
+      "description": "src/topology.rs and src/main.rs have uncommitted changes from the topology session.",
+      "status": "pending",
+      "depends": []
+    }
+  ]
+}
