@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A single TB5/RDMA link between two nodes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyLink {
     pub node_a: String,
     pub device_a: String,
@@ -20,7 +20,7 @@ pub struct TopologyLink {
 }
 
 /// Full cluster topology report.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyReport {
     pub nodes: Vec<String>,
     pub links: Vec<TopologyLink>,

@@ -223,6 +223,45 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         });
     }
 
+    // Topology cache — runs mlx.distributed_config every 60s (only in cluster hub mode)
+    let topology_cache: Arc<tokio::sync::RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    if cluster_hub {
+        let topo_cache = Arc::clone(&topology_cache);
+        let topo_nodes: Vec<String> = {
+            let nm = asmi_core::NodeMap::load();
+            nm.nodes.clone()
+        };
+        if !topo_nodes.is_empty() {
+            tokio::spawn(async move {
+                loop {
+                    let nodes = topo_nodes.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::topology::discover_topology(&nodes, "jaccl")
+                    }).await;
+                    match result {
+                        Ok(Ok(report)) => {
+                            tracing::info!(
+                                nodes = report.nodes.len(),
+                                links = report.links.len(),
+                                jaccl_ready = report.jaccl_ready,
+                                "topology scan complete"
+                            );
+                            *topo_cache.write().await = Some((report, std::time::Instant::now()));
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "topology scan failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "topology task panicked");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            });
+        }
+    }
+
     // Build axum router (serve_managers already created above for poll loop enrichment)
     let share_manager = serve::ShareManager::restore().await;
 
@@ -248,6 +287,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         metrics_tx: metrics_tx.clone(),
         model_cache,
         thunderbolt_cache,
+        topology_cache,
         runtime,
         serve_managers,
         share_manager,
@@ -294,6 +334,9 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         eprintln!("  GET  /nodes            Known node hostnames");
         eprintln!("  GET  /jaccl/config     RDMA topology for JACCL");
         eprintln!("  POST /jaccl/config     Generate JACCL hostfile");
+        eprintln!("  GET  /topology         TB5/RDMA mesh topology (JSON)");
+        eprintln!("  GET  /topology/dot     Topology as DOT graph");
+        eprintln!("  GET  /topology/validate Mesh completeness + JACCL readiness");
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

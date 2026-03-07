@@ -36,6 +36,7 @@ pub struct AppState {
     pub metrics_tx: tokio::sync::broadcast::Sender<String>,
     pub model_cache: Arc<RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>>,
     pub thunderbolt_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
+    pub topology_cache: Arc<RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>>,
     pub runtime: Arc<RuntimeInfo>,
     pub serve_managers: Arc<HashMap<u16, crate::serve::ServeManager>>,
     pub share_manager: crate::serve::ShareManager,
@@ -513,6 +514,52 @@ async fn thunderbolt_handler(State(state): State<AppState>) -> Json<serde_json::
     }
 }
 
+/// GET /topology → cached topology report (JSON). Refreshed by background loop.
+async fn topology_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let cache = state.topology_cache.read().await;
+    match cache.as_ref() {
+        Some((report, scanned_at)) => {
+            let mut val = serde_json::to_value(report)
+                .map_err(|e| ApiError::Internal(format!("serialize: {e}")))?;
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("scan_age_seconds".to_string(),
+                    serde_json::json!(scanned_at.elapsed().as_secs()));
+            }
+            Ok(Json(val))
+        }
+        None => Err(ApiError::NotFound("topology not yet scanned — check back in ~60s".into())),
+    }
+}
+
+/// GET /topology/dot → raw DOT graph output for visualization.
+async fn topology_dot_handler(State(state): State<AppState>) -> Result<String, ApiError> {
+    let cache = state.topology_cache.read().await;
+    match cache.as_ref() {
+        Some((report, _)) => Ok(report.raw_dot.clone()),
+        None => Err(ApiError::NotFound("topology not yet scanned".into())),
+    }
+}
+
+/// GET /topology/validate → mesh completeness check + JACCL readiness.
+async fn topology_validate_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let cache = state.topology_cache.read().await;
+    match cache.as_ref() {
+        Some((report, scanned_at)) => {
+            Ok(Json(serde_json::json!({
+                "nodes": report.nodes,
+                "link_count": report.links.len(),
+                "expected_links": report.nodes.len() * (report.nodes.len() - 1) / 2,
+                "mesh_complete": report.mesh_complete,
+                "missing_links": report.missing_links,
+                "jaccl_ready": report.jaccl_ready,
+                "jaccl_ready_subsets": report.jaccl_ready_subsets,
+                "scan_age_seconds": scanned_at.elapsed().as_secs(),
+            })))
+        }
+        None => Err(ApiError::NotFound("topology not yet scanned".into())),
+    }
+}
+
 /// GET /health/network → validate local Thunderbolt network service names
 async fn network_health_handler() -> Result<Json<serde_json::Value>, ApiError> {
     let status = asmi_core::validate_thunderbolt_services().await;
@@ -923,6 +970,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/jaccl/config", get(jaccl_config_handler).post(jaccl_generate_handler))
         .route("/arp", get(arp_handler))
         .route("/thunderbolt", get(thunderbolt_handler))
+        .route("/topology", get(topology_handler))
+        .route("/topology/dot", get(topology_dot_handler))
+        .route("/topology/validate", get(topology_validate_handler))
         .route("/serve/status", get(serve_status_handler))
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
