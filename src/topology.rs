@@ -1,10 +1,10 @@
-//! Cluster topology discovery by wrapping `mlx.distributed_config`.
+//! Cluster topology discovery for TB5/RDMA mesh.
 //!
-//! Shells out to Apple's `mlx.distributed_config --dot` which SSHes to all nodes
-//! and discovers the full TB5/RDMA mesh. Parses the DOT output into structured
-//! JSON with mesh completeness validation.
+//! Primary: wraps Apple's `mlx.distributed_config --dot`.
+//! Fallback: ARP-based discovery when mlx.distributed_config fails
+//! (e.g., `KeyError: receptacle_1_tag` on freshly-cabled links).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -58,8 +58,20 @@ fn find_distributed_config() -> Result<String> {
     bail!("mlx.distributed_config not found. Install with: pip install mlx")
 }
 
-/// Run `mlx.distributed_config --dot` and capture output.
+/// Discover cluster topology. Tries `mlx.distributed_config` first, falls back
+/// to ARP-based discovery if it fails (e.g., KeyError on freshly-cabled links).
 pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyReport> {
+    match discover_via_mlx(hosts, backend) {
+        Ok(report) => Ok(report),
+        Err(e) => {
+            eprintln!("mlx.distributed_config failed ({e:#}), falling back to ARP-based discovery");
+            discover_via_arp(hosts)
+        }
+    }
+}
+
+/// Primary path: `mlx.distributed_config --dot`.
+fn discover_via_mlx(hosts: &[String], backend: &str) -> Result<TopologyReport> {
     let bin = find_distributed_config()?;
     let hosts_arg = hosts.join(",");
 
@@ -79,19 +91,15 @@ pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyRepo
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // mlx.distributed_config outputs DOT to stdout even on incomplete mesh
-    // (the error goes to stderr). Parse whatever DOT we get.
     let dot = if stdout.contains("graph G") {
         stdout.clone()
     } else if stderr.contains("graph G") {
-        // Sometimes DOT goes to stderr alongside error messages
         stderr
             .lines()
             .skip_while(|l| !l.contains("graph G"))
             .collect::<Vec<_>>()
             .join("\n")
     } else {
-        // No DOT at all — might be a complete failure
         String::new()
     };
 
@@ -103,6 +111,185 @@ pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyRepo
     }
 
     parse_dot(&dot, hosts)
+}
+
+/// Fallback: discover mesh by SSHing to each node, collecting link-local IPs
+/// and ARP tables, then cross-referencing to find which interfaces connect.
+fn discover_via_arp(hosts: &[String]) -> Result<TopologyReport> {
+    use std::collections::BTreeMap;
+
+    // Collect ifconfig IPs and ARP from each node in parallel (threads, not async)
+    let results: Vec<(String, BTreeMap<String, String>, Vec<(String, String)>)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = hosts
+                .iter()
+                .map(|host| {
+                    let h = host.clone();
+                    s.spawn(move || {
+                        let iface_ips = collect_link_local_ips(&h);
+                        let arp = collect_arp_peers(&h);
+                        (h, iface_ips, arp)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+    // Build IP → (hostname, interface) lookup
+    let mut ip_to_node: HashMap<String, (String, String)> = HashMap::new();
+    for (host, iface_ips, _) in &results {
+        for (iface, ip) in iface_ips {
+            ip_to_node.insert(ip.clone(), (host.clone(), iface.clone()));
+        }
+    }
+
+    // Find links by matching ARP entries to known node IPs
+    let mut seen_links: HashSet<(String, String)> = HashSet::new();
+    let mut links: Vec<TopologyLink> = Vec::new();
+
+    for (host, _iface_ips, arp_entries) in &results {
+        for (remote_ip, local_iface) in arp_entries {
+            if let Some((remote_host, remote_iface)) = ip_to_node.get(remote_ip) {
+                if remote_host == host {
+                    continue; // skip self
+                }
+                let (a, b) = if host < remote_host {
+                    (host.clone(), remote_host.clone())
+                } else {
+                    (remote_host.clone(), host.clone())
+                };
+                if seen_links.insert((a.clone(), b.clone())) {
+                    let (dev_a, dev_b) = if host < remote_host {
+                        (format!("rdma_{local_iface}"), format!("rdma_{remote_iface}"))
+                    } else {
+                        (format!("rdma_{remote_iface}"), format!("rdma_{local_iface}"))
+                    };
+                    links.push(TopologyLink {
+                        node_a: a,
+                        device_a: dev_a,
+                        node_b: b,
+                        device_b: dev_b,
+                    });
+                }
+            }
+        }
+    }
+
+    // Build connectivity set and check mesh completeness
+    let connected: HashSet<(String, String)> = seen_links;
+    let mut missing: Vec<(String, String)> = Vec::new();
+    let nodes = hosts.to_vec();
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            let pair = (nodes[i].clone(), nodes[j].clone());
+            if !connected.contains(&pair) {
+                missing.push(pair);
+            }
+        }
+    }
+
+    let mesh_complete = missing.is_empty();
+    let expected = nodes.len() * (nodes.len() - 1) / 2;
+    let jaccl_ready = mesh_complete && links.len() >= expected;
+    let subsets = find_jaccl_subsets(&nodes, &connected);
+
+    // Generate DOT
+    let raw_dot = generate_dot(&nodes, &links);
+
+    Ok(TopologyReport {
+        nodes,
+        links,
+        mesh_complete,
+        missing_links: missing,
+        jaccl_ready,
+        jaccl_ready_subsets: subsets,
+        raw_dot,
+    })
+}
+
+/// Collect link-local (169.254.x.x) IPs from a node via SSH `ifconfig`.
+fn collect_link_local_ips(host: &str) -> BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let output = ssh_cmd(host, "ifconfig 2>/dev/null");
+    let mut result = BTreeMap::new();
+    let mut current_iface = String::new();
+    for line in output.lines() {
+        if !line.starts_with('\t') && !line.starts_with(' ') {
+            if let Some(name) = line.split(':').next() {
+                current_iface = name.to_string();
+            }
+        }
+        if line.contains("inet 169.254.") {
+            if let Some(ip) = line.split_whitespace().nth(1) {
+                if !current_iface.is_empty()
+                    && !current_iface.starts_with("lo")
+                    && !current_iface.starts_with("bridge")
+                {
+                    result.insert(current_iface.clone(), ip.to_string());
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Collect resolved ARP entries for 169.254.x.x peers, returning (remote_ip, local_interface).
+fn collect_arp_peers(host: &str) -> Vec<(String, String)> {
+    let output = ssh_cmd(host, "arp -an 2>/dev/null | grep '169.254.' | grep -v incomplete");
+    let mut peers = Vec::new();
+    for line in output.lines() {
+        // Format: ? (169.254.x.x) at MAC on enN [ethernet]
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 6 && parts[3] != "(incomplete)" {
+            let ip = parts[1].trim_matches(|c| c == '(' || c == ')').to_string();
+            let iface = parts[5].to_string();
+            // Skip bridge interfaces — they don't map to a single TB port
+            if !iface.starts_with("bridge") {
+                peers.push((ip, iface));
+            }
+        }
+    }
+    peers
+}
+
+/// Run an SSH command synchronously and return stdout.
+fn ssh_cmd(host: &str, cmd: &str) -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    Command::new("ssh")
+        .args([
+            "-o", "ConnectTimeout=5",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
+            &format!("{user}@{host}"),
+            cmd,
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// Generate a DOT graph from discovered topology.
+fn generate_dot(nodes: &[String], links: &[TopologyLink]) -> String {
+    let mut dot = String::from("graph G {\n  node [shape=rectangle];\n");
+    let ids: Vec<String> = (b'a'..).take(nodes.len()).map(|c| String::from(c as char)).collect();
+    let name_to_id: HashMap<&str, &str> = nodes
+        .iter()
+        .zip(ids.iter())
+        .map(|(n, id)| (n.as_str(), id.as_str()))
+        .collect();
+    for (name, id) in nodes.iter().zip(ids.iter()) {
+        dot.push_str(&format!("  {id} [label=\"{name}\"];\n"));
+    }
+    for link in links {
+        let id_a = name_to_id.get(link.node_a.as_str()).unwrap_or(&"?");
+        let id_b = name_to_id.get(link.node_b.as_str()).unwrap_or(&"?");
+        let dev_a = link.device_a.strip_prefix("rdma_").unwrap_or(&link.device_a);
+        let dev_b = link.device_b.strip_prefix("rdma_").unwrap_or(&link.device_b);
+        dot.push_str(&format!("  {id_a} -- {id_b} [label=\"{dev_a}/{dev_b}\"]\n"));
+    }
+    dot.push_str("}\n");
+    dot
 }
 
 /// Parse DOT graph output into a TopologyReport.
