@@ -86,6 +86,28 @@ const CMD_POWERMETRICS: &str =
 const CMD_VMSTAT_SYSCTL: &str =
     "hostname -s; echo '---HOSTNAME---'; vm_stat; echo '---MEMSIZE---'; sysctl -n hw.memsize";
 
+/// Hardware identity via system_profiler (for remote nodes via SSH).
+const CMD_HW_IDENTITY: &str =
+    "system_profiler SPHardwareDataType 2>/dev/null | grep -E 'Chip:|Serial Number \\(system\\):|Model Name:'";
+
+/// Parse system_profiler output into (chip, serial, model).
+fn parse_hw_identity(text: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut chip = None;
+    let mut serial = None;
+    let mut model = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("Chip:") {
+            chip = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Serial Number (system):") {
+            serial = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("Model Name:") {
+            model = Some(v.trim().to_string());
+        }
+    }
+    (chip, serial, model)
+}
+
 /// Also captures mlx.launch (distributed launcher), mlx_lm.share, mlx_audio,
 /// llama.cpp (llama-server/llama-cli), and ollama.
 /// JACCL detection: --backend jaccl in args, or ps -E showing MLX_JACCL env vars.
@@ -211,23 +233,7 @@ pub fn local_hardware_identity() -> (Option<String>, Option<String>, Option<Stri
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .unwrap_or_default();
-
-        let mut chip = None;
-        let mut serial = None;
-        let mut model = None;
-
-        for line in output.lines() {
-            let line = line.trim();
-            if let Some(v) = line.strip_prefix("Chip:") {
-                chip = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("Serial Number (system):") {
-                serial = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("Model Name:") {
-                model = Some(v.trim().to_string());
-            }
-        }
-
-        (chip, serial, model)
+        parse_hw_identity(&output)
     });
     (c.clone(), s.clone(), m.clone())
 }
@@ -248,7 +254,7 @@ async fn collect_via_ssh(
         }
     };
 
-    // 1. Run 6 commands in parallel
+    // 1. Run commands in parallel (+ hardware identity for remote nodes)
     let (power_res, mem_res, ps_res, jaccl_res, rdma_net_res, iostat_res) = tokio::join!(
         run(CMD_POWERMETRICS),
         run(CMD_VMSTAT_SYSCTL),
@@ -257,6 +263,15 @@ async fn collect_via_ssh(
         run(CMD_RDMA_NET),
         run(CMD_IOSTAT),
     );
+    // Hardware identity: local uses cached OnceLock, remote runs via SSH
+    let hw_identity = if is_local {
+        local_hardware_identity()
+    } else {
+        match run(CMD_HW_IDENTITY).await {
+            Ok(r) if r.has_output() => parse_hw_identity(&r.stdout),
+            _ => (None, None, None),
+        }
+    };
 
     // 2. Parse powermetrics
     let power = match &power_res {
@@ -490,15 +505,17 @@ async fn collect_via_ssh(
         0.0
     };
 
-    let (chip_model, serial_number, model_name) = if is_local {
-        local_hardware_identity()
-    } else {
-        (None, None, None)
-    };
+    let (chip_model, serial_number, model_name) = hw_identity;
+
+    // A remote node with 0 total RAM means all SSH commands failed (unreachable).
+    let online = is_local || mem_stats.total_bytes > 0;
+    if !online {
+        warn!(hostname, "marking node offline — SSH collection returned no data");
+    }
 
     NodeSnapshot {
         hostname: canonical_hostname,
-        online: true,
+        online,
         timestamp: Utc::now(),
         chip_model,
         serial_number,
@@ -1795,9 +1812,9 @@ mod tests {
         };
         let snap = super::collect_node_metrics("nonexistent-host-12345", &config, false).await;
 
-        // Should return a snapshot (not panic), but with zero/empty data
-        // because both HTTP and SSH failed
-        assert!(snap.online, "snapshot.online is always true from collect_via_ssh");
+        // Should return a snapshot (not panic), but with zero data and
+        // online=false because both HTTP and SSH failed
+        assert!(!snap.online, "unreachable remote should be marked offline");
         assert_eq!(snap.ram_total_bytes, 0, "unreachable host should have 0 RAM");
     }
 }
