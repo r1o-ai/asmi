@@ -92,7 +92,7 @@
       "priority": 0,
       "title": "Commit uncommitted topology.rs and main.rs",
       "description": "src/topology.rs and src/main.rs have uncommitted changes from the topology session.",
-      "status": "pending",
+      "status": "done",
       "depends": []
     }
   ]

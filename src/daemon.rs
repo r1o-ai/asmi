@@ -934,7 +934,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/watchdog/peers", get(peer_heartbeat_handler))
         .route("/watchdog/gpu-lock", get(gpu_lock_handler))
         // v0.5: metrics parity + process management
-        .route("/processes/:pid/kill", post(kill_process_handler))
+        .route("/processes/{pid}/kill", post(kill_process_handler))
         .route("/processes/tree", get(process_tree_handler))
         .route("/disk", get(disk_handler))
         .route("/network", get(network_handler))

@@ -12,7 +12,7 @@ use crate::ssh::{local_run, ssh_run};
 use crate::types::*;
 use chrono::Utc;
 use regex::Regex;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -39,6 +39,12 @@ static PAGE_SIZE_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^Pages (\w[\w ]*\w):\s+(\d+)\.").unwrap()
+});
+static ANON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^Anonymous pages:\s+(\d+)\.").unwrap()
+});
+static FILE_BACKED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^File-backed pages:\s+(\d+)\.").unwrap()
 });
 
 // parse_ps_mlx
@@ -190,6 +196,40 @@ pub async fn fetch_from_daemon(hostname: &str, port: u16) -> Option<NodeSnapshot
         }
     }
     None
+}
+
+/// Cached local hardware identity from `system_profiler SPHardwareDataType`.
+/// Runs once per process lifetime (hardware doesn't change at runtime).
+static LOCAL_HW_IDENTITY: OnceLock<(Option<String>, Option<String>, Option<String>)> =
+    OnceLock::new();
+
+pub fn local_hardware_identity() -> (Option<String>, Option<String>, Option<String>) {
+    let (c, s, m) = LOCAL_HW_IDENTITY.get_or_init(|| {
+        let output = std::process::Command::new("system_profiler")
+            .arg("SPHardwareDataType")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+
+        let mut chip = None;
+        let mut serial = None;
+        let mut model = None;
+
+        for line in output.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("Chip:") {
+                chip = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("Serial Number (system):") {
+                serial = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("Model Name:") {
+                model = Some(v.trim().to_string());
+            }
+        }
+
+        (chip, serial, model)
+    });
+    (c.clone(), s.clone(), m.clone())
 }
 
 /// Collect metrics via SSH commands (original path, used for local node
@@ -450,14 +490,19 @@ async fn collect_via_ssh(
         0.0
     };
 
+    let (chip_model, serial_number, model_name) = if is_local {
+        local_hardware_identity()
+    } else {
+        (None, None, None)
+    };
+
     NodeSnapshot {
         hostname: canonical_hostname,
         online: true,
         timestamp: Utc::now(),
-        // Hardware identity filled in by daemon after collection (system_profiler)
-        chip_model: None,
-        serial_number: None,
-        model_name: None,
+        chip_model,
+        serial_number,
+        model_name,
         cpu_watts: power.cpu_mw,
         gpu_watts: power.gpu_mw,
         ane_watts: power.ane_mw,
@@ -668,9 +713,9 @@ pub struct MemoryStats {
     /// Legacy "used" = active + inactive + speculative + wired + compressor.
     /// Kept for backward compatibility. Includes file cache.
     pub used_bytes: u64,
-    /// App memory = active + wired + compressor. What processes actually need.
+    /// App memory = anonymous + wired + compressor. What processes actually need.
     pub app_bytes: u64,
-    /// Cached memory = speculative + inactive. File cache, immediately reclaimable.
+    /// Cached memory = file-backed + speculative. File cache, immediately reclaimable.
     pub cached_bytes: u64,
 }
 
@@ -686,8 +731,8 @@ pub struct MemoryStats {
 /// 549755813888
 /// ```
 ///
-/// Returns a `MemoryStats` separating app memory (active + wired + compressor)
-/// from cached memory (speculative + inactive). `used_bytes` is the legacy total
+/// Returns a `MemoryStats` separating app memory (anonymous + wired + compressor)
+/// from cached memory (file-backed + speculative). `used_bytes` is the legacy total
 /// for backward compatibility.
 pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
     // Split on the separator
@@ -712,8 +757,6 @@ pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
         .unwrap_or(16384);
 
     // Parse page counts
-    let mut active: u64 = 0;
-    let mut inactive: u64 = 0;
     let mut speculative: u64 = 0;
     let mut wired: u64 = 0;
     let mut compressor: u64 = 0;
@@ -722,8 +765,6 @@ pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
         let name = &cap[1];
         let pages: u64 = cap[2].parse().unwrap_or(0);
         match name {
-            "active" => active = pages,
-            "inactive" => inactive = pages,
             "speculative" => speculative = pages,
             "wired down" => wired = pages,
             "occupied by compressor" => compressor = pages,
@@ -731,8 +772,20 @@ pub fn parse_vmstat_and_memsize(text: &str) -> MemoryStats {
         }
     }
 
-    let app_bytes = (active + wired + compressor) * page_size;
-    let cached_bytes = (speculative + inactive) * page_size;
+    // Use anonymous/file-backed for accurate app vs cache split.
+    // "Anonymous pages" = process-allocated memory (heap, stack, mmap private).
+    // "File-backed pages" = memory-mapped files, dyld shared cache, file cache.
+    let anonymous: u64 = ANON_RE
+        .captures(vmstat_text)
+        .and_then(|c| c[1].parse().ok())
+        .unwrap_or(0);
+    let file_backed: u64 = FILE_BACKED_RE
+        .captures(vmstat_text)
+        .and_then(|c| c[1].parse().ok())
+        .unwrap_or(0);
+
+    let app_bytes = (anonymous + wired + compressor) * page_size;
+    let cached_bytes = (file_backed + speculative) * page_size;
     let used_bytes = app_bytes + cached_bytes;
 
     MemoryStats {
@@ -1326,21 +1379,21 @@ mod tests {
         // Total should be 549755813888 (512 GiB)
         assert_eq!(stats.total_bytes, 549_755_813_888, "total_bytes");
 
-        // App = active + wired + compressor = 11058419 + 1434855 + 422 = 12493696 pages
-        let expected_app_pages: u64 = 11_058_419 + 1_434_855 + 422;
+        // App = anonymous + wired + compressor = 18962475 + 1434855 + 422 = 20397752 pages
+        let expected_app_pages: u64 = 18_962_475 + 1_434_855 + 422;
         let expected_app = expected_app_pages * 16384;
         assert_eq!(stats.app_bytes, expected_app, "app_bytes");
 
-        // Cached = speculative + inactive = 133882 + 11287075 = 11420957 pages
-        let expected_cached_pages: u64 = 133_882 + 11_287_075;
+        // Cached = file-backed + speculative = 3516901 + 133882 = 3650783 pages
+        let expected_cached_pages: u64 = 3_516_901 + 133_882;
         let expected_cached = expected_cached_pages * 16384;
         assert_eq!(stats.cached_bytes, expected_cached, "cached_bytes");
 
         // Used = app + cached (backward compat)
         assert_eq!(stats.used_bytes, expected_app + expected_cached, "used_bytes = app + cached");
 
-        // Sanity: app should be much smaller than total
-        assert!(stats.app_bytes < stats.total_bytes / 2, "app_bytes should be < 50% of total");
+        // Sanity: app should be less than total
+        assert!(stats.app_bytes < stats.total_bytes, "app_bytes should be < total");
 
         eprintln!(
             "Parsed: app={:.1} GiB, cached={:.1} GiB, used={:.1} GiB, total={:.1} GiB",
@@ -1355,13 +1408,16 @@ mod tests {
     fn test_parse_vmstat_custom_page_size() {
         let text = "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n\
                      Pages active:                               100.\n\
+                     Anonymous pages:                             80.\n\
+                     File-backed pages:                           20.\n\
                      ---MEMSIZE---\n\
                      8589934592\n";
         let stats = parse_vmstat_and_memsize(text);
         assert_eq!(stats.total_bytes, 8_589_934_592);
-        // Only active pages — no inactive/speculative/wired/compressor
-        assert_eq!(stats.app_bytes, 100 * 4096);  // active goes into app (with wired+compressor=0)
-        assert_eq!(stats.cached_bytes, 0);
+        // anonymous=80 + wired=0 + compressor=0 = 80 pages app
+        assert_eq!(stats.app_bytes, 80 * 4096);
+        // file-backed=20 + speculative=0 = 20 pages cached
+        assert_eq!(stats.cached_bytes, 20 * 4096);
         assert_eq!(stats.used_bytes, 100 * 4096);
     }
 

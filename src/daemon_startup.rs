@@ -5,34 +5,6 @@ use std::time::Duration;
 
 use crate::{bin_name, daemon, serve, watchdog};
 
-/// Collect hardware identity from `system_profiler SPHardwareDataType`.
-/// Returns (chip_model, serial_number, model_name). Runs synchronously (once at startup).
-fn collect_hardware_identity() -> (Option<String>, Option<String>, Option<String>) {
-    let output = std::process::Command::new("system_profiler")
-        .arg("SPHardwareDataType")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-
-    let mut chip_model = None;
-    let mut serial_number = None;
-    let mut model_name = None;
-
-    for line in output.lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("Chip:") {
-            chip_model = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("Serial Number (system):") {
-            serial_number = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("Model Name:") {
-            model_name = Some(v.trim().to_string());
-        }
-    }
-
-    (chip_model, serial_number, model_name)
-}
-
 /// Run asmi as an HTTP daemon serving local node metrics.
 pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>) -> Result<()> {
     // Init tracing to stderr
@@ -55,8 +27,8 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         "{} daemon starting", bin_name()
     );
 
-    // Collect hardware identity once at startup
-    let (chip_model, serial_number, model_name) = collect_hardware_identity();
+    // Collect hardware identity once (cached in OnceLock across all callers)
+    let (chip_model, serial_number, model_name) = asmi_core::local_hardware_identity();
     tracing::info!(
         chip = chip_model.as_deref().unwrap_or("unknown"),
         serial = serial_number.as_deref().unwrap_or("unknown"),
@@ -75,10 +47,6 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
 
     // Broadcast channel for SSE streaming
     let (metrics_tx, _) = tokio::sync::broadcast::channel::<String>(16);
-
-    let hw_chip = chip_model.clone();
-    let hw_serial = serial_number.clone();
-    let hw_model = model_name.clone();
 
     // Init all managed MLX servers (before poll loop so we can enrich metrics)
     let managers: Vec<_> = futures::future::join_all(
@@ -108,9 +76,6 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         let snapshot = Arc::clone(&snapshot);
         let config = config.clone();
         let hostname = hostname.clone();
-        let hw_chip = hw_chip.clone();
-        let hw_serial = hw_serial.clone();
-        let hw_model = hw_model.clone();
         let metrics_tx = metrics_tx.clone();
         let serve_managers = Arc::clone(&serve_managers);
         // Wrap in Mutex so we can mutate inside the async move block
@@ -118,9 +83,6 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         tokio::spawn(async move {
             loop {
                 let mut snap = asmi_core::collect_node_metrics(&hostname, &config, true).await;
-                snap.chip_model = hw_chip.clone();
-                snap.serial_number = hw_serial.clone();
-                snap.model_name = hw_model.clone();
 
                 // Sample IOReport for ANE power (no sudo required).
                 // If powermetrics returned 0 for ANE (common without sudo),
