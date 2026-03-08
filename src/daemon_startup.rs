@@ -3,10 +3,10 @@ use asmi_core::ClusterConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{bin_name, daemon, serve, watchdog};
+use crate::{ane::AneState, bin_name, daemon, serve, watchdog};
 
 /// Run asmi as an HTTP daemon serving local node metrics.
-pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>) -> Result<()> {
+pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>, _experimental_ane: bool) -> Result<()> {
     // Init tracing to stderr
     tracing_subscriber::fmt()
         .with_env_filter("asmi_core=info,asmi=info")
@@ -293,6 +293,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         share_manager,
         peer_heartbeat,
         watchdog: wd,
+        ane: AneState::new(_experimental_ane),
     };
 
     let app = daemon::build_router(app_state);

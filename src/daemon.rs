@@ -42,6 +42,7 @@ pub struct AppState {
     pub share_manager: crate::serve::ShareManager,
     pub peer_heartbeat: Arc<crate::serve::PeerHeartbeat>,
     pub watchdog: Arc<crate::watchdog::Watchdog>,
+    pub ane: crate::ane::AneState,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -936,7 +937,8 @@ async fn ane_handler(
     let snap = state.snapshot.read().await;
     match snap.as_ref() {
         Some(s) => {
-            let ane_active = s.ane_watts > 0.0;
+            // ANE draws 2000-3000 mW under load; sub-1 mW is IOReport noise
+            let ane_active = s.ane_watts > 1.0;
             Ok(Json(serde_json::json!({
                 "hostname": state.hostname,
                 "ane_watts": s.ane_watts,
@@ -989,5 +991,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/disk", get(disk_handler))
         .route("/network", get(network_handler))
         .route("/ane", get(ane_handler))
+        // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
+        .route("/ane/compute", get(crate::ane::status_handler))
+        .route("/ane/eval", post(crate::ane::eval_handler))
+        .route("/ane/probe", get(crate::ane::probe_handler))
         .with_state(state)
 }

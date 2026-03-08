@@ -117,10 +117,27 @@ GPU-level metrics via Metal APIs and IOKit for deeper profiling.
 
 - [ ] **Metal performance counters** — read GPU counters via `MTLDevice.counterSets` (shader utilization, occupancy, bandwidth)
 - [ ] **Per-process GPU time** — investigate IOKit GPU time accounting for running processes
-- [ ] **ANE utilization** — Apple Neural Engine utilization % (may require private API or `powermetrics` ANE sampler)
+- [ ] **ANE utilization** — extend v0.10 ANE integration with Metal Performance Counters correlation
 - [ ] **Memory bandwidth** — GPU memory bandwidth utilization via Metal counters or `powermetrics`
 - [ ] **Shader core occupancy** — thread execution width, active warps equivalent
 - [ ] **GPU power breakdown** — separate GPU cluster power if available from Metal 4 APIs
+
+## v0.10 — ANE Integration (in progress)
+
+Direct Apple Neural Engine compute via private APIs + IOSurface I/O.
+
+- [x] **ANE power (sudoless)** — IOReport `"Energy Model"` channel for ANE power without sudo
+- [x] **GET /ane** — dedicated ANE metrics endpoint (power, active status, IOReport source)
+- [x] **`ProcessFramework::AneNative`** — process detection for ANE workloads
+- [x] **`ane-runtime` crate** — Rust FFI wrappers for `_ANEInMemoryModel` lifecycle (8000 LOC)
+- [x] **GPT-2 forward pass** — working ANE inference at 31.1 tok/s (M3 Ultra)
+- [ ] **`--experimental-ane`** — CLI flag + feature gate for ANE compute endpoints
+- [ ] **GET /ane/compute** — ANE compute subsystem status (compile budget, availability)
+- [ ] **POST /ane/eval** — submit MIL program to ANE via HTTP (scaffolded)
+- [ ] **GET /ane/probe** — IOSurface memory layout profiling for RDMA research
+- [ ] **ANE-RDMA bridge** — cross-node activation transfer via Thunderbolt 5 RDMA
+- [ ] **Pipeline parallelism** — distribute transformer layers across nodes
+- [ ] **MoE expert placement** — route MoE experts to individual ANE dies across cluster
 
 ## Feature Mapping Reference
 

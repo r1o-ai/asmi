@@ -28,6 +28,7 @@ pub mod graph;
 pub mod io_surface;
 mod executable;
 pub mod ops;
+pub mod probe;
 pub(crate) mod request;
 mod tensor_data;
 

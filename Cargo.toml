@@ -41,7 +41,8 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 nix = { version = "0.29", features = ["signal", "process"] }
 ane-runtime = { path = "crates/ane-runtime", optional = true }
+objc2-io-surface = { version = "0.3", optional = true, features = ["IOSurfaceRef"] }
 
 [features]
 default = []
-ane = ["dep:ane-runtime"]
+ane = ["dep:ane-runtime", "dep:objc2-io-surface"]

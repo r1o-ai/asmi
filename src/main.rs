@@ -1,3 +1,4 @@
+mod ane;
 mod cli;
 mod daemon;
 mod daemon_startup;
@@ -50,6 +51,10 @@ struct Cli {
     /// Directories to scan for models (comma-separated).
     #[arg(long, value_delimiter = ',')]
     models_dir: Vec<String>,
+
+    /// Enable experimental ANE compute endpoints (requires --features ane at build time).
+    #[arg(long, hide = true)]
+    experimental_ane: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -176,7 +181,10 @@ async fn main() -> Result<()> {
 
     // --serve mode: run as HTTP daemon
     if args.serve {
-        return daemon_startup::run_serve(args.port, args.interval, args.cluster, args.models_dir).await;
+        return daemon_startup::run_serve(
+            args.port, args.interval, args.cluster,
+            args.models_dir, args.experimental_ane,
+        ).await;
     }
 
     // CLI monitor: one-shot or streaming watch
