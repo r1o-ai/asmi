@@ -1,7 +1,7 @@
 {
   "project": "asmi (apple-smi)",
   "description": "Apple Silicon cluster monitoring + ANE inference orchestration",
-  "updated": "2026-03-04",
+  "updated": "2026-03-20",
   "features": [
     {
       "id": "ane-power-01",
@@ -31,7 +31,7 @@
       "priority": 3,
       "title": "MoE expert routing on ANE",
       "description": "Extend Bokhan graph API for MoE: router on CPU, expert dispatch to ANE. Target: Qwen 3.5-35B-A3B (3B active).",
-      "status": "pending",
+      "status": "done",
       "depends": [
         "ane-compute-02"
       ]

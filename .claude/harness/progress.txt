@@ -1,7 +1,44 @@
 # asmi — Session Progress Log
 # Updated at end of each Claude session. Read at start of next.
 
-## Last Session: 2026-03-04 (Qwen 3.5 on ANE — Phase 0+1 Complete)
+## Last Session: 2026-03-20 (MoE Expert Routing on ANE — Complete)
+
+### What Was Done
+- **MoE Config**: Extended `QwenConfig` with `num_experts`, `num_experts_per_tok`, `moe_intermediate_size`, `shared_expert_intermediate_size`, `decoder_sparse_step`
+- **MoE Weight Types**: Added `MoeWeights`, `FfnVariant` enum (Dense/Moe) to `layer_weights.rs`; changed `ffn` field from `FfnWeights` to `FfnVariant` in both `FullAttentionWeights` and `LinearAttentionWeights`
+- **Weight Loader**: `load_ffn_variant()` dispatches to Dense or MoE based on config; loads router gate, shared expert, shared expert gate, and per-expert weights from safetensors
+- **Generic Expert Executable**: `build_generic_moe_expert()` compiles a single ANE graph using `matrix_multiplication` with placeholder inputs for gate/up/down weights — avoids per-expert compilation (would blow ~119 compile budget)
+- **FfnExecutable Enum**: `FfnExecutable::Dense(Executable)` vs `FfnExecutable::Moe { shared_expert }` — shared expert runs on ANE with baked weights, sparse experts use the generic executable with dynamic IOSurface weight binding
+- **MoE Expert IOSurfaces**: `MoeExpertTensors` struct pre-allocates IOSurface-backed `TensorData` for each expert's gate/up/down weights at model load time (in `compiled_model.rs`)
+- **Session Runtime**: `run_ffn_layer()` handles both Dense (direct ANE run) and MoE (CPU router softmax top-K → dynamic ANE expert dispatch with routing weight accumulation)
+- **Hopper MCP**: Installed `dflatline/hopperpymcp` to `~/Library/Application Support/Hopper/Scripts/`, added to MCP gateway on port 42069
+- **Safety**: All MoE code is confined to `qwen_forward` binary in `crates/ane-runtime/`. Zero changes to `src/daemon_startup.rs` or `src/ane.rs`. Daemon does NOT eagerly init any ANE inference.
+
+### Key Architectural Decisions
+- **Single generic expert executable** instead of per-expert compilation: 2 compiles (prefill+decode) vs 1,440 (60 experts × 24 layers). Uses `matrix_multiplication` op with placeholder tensors instead of `convolution_2d_1x1` with baked constants.
+- **Shared expert on ANE, sparse experts on ANE via dynamic dispatch**: Shared expert weights are baked in (like dense FFN). Sparse expert weights are passed as IOSurface placeholders at runtime.
+- **CPU router**: Top-K softmax routing runs on CPU (tiny gate linear layer), only selected experts dispatched to ANE.
+- **swiglu_ffn_body returns tuple**: `(output, normalized_input)` — needed for MoE because the normalized hidden state feeds both the shared expert AND the router.
+
+### Compile Budget Analysis (MoE)
+- Dense Qwen 3.5-0.8B: 72 compiles (current, fits in 119)
+- MoE Qwen 3.5-35B-A3B: 72 + 2 (generic expert prefill+decode) = 74 compiles (fits)
+- No per-expert compilation — experts share one pre-compiled graph
+
+### What's Next
+- Test with actual MoE weights (need Qwen2MoE or similar model on cluster)
+- Verify matmul-based expert graph actually compiles and runs on ANE hardware
+- Optimize: batch tokens per expert instead of per-token dispatch (current is O(seq_len * top_k) ANE calls)
+- Investigate if ANE supports dynamic weight binding via IOSurface (the key assumption)
+
+### Environment State
+- Branch: main (uncommitted: MoE scaffolding across 7 files)
+- Clean `cargo check -p ane-runtime --bin qwen_forward` — zero warnings
+- No changes to daemon startup path
+
+---
+
+## Previous Session: 2026-03-04 (Qwen 3.5 on ANE — Phase 0+1 Complete)
 
 ### What Was Done
 - **Phase 0**: Integrated Bokhan ANE crate into workspace as `crates/ane-runtime/` (behind `--features ane`)

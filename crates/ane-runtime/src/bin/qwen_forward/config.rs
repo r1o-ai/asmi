@@ -40,6 +40,22 @@ pub struct QwenConfig {
 
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
+
+    // MoE params
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: Option<usize>,
+    #[serde(default = "default_decoder_sparse_step")]
+    pub decoder_sparse_step: usize,
+}
+
+fn default_decoder_sparse_step() -> usize {
+    0
 }
 
 fn default_partial_rotary_factor() -> f64 {

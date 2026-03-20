@@ -35,6 +35,8 @@ pub struct Session<'model> {
     prefill_mask: TensorData,
     /// FFN output: [hidden_size, 1, padded_seq]
     prefill_ffn_out: TensorData,
+    /// MoE shared expert norm output: [hidden_size, 1, padded_seq]
+    prefill_norm_out: Option<TensorData>,
 
     // Decode scratch
     decode_hidden: TensorData,
@@ -46,6 +48,7 @@ pub struct Session<'model> {
     decode_v_expanded: TensorData,
     decode_mask: TensorData,
     decode_ffn_out: TensorData,
+    decode_norm_out: Option<TensorData>,
 
     /// Current position in the sequence.
     position: usize,
@@ -94,6 +97,9 @@ impl<'model> Session<'model> {
             prefill_v_expanded: TensorData::new(Shape::spatial(qk_flat, 1, padded_prompt_length)),
             prefill_mask: TensorData::new(Shape { batch: 1, channels: 1, height: padded_prompt_length, width: padded_prompt_length }),
             prefill_ffn_out: TensorData::new(Shape::spatial(hidden, 1, padded_prompt_length)),
+            prefill_norm_out: if config.num_experts.unwrap_or(0) > 0 {
+                Some(TensorData::new(Shape::spatial(hidden, 1, padded_prompt_length)))
+            } else { None },
 
             // Decode scratch
             decode_hidden: TensorData::new(Shape::spatial(hidden, 1, DECODE_SPATIAL_WIDTH)),
@@ -105,6 +111,9 @@ impl<'model> Session<'model> {
             decode_v_expanded: TensorData::new(Shape::spatial(qk_flat, 1, max_seq)),
             decode_mask: TensorData::new(Shape { batch: 1, channels: 1, height: DECODE_SPATIAL_WIDTH, width: max_seq }),
             decode_ffn_out: TensorData::new(Shape::spatial(hidden, 1, DECODE_SPATIAL_WIDTH)),
+            decode_norm_out: if config.num_experts.unwrap_or(0) > 0 {
+                Some(TensorData::new(Shape::spatial(hidden, 1, DECODE_SPATIAL_WIDTH)))
+            } else { None },
 
             position: 0,
         }
@@ -141,7 +150,7 @@ impl<'model> Session<'model> {
                 }
                 (PrefillLayer::LinearAttention(exec), LayerWeights::LinearAttention(weights)) => {
                     self.prefill_linear_attention_layer(
-                        exec, weights, config, linear_attn_idx, seq_len, real_prompt_length,
+                        exec, weights, config, layer_index, linear_attn_idx, seq_len, real_prompt_length,
                     );
                     linear_attn_idx += 1;
                 }
@@ -189,7 +198,7 @@ impl<'model> Session<'model> {
                     full_attn_idx += 1;
                 }
                 (DecodeLayer::LinearAttention(exec), LayerWeights::LinearAttention(weights)) => {
-                    self.decode_linear_attention_layer(exec, weights, config, linear_attn_idx);
+                    self.decode_linear_attention_layer(exec, weights, config, layer_index, linear_attn_idx);
                     linear_attn_idx += 1;
                 }
                 _ => panic!("layer type mismatch at index {layer_index}"),
@@ -200,6 +209,137 @@ impl<'model> Session<'model> {
         self.kv_cache.position = self.position;
 
         self.compute_logits_from_decode()
+    }
+
+    // -----------------------------------------------------------------------
+    // FFN execution helper (MoE router + dense fallback)
+    // -----------------------------------------------------------------------
+
+    fn run_ffn_layer(
+        &mut self,
+        exec: &crate::executables::FfnExecutable,
+        layer_index: usize,
+        seq_len: usize,
+        is_prefill: bool,
+    ) {
+        let (hidden_in, ffn_out) = if is_prefill {
+            (&self.prefill_hidden, &self.prefill_ffn_out)
+        } else {
+            (&self.decode_hidden, &self.decode_ffn_out)
+        };
+
+        match exec {
+            crate::executables::FfnExecutable::Dense(dense) => {
+                dense
+                    .run(&[hidden_in], &[ffn_out])
+                    .unwrap_or_else(|e| panic!("L{layer_index} dense ffn: {e}"));
+            }
+            crate::executables::FfnExecutable::Moe { shared_expert } => {
+                let norm_out = if is_prefill {
+                    self.prefill_norm_out.as_ref().unwrap()
+                } else {
+                    self.decode_norm_out.as_ref().unwrap()
+                };
+
+                // 1. Run shared expert; output goes to ffn_out, and normalized goes to norm_out
+                shared_expert
+                    .run(&[hidden_in], &[ffn_out, norm_out])
+                    .unwrap_or_else(|e| panic!("L{layer_index} shared expert: {e}"));
+
+                let config = &self.model.config;
+                let num_experts = config.num_experts.unwrap();
+                let num_active = config.num_experts_per_tok.unwrap();
+
+                let moe_weights = match &self.model.weights.layers[layer_index] {
+                    crate::weights::LayerWeights::FullAttention(w) => match &w.ffn {
+                        crate::weights::FfnVariant::Moe(m) => m,
+                        _ => unreachable!(),
+                    },
+                    crate::weights::LayerWeights::LinearAttention(w) => match &w.ffn {
+                        crate::weights::FfnVariant::Moe(m) => m,
+                        _ => unreachable!(),
+                    }
+                };
+
+                let gate_w = &moe_weights.gate_weight;
+                let hidden = config.hidden_size;
+                let expert_tensors = &self.model.moe_expert_tensors.as_ref().unwrap()[layer_index];
+
+                let generic_expert = if is_prefill {
+                    self.model.executables.moe_expert_prefill.as_ref().unwrap()
+                } else {
+                    self.model.executables.moe_expert_decode.as_ref().unwrap()
+                };
+
+                // Allocate a single token buffer for routing and executing experts
+                let token_in = ane::TensorData::new(ane::Shape::spatial(hidden, 1, seq_len));
+                let mut token_out = ane::TensorData::new(ane::Shape::spatial(hidden, 1, seq_len));
+
+                // 2. CPU Router + dynamic expert dispatch
+                let norm_slice = norm_out.as_f32_slice();
+                let mut out_slice = ffn_out.as_f32_slice_mut();
+
+                for s in 0..seq_len {
+                    // Compute router logits
+                    let mut logits = vec![0.0f32; num_experts];
+                    for e in 0..num_experts {
+                        let mut sum = 0.0;
+                        for ch in 0..hidden {
+                            sum += norm_slice[ch * seq_len + s] * gate_w[e * hidden + ch];
+                        }
+                        logits[e] = sum;
+                    }
+
+                    // Top-K routing
+                    let mut indices: Vec<usize> = (0..num_experts).collect();
+                    indices.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+                    indices.truncate(num_active);
+
+                    let max_logit = indices.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
+                    let mut routing_weights = vec![0.0f32; num_active];
+                    let mut exp_sum = 0.0;
+                    for (k, &e) in indices.iter().enumerate() {
+                        let w = (logits[e] - max_logit).exp();
+                        routing_weights[k] = w;
+                        exp_sum += w;
+                    }
+                    for k in 0..num_active {
+                        routing_weights[k] /= exp_sum;
+                    }
+
+                    // For each selected expert, run the generic ANE executable
+                    for (k, &e) in indices.iter().enumerate() {
+                        let w = routing_weights[k];
+                        let tensors = &expert_tensors[e];
+
+                        // Copy the single token to expert input
+                        {
+                            let mut t_in = token_in.as_f32_slice_mut();
+                            t_in.fill(0.0);
+                            for ch in 0..hidden {
+                                t_in[ch * seq_len + s] = norm_slice[ch * seq_len + s];
+                            }
+                        }
+
+                        // Run ANE expert! The graph expects: [input, gate_w, up_w, down_w]
+                        generic_expert
+                            .run(
+                                &[&token_in, &tensors.gate_w, &tensors.up_w, &tensors.down_w],
+                                &[&mut token_out]
+                            )
+                            .unwrap_or_else(|err| panic!("L{layer_index} expert {e}: {err}"));
+
+                        // Accumulate output
+                        {
+                            let t_out = token_out.as_f32_slice();
+                            for ch in 0..hidden {
+                                out_slice[ch * seq_len + s] += w * t_out[ch * seq_len + s];
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -299,10 +439,8 @@ impl<'model> Session<'model> {
         // Add attention output to residual
         self.prefill_hidden.add_from(&self.prefill_attn_out);
 
-        // 4. ANE FFN
-        exec.feed_forward
-            .run(&[&self.prefill_hidden], &[&self.prefill_ffn_out])
-            .unwrap_or_else(|e| panic!("prefill L{layer_index} ffn: {e}"));
+        // 4. FFN (Dense or MoE)
+        self.run_ffn_layer(&exec.feed_forward, layer_index, seq_len, true);
 
         self.prefill_hidden.add_from(&self.prefill_ffn_out);
     }
@@ -316,6 +454,7 @@ impl<'model> Session<'model> {
         exec: &crate::executables::LinearAttnPrefillLayer,
         weights: &LinearAttentionWeights,
         config: &QwenConfig,
+        layer_index: usize,
         linear_idx: usize,
         seq_len: usize,
         real_length: usize,
@@ -344,9 +483,7 @@ impl<'model> Session<'model> {
         }
 
         // ANE FFN
-        exec.feed_forward
-            .run(&[&self.prefill_hidden], &[&self.prefill_ffn_out])
-            .unwrap_or_else(|e| panic!("prefill DeltaNet ffn: {e}"));
+        self.run_ffn_layer(&exec.feed_forward, layer_index, seq_len, true);
 
         self.prefill_hidden.add_from(&self.prefill_ffn_out);
     }
@@ -467,9 +604,7 @@ impl<'model> Session<'model> {
         }
 
         // 4. ANE FFN
-        exec.feed_forward
-            .run(&[&self.decode_hidden], &[&self.decode_ffn_out])
-            .unwrap_or_else(|e| panic!("decode L{layer_index} ffn: {e}"));
+        self.run_ffn_layer(&exec.feed_forward, layer_index, 1, false);
 
         {
             let delta = self.decode_ffn_out.as_f32_slice();
@@ -489,6 +624,7 @@ impl<'model> Session<'model> {
         exec: &crate::executables::LinearAttnDecodeLayer,
         weights: &LinearAttentionWeights,
         config: &QwenConfig,
+        layer_index: usize,
         linear_idx: usize,
     ) {
         let hidden = config.hidden_size;
@@ -511,9 +647,7 @@ impl<'model> Session<'model> {
         }
 
         // ANE FFN
-        exec.feed_forward
-            .run(&[&self.decode_hidden], &[&self.decode_ffn_out])
-            .unwrap_or_else(|e| panic!("decode DeltaNet ffn: {e}"));
+        self.run_ffn_layer(&exec.feed_forward, layer_index, 1, false);
 
         {
             let delta = self.decode_ffn_out.as_f32_slice();

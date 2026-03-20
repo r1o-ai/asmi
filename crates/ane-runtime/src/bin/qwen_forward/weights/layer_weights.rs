@@ -8,6 +8,22 @@ pub struct FfnWeights {
     pub down_proj_weight: Box<[f32]>,
 }
 
+pub struct MoeWeights {
+    /// Router gate weights: [num_experts, hidden_size]
+    pub gate_weight: Box<[f32]>,
+    /// Shared expert FFN weights
+    pub shared_expert: FfnWeights,
+    /// Shared expert gate weights (optional): [1, hidden_size]
+    pub shared_expert_gate_weight: Option<Box<[f32]>>,
+    /// Sparse expert FFN weights
+    pub experts: Vec<FfnWeights>,
+}
+
+pub enum FfnVariant {
+    Dense(FfnWeights),
+    Moe(MoeWeights),
+}
+
 /// Weights for a full (quadratic) attention layer with GQA and RoPE.
 ///
 /// Occurs at layers 3, 7, 11, 15, 19, 23 (every 4th starting at 3).
@@ -39,8 +55,8 @@ pub struct FullAttentionWeights {
     /// RMSNorm before FFN: [hidden_size]
     pub post_attention_layernorm_weight: Box<[f32]>,
 
-    /// FFN weights (SwiGLU)
-    pub ffn: FfnWeights,
+    /// FFN weights (SwiGLU or MoE)
+    pub ffn: FfnVariant,
 }
 
 /// Weights for a linear (DeltaNet) attention layer.
@@ -86,8 +102,8 @@ pub struct LinearAttentionWeights {
     /// RMSNorm before FFN: [hidden_size]
     pub post_attention_layernorm_weight: Box<[f32]>,
 
-    /// FFN weights (SwiGLU)
-    pub ffn: FfnWeights,
+    /// FFN weights (SwiGLU or MoE)
+    pub ffn: FfnVariant,
 }
 
 /// Per-layer weights, dispatched by attention type.

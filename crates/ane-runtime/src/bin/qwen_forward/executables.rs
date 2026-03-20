@@ -9,24 +9,31 @@ use crate::weights::{
 // Compiled layer types
 // ---------------------------------------------------------------------------
 
+pub enum FfnExecutable {
+    Dense(Executable),
+    Moe {
+        shared_expert: Executable,
+    },
+}
+
 /// Full attention layer executables (layers 3, 7, 11, 15, 19, 23).
 ///
 /// Split into two ANE kernels with a CPU step between them:
 ///   1. `projection` — RMSNorm + Q/K/V/gate linear projections
 ///   2. (CPU) — per-head Q/K RMSNorm, partial RoPE, GQA KV expansion
 ///   3. `attention` — multi-head dot-product attention + sigmoid gate + o_proj
-///   4. `feed_forward` — post-attention RMSNorm + SwiGLU FFN
+///   4. `feed_forward` — post-attention RMSNorm + SwiGLU FFN (Dense or Shared Expert)
 pub struct FullAttnPrefillLayer {
     pub projection: Executable,
     pub attention: Executable,
-    pub feed_forward: Executable,
+    pub feed_forward: FfnExecutable,
 }
 
 /// Full attention decode layer. Same split as prefill but with cache inputs.
 pub struct FullAttnDecodeLayer {
     pub projection: Executable,
     pub attention: Executable,
-    pub feed_forward: Executable,
+    pub feed_forward: FfnExecutable,
 }
 
 /// Linear attention (DeltaNet) layers only run the FFN on ANE.
@@ -35,12 +42,12 @@ pub struct FullAttnDecodeLayer {
 /// recurrent state updates, causal convolution, and element-wise gating
 /// that don't map well to the ANE's fixed-function pipeline.
 pub struct LinearAttnPrefillLayer {
-    pub feed_forward: Executable,
+    pub feed_forward: FfnExecutable,
 }
 
 /// Linear attention decode layer — FFN only, DeltaNet on CPU.
 pub struct LinearAttnDecodeLayer {
-    pub feed_forward: Executable,
+    pub feed_forward: FfnExecutable,
 }
 
 /// Enum dispatch for a single prefill layer.
@@ -59,6 +66,11 @@ pub enum DecodeLayer {
 pub struct CompiledExecutables {
     pub prefill: Box<[PrefillLayer]>,
     pub decode: Box<[DecodeLayer]>,
+
+    /// Generic MoE expert executable for the prefill phase.
+    pub moe_expert_prefill: Option<Executable>,
+    /// Generic MoE expert executable for the decode phase.
+    pub moe_expert_decode: Option<Executable>,
 }
 
 /// Minimum spatial width for ANE execution (hardware constraint).
@@ -387,13 +399,12 @@ fn swiglu_ffn_body(
     input: ane::Tensor,
     norm_weight: &[f32],
     ffn: &FfnWeights,
-    config: &QwenConfig,
-) -> ane::Tensor {
-    let hidden = config.hidden_size; // 1024
-    let intermediate = config.intermediate_size; // 3584
-
+    hidden: usize,
+    intermediate: usize,
+    eps: f64,
+) -> (ane::Tensor, ane::Tensor) {
     // Post-attention RMSNorm
-    let normalized = rms_norm(graph, input, norm_weight, hidden, config.rms_norm_eps);
+    let normalized = rms_norm(graph, input, norm_weight, hidden, eps);
 
     // Gate projection: [hidden_size] -> [intermediate_size]
     let gate_w = graph.constant(&ffn.gate_proj_weight, Shape::spatial(intermediate, 1, 1));
@@ -409,7 +420,53 @@ fn swiglu_ffn_body(
 
     // Down projection: [intermediate_size] -> [hidden_size]
     let down_w = graph.constant(&ffn.down_proj_weight, Shape::spatial(hidden, 1, 1));
-    graph.convolution_2d_1x1(gated, down_w, None)
+    (graph.convolution_2d_1x1(gated, down_w, None), normalized)
+}
+
+fn build_ffn_executable(
+    norm_weight: &[f32],
+    ffn_variant: &crate::weights::FfnVariant,
+    config: &QwenConfig,
+    seq_len: usize,
+) -> Result<FfnExecutable, ane::Error> {
+    match ffn_variant {
+        crate::weights::FfnVariant::Dense(ffn) => {
+            let mut graph = Graph::new();
+            let input = graph.placeholder(Shape::spatial(config.hidden_size, 1, seq_len));
+            let (_out, _norm) = swiglu_ffn_body(
+                &mut graph, input, norm_weight, ffn,
+                config.hidden_size, config.intermediate_size, config.rms_norm_eps
+            );
+            Ok(FfnExecutable::Dense(graph.compile(NSQualityOfService::Default)?))
+        }
+        crate::weights::FfnVariant::Moe(moe) => {
+            let mut graph = Graph::new();
+            let input = graph.placeholder(Shape::spatial(config.hidden_size, 1, seq_len));
+            let shared_intermediate = config.shared_expert_intermediate_size.unwrap();
+            let (shared_out, normalized) = swiglu_ffn_body(
+                &mut graph, input, norm_weight, &moe.shared_expert,
+                config.hidden_size, shared_intermediate, config.rms_norm_eps
+            );
+
+            // If there's a shared expert gate, multiply output by F.sigmoid(gate(normalized_x))
+            // Qwen2Moe uses a linear layer for the shared expert gate: [1, hidden_size]
+            if let Some(gate_w) = &moe.shared_expert_gate_weight {
+                let gate_w_const = graph.constant(gate_w, Shape::spatial(1, 1, config.hidden_size));
+                let norm_transposed = graph.transpose(normalized, [0, 2, 3, 1]); // [1, 1, seq, hidden]
+                let gate_logits = graph.matrix_multiplication(norm_transposed, gate_w_const, false, true); // [1, 1, seq, 1]
+                let gate_act = graph.sigmoid(gate_logits); // [1, 1, seq, 1]
+
+                // Multiply gate_act by shared_out [1, hidden, 1, seq].
+                // We reshape gate_act to [1, 1, 1, seq] to broadcast nicely.
+                let gate_reshaped = graph.reshape(gate_act, Shape::spatial(1, 1, seq_len));
+                let _gated_shared_out = graph.multiplication(shared_out, gate_reshaped);
+            }
+
+            Ok(FfnExecutable::Moe {
+                shared_expert: graph.compile(NSQualityOfService::Default)?
+            })
+        }
+    }
 }
 
 /// Prefill FFN for a full attention layer.
@@ -418,15 +475,8 @@ pub fn build_full_attn_ffn_prefill(
     weights: &FullAttentionWeights,
     config: &QwenConfig,
     seq_len: usize,
-) -> Result<Executable, ane::Error> {
-    let mut graph = Graph::new();
-    let input = graph.placeholder(Shape::spatial(config.hidden_size, 1, seq_len));
-    let _output = swiglu_ffn_body(
-        &mut graph, input,
-        &weights.post_attention_layernorm_weight,
-        &weights.ffn, config,
-    );
-    graph.compile(NSQualityOfService::Default)
+) -> Result<FfnExecutable, ane::Error> {
+    build_ffn_executable(&weights.post_attention_layernorm_weight, &weights.ffn, config, seq_len)
 }
 
 /// Decode FFN for a full attention layer.
@@ -434,15 +484,8 @@ pub fn build_full_attn_ffn_prefill(
 pub fn build_full_attn_ffn_decode(
     weights: &FullAttentionWeights,
     config: &QwenConfig,
-) -> Result<Executable, ane::Error> {
-    let mut graph = Graph::new();
-    let input = graph.placeholder(Shape::spatial(config.hidden_size, 1, DECODE_SPATIAL_WIDTH));
-    let _output = swiglu_ffn_body(
-        &mut graph, input,
-        &weights.post_attention_layernorm_weight,
-        &weights.ffn, config,
-    );
-    graph.compile(NSQualityOfService::Default)
+) -> Result<FfnExecutable, ane::Error> {
+    build_ffn_executable(&weights.post_attention_layernorm_weight, &weights.ffn, config, DECODE_SPATIAL_WIDTH)
 }
 
 /// Prefill FFN for a linear attention (DeltaNet) layer.
@@ -452,15 +495,8 @@ pub fn build_linear_attn_ffn_prefill(
     weights: &LinearAttentionWeights,
     config: &QwenConfig,
     seq_len: usize,
-) -> Result<Executable, ane::Error> {
-    let mut graph = Graph::new();
-    let input = graph.placeholder(Shape::spatial(config.hidden_size, 1, seq_len));
-    let _output = swiglu_ffn_body(
-        &mut graph, input,
-        &weights.post_attention_layernorm_weight,
-        &weights.ffn, config,
-    );
-    graph.compile(NSQualityOfService::Default)
+) -> Result<FfnExecutable, ane::Error> {
+    build_ffn_executable(&weights.post_attention_layernorm_weight, &weights.ffn, config, seq_len)
 }
 
 /// Decode FFN for a linear attention (DeltaNet) layer.
@@ -468,14 +504,47 @@ pub fn build_linear_attn_ffn_prefill(
 pub fn build_linear_attn_ffn_decode(
     weights: &LinearAttentionWeights,
     config: &QwenConfig,
-) -> Result<Executable, ane::Error> {
+) -> Result<FfnExecutable, ane::Error> {
+    build_ffn_executable(&weights.post_attention_layernorm_weight, &weights.ffn, config, DECODE_SPATIAL_WIDTH)
+}
+
+/// Build generic MoE expert executable.
+///
+/// Takes normalized input [1, hidden, 1, seq] and placeholders for the expert weights:
+/// gate: [1, 1, intermediate, hidden]
+/// up: [1, 1, intermediate, hidden]
+/// down: [1, 1, hidden, intermediate]
+fn build_generic_moe_expert(config: &QwenConfig, seq_len: usize) -> Result<Executable, ane::Error> {
     let mut graph = Graph::new();
-    let input = graph.placeholder(Shape::spatial(config.hidden_size, 1, DECODE_SPATIAL_WIDTH));
-    let _output = swiglu_ffn_body(
-        &mut graph, input,
-        &weights.post_attention_layernorm_weight,
-        &weights.ffn, config,
-    );
+    let hidden = config.hidden_size;
+    let intermediate = config.moe_intermediate_size.unwrap_or(1);
+
+    // [1, hidden, 1, seq]
+    let input = graph.placeholder(Shape::spatial(hidden, 1, seq_len));
+
+    let gate_w = graph.placeholder(Shape { batch: 1, channels: 1, height: intermediate, width: hidden });
+    let up_w = graph.placeholder(Shape { batch: 1, channels: 1, height: intermediate, width: hidden });
+    let down_w = graph.placeholder(Shape { batch: 1, channels: 1, height: hidden, width: intermediate });
+
+    // Transpose input to [1, 1, seq, hidden]
+    let x_t = graph.transpose(input, [0, 2, 3, 1]);
+
+    // gate = matmul(x_t, gate_w^T) => [1, 1, seq, intermediate]
+    let gate = graph.matrix_multiplication(x_t, gate_w, false, true);
+    let gate_act = silu(&mut graph, gate);
+
+    // up = matmul(x_t, up_w^T) => [1, 1, seq, intermediate]
+    let up = graph.matrix_multiplication(x_t, up_w, false, true);
+
+    // multiply gate and up => [1, 1, seq, intermediate]
+    let gated = graph.multiplication(gate_act, up);
+
+    // down = matmul(gated, down_w^T) => [1, 1, seq, hidden]
+    let out_t = graph.matrix_multiplication(gated, down_w, false, true);
+
+    // Transpose back to [1, hidden, 1, seq]
+    let _out = graph.transpose(out_t, [0, 3, 1, 2]);
+
     graph.compile(NSQualityOfService::Default)
 }
 
@@ -494,6 +563,13 @@ pub fn compile_all(
     padded_prompt_length: usize,
     max_sequence_length: usize,
 ) -> Result<CompiledExecutables, ane::Error> {
+    let mut moe_expert_prefill = None;
+    let mut moe_expert_decode = None;
+    if config.num_experts.unwrap_or(0) > 0 {
+        moe_expert_prefill = Some(build_generic_moe_expert(config, padded_prompt_length)?);
+        moe_expert_decode = Some(build_generic_moe_expert(config, DECODE_SPATIAL_WIDTH)?);
+    }
+
     let prefill: Box<[PrefillLayer]> = layer_weights
         .iter()
         .map(|lw| match lw {
@@ -540,5 +616,10 @@ pub fn compile_all(
         })
         .collect::<Result<_, ane::Error>>()?;
 
-    Ok(CompiledExecutables { prefill, decode })
+    Ok(CompiledExecutables {
+        prefill,
+        decode,
+        moe_expert_prefill,
+        moe_expert_decode,
+    })
 }

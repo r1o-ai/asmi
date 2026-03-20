@@ -48,8 +48,61 @@ fn load_ffn_weights(shards: &[SafeTensors], layer_prefix: &str) -> FfnWeights {
     }
 }
 
+/// Load FFN weights, dispatching to Dense or MoE depending on config.
+fn load_ffn_variant(shards: &[SafeTensors], layer_prefix: &str, config: &QwenConfig, layer_idx: usize) -> crate::weights::layer_weights::FfnVariant {
+    let is_moe = config.num_experts.unwrap_or(0) > 0 &&
+                 config.decoder_sparse_step > 0 &&
+                 layer_idx % config.decoder_sparse_step == 0;
+
+    if is_moe {
+        let num_experts = config.num_experts.unwrap();
+        let gate_weight = tensor_from_shards(shards, &format!("{layer_prefix}.mlp.gate.weight"));
+
+        let shared_expert = FfnWeights {
+            gate_proj_weight: tensor_from_shards(shards, &format!("{layer_prefix}.mlp.shared_expert.gate_proj.weight")),
+            up_proj_weight: tensor_from_shards(shards, &format!("{layer_prefix}.mlp.shared_expert.up_proj.weight")),
+            down_proj_weight: tensor_from_shards(shards, &format!("{layer_prefix}.mlp.shared_expert.down_proj.weight")),
+        };
+
+        let shared_expert_gate_weight = try_tensor_from_shards(shards, &format!("{layer_prefix}.mlp.shared_expert_gate.weight"));
+
+        let mut experts = Vec::with_capacity(num_experts);
+        for i in 0..num_experts {
+            let gate_proj_weight = try_tensor_from_shards(shards, &format!("{layer_prefix}.mlp.experts.{i}.gate_proj.weight"));
+            let up_proj_weight = try_tensor_from_shards(shards, &format!("{layer_prefix}.mlp.experts.{i}.up_proj.weight"));
+
+            if gate_proj_weight.is_none() {
+                // If not found, check fused
+                if let Some(_fused) = try_tensor_from_shards(shards, &format!("{layer_prefix}.mlp.experts.{i}.gate_up_proj.weight")) {
+                    panic!("Fused gate_up_proj not fully implemented yet for expert {i}");
+                }
+            }
+
+            experts.push(FfnWeights {
+                gate_proj_weight: gate_proj_weight.unwrap_or_else(|| panic!("Missing gate_proj.weight for expert {i}")),
+                up_proj_weight: up_proj_weight.unwrap_or_else(|| panic!("Missing up_proj.weight for expert {i}")),
+                down_proj_weight: tensor_from_shards(shards, &format!("{layer_prefix}.mlp.experts.{i}.down_proj.weight")),
+            });
+        }
+
+        crate::weights::layer_weights::FfnVariant::Moe(crate::weights::layer_weights::MoeWeights {
+            gate_weight,
+            shared_expert,
+            shared_expert_gate_weight,
+            experts,
+        })
+    } else {
+        crate::weights::layer_weights::FfnVariant::Dense(load_ffn_weights(shards, layer_prefix))
+    }
+}
+
 /// Load full (quadratic) attention layer weights.
-fn load_full_attention_layer(shards: &[SafeTensors], layer_prefix: &str) -> FullAttentionWeights {
+fn load_full_attention_layer(
+    shards: &[SafeTensors],
+    layer_prefix: &str,
+    config: &QwenConfig,
+    layer_idx: usize,
+) -> FullAttentionWeights {
     FullAttentionWeights {
         input_layernorm_weight: tensor_from_shards(
             shards,
@@ -95,7 +148,7 @@ fn load_full_attention_layer(shards: &[SafeTensors], layer_prefix: &str) -> Full
             shards,
             &format!("{layer_prefix}.post_attention_layernorm.weight"),
         ),
-        ffn: load_ffn_weights(shards, layer_prefix),
+        ffn: load_ffn_variant(shards, layer_prefix, config, layer_idx),
     }
 }
 
@@ -103,6 +156,8 @@ fn load_full_attention_layer(shards: &[SafeTensors], layer_prefix: &str) -> Full
 fn load_linear_attention_layer(
     shards: &[SafeTensors],
     layer_prefix: &str,
+    config: &QwenConfig,
+    layer_idx: usize,
 ) -> LinearAttentionWeights {
     LinearAttentionWeights {
         input_layernorm_weight: tensor_from_shards(
@@ -165,7 +220,7 @@ fn load_linear_attention_layer(
             shards,
             &format!("{layer_prefix}.post_attention_layernorm.weight"),
         ),
-        ffn: load_ffn_weights(shards, layer_prefix),
+        ffn: load_ffn_variant(shards, layer_prefix, config, layer_idx),
     }
 }
 
@@ -180,9 +235,9 @@ pub fn load_weights(shards: &[SafeTensors], config: &QwenConfig) -> ModelWeights
         .map(|i| {
             let layer_prefix = format!("model.layers.{i}");
             if config.is_full_attention(i) {
-                LayerWeights::FullAttention(load_full_attention_layer(shards, &layer_prefix))
+                LayerWeights::FullAttention(load_full_attention_layer(shards, &layer_prefix, config, i))
             } else {
-                LayerWeights::LinearAttention(load_linear_attention_layer(shards, &layer_prefix))
+                LayerWeights::LinearAttention(load_linear_attention_layer(shards, &layer_prefix, config, i))
             }
         })
         .collect();
