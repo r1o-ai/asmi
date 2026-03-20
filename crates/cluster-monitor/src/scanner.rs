@@ -1166,33 +1166,6 @@ pub fn parse_v1_models_metadata(json: &str) -> Vec<ModelServerMetadata> {
         .unwrap_or_default()
 }
 
-/// Parse Ollama `/api/tags` JSON response into model metadata.
-///
-/// Ollama returns: `{ "models": [{ "name": "llama3:8b", ... }] }`
-pub fn parse_ollama_tags(json: &str) -> Vec<ModelServerMetadata> {
-    let value: serde_json::Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    value
-        .get("models")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let name = item.get("name")?.as_str()?.to_string();
-                    Some(ModelServerMetadata {
-                        id: name,
-                        context_length: None,
-                        max_tokens: None,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Parse ping output for round-trip latency in ms.
 fn parse_ping_latency(output: &str) -> Option<f64> {
     // macOS ping: "round-trip min/avg/max/stddev = 0.123/0.456/0.789/0.012 ms"
@@ -1644,27 +1617,6 @@ mod tests {
     #[test]
     fn test_parse_v1_models_metadata_invalid_json() {
         let models = parse_v1_models_metadata("not json");
-        assert!(models.is_empty());
-    }
-
-    #[test]
-    fn test_parse_ollama_tags() {
-        let json = r#"{"models":[{"name":"llama3:8b","model":"llama3:8b","size":4661224676},{"name":"qwen2:7b","model":"qwen2:7b","size":3825819519}]}"#;
-        let models = parse_ollama_tags(json);
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "llama3:8b");
-        assert_eq!(models[1].id, "qwen2:7b");
-    }
-
-    #[test]
-    fn test_parse_ollama_tags_empty() {
-        let models = parse_ollama_tags(r#"{"models":[]}"#);
-        assert!(models.is_empty());
-    }
-
-    #[test]
-    fn test_parse_ollama_tags_invalid() {
-        let models = parse_ollama_tags("not json");
         assert!(models.is_empty());
     }
 }

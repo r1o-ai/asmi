@@ -153,10 +153,6 @@ pub enum ProcessFramework {
     MlxLaunch,
     #[serde(rename = "mlx-audio")]
     MlxAudio,
-    #[serde(rename = "llama-cpp")]
-    LlamaCpp,
-    #[serde(rename = "ollama")]
-    Ollama,
     #[serde(rename = "watchdog")]
     Watchdog,
     #[serde(rename = "unknown")]
@@ -172,8 +168,6 @@ impl fmt::Display for ProcessFramework {
             Self::VllmMlx => write!(f, "vllm-mlx"),
             Self::MlxLaunch => write!(f, "mlx-dist"),
             Self::MlxAudio => write!(f, "mlx-audio"),
-            Self::LlamaCpp => write!(f, "llama-cpp"),
-            Self::Ollama => write!(f, "ollama"),
             Self::Watchdog => write!(f, "watchdog"),
             Self::Unknown => write!(f, "unknown"),
         }
@@ -841,7 +835,7 @@ impl ServeEngine {
                 health_endpoints: &["/health", "/models"],
             },
             Self::VllmMlx => EngineConfig {
-                binary: "vllm",
+                binary: "vllm-mlx",
                 binary_args: &["serve"],
                 uvicorn_app: None,
                 model_flag: Some("--model"),

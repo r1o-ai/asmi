@@ -108,11 +108,10 @@ fn parse_hw_identity(text: &str) -> (Option<String>, Option<String>, Option<Stri
     (chip, serial, model)
 }
 
-/// Also captures mlx.launch (distributed launcher), mlx_lm.share, mlx_audio,
-/// llama.cpp (llama-server/llama-cli), and ollama.
+/// Also captures mlx.launch (distributed launcher), mlx_lm.share, mlx_audio.
 /// JACCL detection: --backend jaccl in args, or ps -E showing MLX_JACCL env vars.
 const CMD_PS_MLX: &str =
-    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch|mlx_audio|llama-server|llama-cli|ollama' | grep -v grep";
+    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch|mlx_audio' | grep -v grep";
 
 /// RDMA status + ifconfig in one command to minimize SSH connections.
 const CMD_RDMA_NET: &str =
@@ -578,18 +577,13 @@ async fn probe_model_endpoints(
     let probes: Vec<_> = processes
         .iter()
         .enumerate()
-        .filter_map(|(i, p)| p.port.map(|port| (i, port, p.framework)))
-        .map(|(i, port, framework)| {
+        .filter_map(|(i, p)| p.port.map(|port| (i, port)))
+        .map(|(i, port)| {
             let hostname = hostname.to_string();
             let config = config.clone();
             let client = client.clone();
             async move {
-                // Ollama uses /api/tags instead of /v1/models
-                let endpoint = if framework == ProcessFramework::Ollama {
-                    "/api/tags"
-                } else {
-                    "/v1/models"
-                };
+                let endpoint = "/v1/models";
 
                 let models = if is_local {
                     if let Some(client) = client {
@@ -598,11 +592,7 @@ async fn probe_model_endpoints(
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.text().await {
                                     Ok(json) => {
-                                        if framework == ProcessFramework::Ollama {
-                                            crate::scanner::parse_ollama_tags(&json)
-                                        } else {
-                                            crate::scanner::parse_v1_models_metadata(&json)
-                                        }
+                                        crate::scanner::parse_v1_models_metadata(&json)
                                     }
                                     Err(_) => Vec::new(),
                                 }
@@ -623,11 +613,7 @@ async fn probe_model_endpoints(
                     ).await;
                     match result {
                         Ok(Ok(ref r)) if r.has_output() => {
-                            if framework == ProcessFramework::Ollama {
-                                crate::scanner::parse_ollama_tags(&r.stdout)
-                            } else {
-                                crate::scanner::parse_v1_models_metadata(&r.stdout)
-                            }
+                            crate::scanner::parse_v1_models_metadata(&r.stdout)
                         }
                         _ => Vec::new(),
                     }
@@ -881,10 +867,6 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
             ProcessFramework::VllmMlx
         } else if command.contains("mlx_audio") {
             ProcessFramework::MlxAudio
-        } else if command.contains("llama-server") || command.contains("llama-cli") {
-            ProcessFramework::LlamaCpp
-        } else if command.contains("ollama") {
-            ProcessFramework::Ollama
         } else {
             continue; // Not a recognised ML process
         };
@@ -893,18 +875,8 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
         let cpu_percent: f64 = cap[3].parse().unwrap_or(0.0);
         let mem_percent: f64 = cap[4].parse().unwrap_or(0.0);
 
-        // Extract model path — llama.cpp uses -m, others use --model
-        let model = extract_flag_value(command, "--model")
-            .or_else(|| {
-                if framework == ProcessFramework::LlamaCpp {
-                    extract_flag_value(command, "-m")
-                } else if framework == ProcessFramework::Ollama {
-                    // `ollama run <model>` — model is the arg after "run"
-                    extract_flag_value(command, "run")
-                } else {
-                    None
-                }
-            });
+        // Extract model path
+        let model = extract_flag_value(command, "--model");
 
         // Simplify model path to just the model name (last path component)
         let model = model.map(|m| {
@@ -914,18 +886,9 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
                 .to_string()
         });
 
-        // Extract port — llama.cpp also uses --port, ollama defaults to 11434
+        // Extract port
         let port: Option<u16> = extract_flag_value(command, "--port")
-            .and_then(|p| p.parse().ok())
-            .or_else(|| {
-                if framework == ProcessFramework::Ollama
-                    && command.contains("ollama serve")
-                {
-                    Some(11434)
-                } else {
-                    None
-                }
-            });
+            .and_then(|p| p.parse().ok());
 
         // Detect distributed backend from --backend flag
         let distributed = extract_flag_value(command, "--backend").and_then(|b| {
@@ -1603,45 +1566,6 @@ mod tests {
         assert_eq!(procs[0].framework, ProcessFramework::MlxAudio);
         assert_eq!(procs[0].model.as_deref(), Some("kokoro-tts"));
         assert_eq!(procs[0].port, Some(8030));
-    }
-
-    #[test]
-    fn test_parse_ps_llama_server() {
-        let line = "ma  33333  25.0  40.0 100000 200000  ??  S  7:00AM  1:30.00 llama-server -m /models/llama3-8b.gguf --port 8080 --host 0.0.0.0";
-        let procs = parse_ps_mlx(line);
-        assert_eq!(procs.len(), 1);
-        assert_eq!(procs[0].framework, ProcessFramework::LlamaCpp);
-        assert_eq!(procs[0].model.as_deref(), Some("llama3-8b.gguf"));
-        assert_eq!(procs[0].port, Some(8080));
-    }
-
-    #[test]
-    fn test_parse_ps_llama_cli() {
-        let line = "ma  33334  50.0  35.0 100000 200000  ??  R  7:01AM  0:05.00 llama-cli -m /models/qwen3-8b.gguf --temp 0.7";
-        let procs = parse_ps_mlx(line);
-        assert_eq!(procs.len(), 1);
-        assert_eq!(procs[0].framework, ProcessFramework::LlamaCpp);
-        assert_eq!(procs[0].model.as_deref(), Some("qwen3-8b.gguf"));
-        assert_eq!(procs[0].port, None); // CLI mode, no port
-    }
-
-    #[test]
-    fn test_parse_ps_ollama_serve() {
-        let line = "ma  22222  3.0  5.0 100000 200000  ??  S  8:00AM  0:10.00 ollama serve";
-        let procs = parse_ps_mlx(line);
-        assert_eq!(procs.len(), 1);
-        assert_eq!(procs[0].framework, ProcessFramework::Ollama);
-        assert_eq!(procs[0].port, Some(11434));
-        assert_eq!(procs[0].model, None);
-    }
-
-    #[test]
-    fn test_parse_ps_ollama_run() {
-        let line = "ma  22223  80.0  60.0 100000 200000  ??  R  8:01AM  2:00.00 ollama run llama3:70b";
-        let procs = parse_ps_mlx(line);
-        assert_eq!(procs.len(), 1);
-        assert_eq!(procs[0].framework, ProcessFramework::Ollama);
-        assert_eq!(procs[0].model.as_deref(), Some("llama3:70b"));
     }
 
     #[test]
