@@ -54,7 +54,13 @@ pub async fn ssh_run(
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
-        .arg("LogLevel=ERROR");
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("ControlMaster=auto")
+        .arg("-o")
+        .arg("ControlPath=/tmp/asmi-%r@%h:%p")
+        .arg("-o")
+        .arg("ControlPersist=5m");
 
     if let Some(ref identity) = config.ssh_identity {
         cmd.arg("-i").arg(identity);

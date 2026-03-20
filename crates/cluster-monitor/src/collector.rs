@@ -254,8 +254,35 @@ async fn collect_via_ssh(
     };
 
     // 1. Run commands in parallel (+ hardware identity for remote nodes)
-    let (power_res, mem_res, ps_res, jaccl_res, rdma_net_res, iostat_res) = tokio::join!(
-        run(CMD_POWERMETRICS),
+    let power_fut = async {
+        if is_local {
+            if let Ok(stream) = tokio::net::UnixStream::connect("/var/run/eu.r1o.asmi.sock").await {
+                let mut json_str = String::new();
+                use tokio::io::AsyncBufReadExt;
+                let mut reader = tokio::io::BufReader::new(stream);
+                if reader.read_line(&mut json_str).await.is_ok() {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        return PowerMetricsResult {
+                            cpu_mw: parsed["cpu_mw"].as_f64().unwrap_or(0.0),
+                            gpu_mw: parsed["gpu_mw"].as_f64().unwrap_or(0.0),
+                            ane_mw: parsed["ane_mw"].as_f64().unwrap_or(0.0),
+                            cpu_percent: parsed["cpu_percent"].as_f64().unwrap_or(0.0),
+                            gpu_percent: parsed["gpu_percent"].as_f64().unwrap_or(0.0),
+                            gpu_frequency_mhz: parsed["gpu_frequency_mhz"].as_u64().map(|v| v as u32),
+                            cpu_clusters: Vec::new(), // In a full implementation, we'd deserialize this
+                        };
+                    }
+                }
+            }
+        }
+        match run(CMD_POWERMETRICS).await {
+            Ok(r) if r.has_output() => parse_powermetrics_text(&r.stdout),
+            _ => PowerMetricsResult::default(),
+        }
+    };
+
+    let (power, mem_res, ps_res, jaccl_res, rdma_net_res, iostat_res) = tokio::join!(
+        power_fut,
         run(CMD_VMSTAT_SYSCTL),
         run(CMD_PS_MLX),
         run(CMD_JACCL_ENV),
@@ -272,23 +299,7 @@ async fn collect_via_ssh(
         }
     };
 
-    // 2. Parse powermetrics
-    let power = match &power_res {
-        Ok(r) if r.has_output() => {
-            debug!(hostname, "powermetrics OK");
-            parse_powermetrics_text(&r.stdout)
-        }
-        Ok(r) => {
-            debug!(hostname, stderr = r.stderr.as_str(), "powermetrics empty/failed");
-            PowerMetricsResult::default()
-        }
-        Err(e) => {
-            warn!(hostname, error = %e, "powermetrics command error");
-            PowerMetricsResult::default()
-        }
-    };
-
-    // 3. Parse hostname -s + vm_stat + sysctl
+    // 2. Parse hostname -s + vm_stat + sysctl
     // The combined command outputs: hostname\n---HOSTNAME---\nvm_stat...\n---MEMSIZE---\nmemsize
     let (resolved_hostname, mem_stats) = match &mem_res {
         Ok(r) if r.has_output() => {

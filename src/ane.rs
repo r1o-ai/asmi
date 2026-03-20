@@ -70,7 +70,7 @@ pub async fn eval_handler(
 
     if !ane.enabled {
         let body = Json(serde_json::json!({"error": "ANE compute not enabled. Start daemon with --experimental-ane"}));
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
     }
 
     #[cfg(not(feature = "ane"))]
@@ -83,7 +83,7 @@ pub async fn eval_handler(
     {
         if ane.compile_budget_remaining() == 0 {
             let body = Json(serde_json::json!({"error": "ANE compile budget exhausted (~119 per process). Restart daemon to reset."}));
-            (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
         }
 
         let body = Json(serde_json::json!({"error": "ANE eval endpoint is scaffolded but not yet implemented. See /ane/compute for subsystem status."}));
@@ -97,7 +97,7 @@ pub async fn probe_handler(
 ) -> axum::response::Response {
     if !state.ane.enabled {
         let body = Json(serde_json::json!({"error": "ANE compute not enabled. Start daemon with --experimental-ane"}));
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
     }
 
     #[cfg(not(feature = "ane"))]

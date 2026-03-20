@@ -22,6 +22,10 @@ description = "Apple Silicon cluster monitor — like nvidia-smi + htop for Mac"
 name = "asmi"
 path = "src/main.rs"
 
+[[bin]]
+name = "asmi-helper"
+path = "src/helper.rs"
+
 [dependencies]
 asmi-core = { path = "crates/cluster-monitor" }
 tokio = { version = "1", features = ["full"] }
