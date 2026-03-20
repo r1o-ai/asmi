@@ -66,6 +66,59 @@ def _resolve_base(host: Optional[str]) -> str:
     return f"http://{host}:9090"
 
 
+async def _post_flight_check(base: str, port: Optional[int], is_share: bool = False) -> dict:
+    """Verify a server/share actually stopped by checking status + processes.
+
+    Returns a dict with:
+      - verified: bool — True if the server is confirmed stopped
+      - state: str — current server state from /serve/status
+      - orphan_processes: list — any MLX processes still running on that port
+      - ram_reclaimed: bool — True if no footprint detected for that port
+    """
+    check = {
+        "verified": False,
+        "state": "unknown",
+        "orphan_processes": [],
+        "ram_reclaimed": True,
+    }
+
+    try:
+        if is_share:
+            status = await _get("/serve/share/status", base)
+            state = status.get("state", "unknown")
+            check["state"] = state
+            check["verified"] = state in ("idle", "error")
+        else:
+            port_param = f"?port={port}" if port else ""
+            status = await _get(f"/serve/status{port_param}", base)
+            # Single-port query returns ServeStatus, all-ports returns {servers: [...]}
+            if "servers" in status:
+                servers = status["servers"]
+                target = [s for s in servers if s.get("port") == (port or 19080)]
+                state = target[0]["state"] if target else "not_found"
+            else:
+                state = status.get("state", "unknown")
+            check["state"] = state
+            check["verified"] = state in ("idle", "error")
+    except Exception as e:
+        check["state"] = f"check_failed: {e}"
+
+    # Check for orphan processes still bound to the port
+    try:
+        procs = await _get("/processes", base)
+        proc_list = procs if isinstance(procs, list) else procs.get("processes", [])
+        target_port = port or 19080
+        orphans = [p for p in proc_list if p.get("port") == target_port]
+        if orphans:
+            check["orphan_processes"] = orphans
+            check["verified"] = False
+            check["ram_reclaimed"] = False
+    except Exception:
+        pass
+
+    return check
+
+
 # ─── Tools ───────────────────────────────────────────────────────────────────
 
 
@@ -243,7 +296,15 @@ async def asmi_serve(
             body = {"model_path": model}
             return json.dumps(await _post(f"/serve/load{port_param}", body, base), indent=2)
         elif action == "stop":
-            return json.dumps(await _post(f"/serve/stop{port_param}", base=base), indent=2)
+            stop_result = await _post(f"/serve/stop{port_param}", base=base)
+            # Post-flight check: verify the server actually stopped
+            import asyncio
+            await asyncio.sleep(1)
+            post_flight = await _post_flight_check(base, port)
+            return json.dumps({
+                "stop_result": stop_result,
+                "post_flight": post_flight,
+            }, indent=2)
         elif action == "reload":
             return json.dumps(await _post(f"/serve/reload{port_param}", base=base), indent=2)
         elif action == "share":
@@ -252,7 +313,14 @@ async def asmi_serve(
         elif action == "share_status":
             return json.dumps(await _get("/serve/share/status", base), indent=2)
         elif action == "share_stop":
-            return json.dumps(await _post("/serve/share/stop", base=base), indent=2)
+            stop_result = await _post("/serve/share/stop", base=base)
+            import asyncio
+            await asyncio.sleep(1)
+            post_flight = await _post_flight_check(base, None, is_share=True)
+            return json.dumps({
+                "stop_result": stop_result,
+                "post_flight": post_flight,
+            }, indent=2)
         else:
             return f"Unknown action '{action}'. Use: status, load, stop, reload, share, share_status, share_stop"
     except Exception as e:
