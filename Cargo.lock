@@ -149,11 +149,15 @@ dependencies = [
 name = "asmi-core"
 version = "0.1.0"
 dependencies = [
+ "ane-runtime",
+ "cc",
  "chrono",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "dirs",
  "futures",
+ "libc",
+ "objc2-io-surface",
  "regex",
  "reqwest",
  "serde",
