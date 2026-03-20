@@ -212,30 +212,18 @@ async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool
         } else {
             None
         };
-        // Still run RDMA check via SSH (changes rarely, daemon doesn't expose it)
-        let rdma = {
-            let rdma_cmd = "rdma_ctl status 2>/dev/null; \
-                            echo '---'; \
-                            ibv_devices 2>/dev/null; \
-                            echo '---'; \
-                            ibv_devinfo 2>/dev/null";
-            match ssh_run(hostname, rdma_cmd, config).await {
-                Ok(ref r) if r.has_output() => Some(parse_rdma_status(&r.stdout)),
-                _ => None,
-            }
-        };
         return ScanResult {
             hostname: snap.hostname,
             reachable: true,
             ssh_ok: true,
-            chip: None,       // Not in NodeSnapshot; SSH probe below fills this
+            chip: snap.chip_model,
             ram_gb,
             gpu_cores: None,  // Not in NodeSnapshot
-            rdma,
-            mlx_servers: snap.processes.iter().filter_map(|p| {
+            rdma: snap.rdma,
+            mlx_servers: snap.processes.into_iter().filter_map(|p| {
                 p.port.map(|port| MlxServerInfo {
                     port,
-                    models: p.server_models.iter().map(|m| m.id.clone()).collect(),
+                    models: p.server_models.into_iter().map(|m| m.id).collect(),
                     engine: p.framework,
                 })
             }).collect(),
@@ -274,28 +262,75 @@ async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool
         };
     }
 
-    // 3. SSH hardware probe (daemon not running — new/undeployed node)
-    let hw_cmd = "hostname -s 2>/dev/null; \
-                  sysctl -n hw.memsize 2>/dev/null; \
-                  sysctl -n machdep.cpu.brand_string 2>/dev/null; \
-                  sysctl -n hw.ncpu 2>/dev/null";
-    let hw_result = ssh_run(hostname, hw_cmd, config).await;
-    let (ssh_ok, resolved_hostname, chip, ram_gb, gpu_cores) = match hw_result {
+    // 3. Batched SSH probe: hardware + RDMA + process scan in a SINGLE SSH call.
+    //    Previously this was 3 sequential SSH sessions (~200-500ms each for TCP+auth).
+    //    Now we combine all probes with section delimiters (===HW===, ===RDMA===,
+    //    ===PS===) and parse the combined output.
+    let batched_cmd = "\
+        echo '===HW==='; \
+        hostname -s 2>/dev/null; \
+        echo '---'; \
+        sysctl -n hw.memsize 2>/dev/null; \
+        echo '---'; \
+        sysctl -n machdep.cpu.brand_string 2>/dev/null; \
+        echo '---'; \
+        sysctl -n hw.ncpu 2>/dev/null; \
+        echo '===RDMA==='; \
+        rdma_ctl status 2>/dev/null; \
+        echo '---'; \
+        ibv_devices 2>/dev/null; \
+        echo '---'; \
+        ibv_devinfo 2>/dev/null; \
+        echo '===PS==='; \
+        ps aux 2>/dev/null | grep -E 'mlx_lm|mlx_vlm|vllm_mlx' | grep -v grep";
+    let batched_result = ssh_run(hostname, batched_cmd, config).await;
+
+    let (ssh_ok, resolved_hostname, chip, ram_gb, gpu_cores, rdma, processes) =
+        match batched_result {
         Ok(ref r) if r.success => {
-            let lines: Vec<&str> = r.stdout.lines().collect();
-            let resolved = lines.first()
+            let output = &r.stdout;
+
+            // --- Parse HW section (between ===HW=== and ===RDMA===) ---
+            let hw_start = output.find("===HW===").map(|i| i + 8).unwrap_or(0);
+            let hw_end = output.find("===RDMA===").unwrap_or(output.len());
+            let hw_text = output[hw_start..hw_end].trim();
+            // HW values are separated by --- delimiters: hostname, memsize, cpu_brand, ncpu
+            let hw_parts: Vec<&str> = hw_text.split("\n---\n").collect();
+            let resolved = hw_parts.first()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let mem_bytes: Option<u64> = lines.get(1).and_then(|s| s.trim().parse().ok());
+            let mem_bytes: Option<u64> = hw_parts.get(1).and_then(|s| s.trim().parse().ok());
             let ram = mem_bytes.map(|b| b / (1024 * 1024 * 1024));
-            let chip_name = lines.get(2).map(|s| s.trim().to_string());
-            let ncpu: Option<u32> = lines.get(3).and_then(|s| s.trim().parse().ok());
-            (true, resolved, chip_name, ram, ncpu)
+            let chip_name = hw_parts.get(2).map(|s| s.trim().to_string());
+            let ncpu: Option<u32> = hw_parts.get(3).and_then(|s| s.trim().parse().ok());
+
+            // --- Parse RDMA section (between ===RDMA=== and ===PS===) ---
+            // Feed the raw section text to parse_rdma_status, which expects
+            // rdma_ctl / ibv_devices / ibv_devinfo separated by \n---\n.
+            let rdma_start = output.find("===RDMA===").map(|i| i + 10).unwrap_or(output.len());
+            let rdma_end = output.find("===PS===").unwrap_or(output.len());
+            let rdma_text = output[rdma_start..rdma_end].trim();
+            let rdma_status = if rdma_text.is_empty() {
+                None
+            } else {
+                Some(parse_rdma_status(rdma_text))
+            };
+
+            // --- Parse PS section (after ===PS===) ---
+            let ps_start = output.find("===PS===").map(|i| i + 8).unwrap_or(output.len());
+            let ps_text = output[ps_start..].trim();
+            let procs = if ps_text.is_empty() {
+                Vec::new()
+            } else {
+                parse_mlx_processes(ps_text)
+            };
+
+            (true, resolved, chip_name, ram, ncpu, rdma_status, procs)
         }
-        Ok(_) => (false, None, None, None, None),
+        Ok(_) => (false, None, None, None, None, None, Vec::new()),
         Err(e) => {
-            debug!(hostname, error = %e, "SSH hardware probe failed");
-            (false, None, None, None, None)
+            debug!(hostname, error = %e, "SSH batched probe failed");
+            (false, None, None, None, None, None, Vec::new())
         }
     };
 
@@ -303,47 +338,61 @@ async fn scan_node_inner(hostname: &str, config: &ClusterConfig, skip_ping: bool
     let final_hostname = resolved_hostname
         .unwrap_or_else(|| hostname.to_string());
 
-    // 3. RDMA check
-    let rdma = if ssh_ok {
-        let rdma_cmd = "rdma_ctl status 2>/dev/null; \
-                        echo '---'; \
-                        ibv_devices 2>/dev/null; \
-                        echo '---'; \
-                        ibv_devinfo 2>/dev/null";
-        match ssh_run(hostname, rdma_cmd, config).await {
-            Ok(ref r) if r.has_output() => Some(parse_rdma_status(&r.stdout)),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    // 4. Process scan for MLX servers
+    // 4. Batch model endpoint probes into a SINGLE SSH call for all discovered ports.
+    //    Each port's curl response is delimited by ===PORT_NNNN=== markers so we
+    //    can split the combined output and feed each section to parse_v1_models_metadata.
     let mut mlx_servers: Vec<MlxServerInfo> = Vec::new();
     if ssh_ok {
-        let ps_cmd = "ps aux 2>/dev/null | grep -E 'mlx_lm|mlx_vlm|vllm_mlx' | grep -v grep";
-        if let Ok(ref r) = ssh_run(hostname, ps_cmd, config).await {
-            if r.has_output() {
-                let processes = parse_mlx_processes(&r.stdout);
-                // 5. For each discovered port, probe /v1/models for full metadata
-                for proc in &processes {
-                    if let Some(port) = proc.port {
-                        let curl_cmd = format!(
-                            "curl -s --connect-timeout 2 http://127.0.0.1:{}/v1/models 2>/dev/null",
-                            port
-                        );
-                        let server_models = match ssh_run(hostname, &curl_cmd, config).await {
-                            Ok(ref r) if r.has_output() => parse_v1_models_metadata(&r.stdout),
-                            _ => Vec::new(),
-                        };
-                        let models: Vec<String> = server_models.iter().map(|m| m.id.clone()).collect();
-                        mlx_servers.push(MlxServerInfo {
-                            port,
-                            models,
-                            engine: proc.framework,
-                        });
+        let ports_and_frameworks: Vec<(u16, ProcessFramework)> = processes
+            .iter()
+            .filter_map(|p| p.port.map(|port| (port, p.framework)))
+            .collect();
+
+        if !ports_and_frameworks.is_empty() {
+            // Build a single SSH command that probes ALL ports with section delimiters
+            let curl_parts: Vec<String> = ports_and_frameworks
+                .iter()
+                .map(|(port, _)| {
+                    format!(
+                        "echo '===PORT_{port}==='; \
+                         curl -s --connect-timeout 2 http://127.0.0.1:{port}/v1/models 2>/dev/null"
+                    )
+                })
+                .collect();
+            let curl_cmd = curl_parts.join("; ");
+
+            let port_output: Option<String> = match ssh_run(hostname, &curl_cmd, config).await {
+                Ok(ref r) if r.has_output() => Some(r.stdout.clone()),
+                _ => None,
+            };
+
+            // Parse each port's section from the combined output
+            for (port, framework) in &ports_and_frameworks {
+                let models = if let Some(ref output) = port_output {
+                    let marker = format!("===PORT_{port}===");
+                    if let Some(section_start) = output.find(&marker).map(|i| i + marker.len()) {
+                        // Find end: next ===PORT_ marker or end of output
+                        let section_end = output[section_start..]
+                            .find("===PORT_")
+                            .map(|i| section_start + i)
+                            .unwrap_or(output.len());
+                        let section_text = output[section_start..section_end].trim();
+                        parse_v1_models_metadata(section_text)
+                            .iter()
+                            .map(|m| m.id.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
                     }
-                }
+                } else {
+                    Vec::new()
+                };
+
+                mlx_servers.push(MlxServerInfo {
+                    port: *port,
+                    models,
+                    engine: *framework,
+                });
             }
         }
     }
@@ -546,25 +595,33 @@ pub async fn scan_cluster(config: &ClusterConfig, events: &EventSink) -> Vec<Sca
         }
     }
 
-    // Post-scan: check Thunderbolt network service names on each SSH-reachable node.
+    // Post-scan: check Thunderbolt network service names concurrently on each SSH-reachable node.
     // Uses `networksetup -listallnetworkservices` to detect duplicates / non-r1o prefixes.
-    for result in &results {
-        if !result.ssh_ok {
-            continue;
-        }
-        let tb_cmd = "networksetup -listallnetworkservices 2>/dev/null | grep -i thunder";
-        let tb_services = match ssh_run(&result.hostname, tb_cmd, config).await {
-            Ok(ref r) if r.has_output() => parse_thunderbolt_services(&r.stdout),
-            _ => continue,
-        };
-        let issues = find_thunderbolt_issues(&tb_services);
-        if !issues.is_empty() {
-            events.emit(ClusterEvent::ThunderboltServiceIssue {
-                hostname: result.hostname.clone(),
-                issues,
-            });
-        }
-    }
+    let tb_futures: Vec<_> = results
+        .iter()
+        .filter(|r| r.ssh_ok)
+        .map(|result| {
+            let hostname = result.hostname.clone();
+            let config = config.clone();
+            let events = events.clone();
+            async move {
+                let tb_cmd = "networksetup -listallnetworkservices 2>/dev/null | grep -i thunder";
+                let tb_services = match ssh_run(&hostname, tb_cmd, &config).await {
+                    Ok(ref r) if r.has_output() => parse_thunderbolt_services(&r.stdout),
+                    _ => return,
+                };
+                let issues = find_thunderbolt_issues(&tb_services);
+                if !issues.is_empty() {
+                    events.emit(ClusterEvent::ThunderboltServiceIssue {
+                        hostname,
+                        issues,
+                    });
+                }
+            }
+        })
+        .collect();
+
+    futures::future::join_all(tb_futures).await;
 
     let online = results.iter().filter(|r| r.ssh_ok).count();
     events.emit(ClusterEvent::ScanComplete { online, total: results.len() });

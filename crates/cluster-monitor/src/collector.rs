@@ -565,6 +565,16 @@ async fn probe_model_endpoints(
     is_local: bool,
     processes: &mut [ProcessInfo],
 ) {
+    let client = if is_local {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()
+    } else {
+        None
+    };
+
     let probes: Vec<_> = processes
         .iter()
         .enumerate()
@@ -572,6 +582,7 @@ async fn probe_model_endpoints(
         .map(|(i, port, framework)| {
             let hostname = hostname.to_string();
             let config = config.clone();
+            let client = client.clone();
             async move {
                 // Ollama uses /api/tags instead of /v1/models
                 let endpoint = if framework == ProcessFramework::Ollama {
@@ -579,29 +590,47 @@ async fn probe_model_endpoints(
                 } else {
                     "/v1/models"
                 };
-                let curl_cmd = format!(
-                    "curl -s --connect-timeout 2 --max-time 5 http://127.0.0.1:{}{} 2>/dev/null",
-                    port, endpoint
-                );
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    async {
-                        if is_local {
-                            local_run(&curl_cmd).await
-                        } else {
-                            ssh_run(&hostname, &curl_cmd, &config).await
+
+                let models = if is_local {
+                    if let Some(client) = client {
+                        let url = format!("http://127.0.0.1:{}{}", port, endpoint);
+                        match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.text().await {
+                                    Ok(json) => {
+                                        if framework == ProcessFramework::Ollama {
+                                            crate::scanner::parse_ollama_tags(&json)
+                                        } else {
+                                            crate::scanner::parse_v1_models_metadata(&json)
+                                        }
+                                    }
+                                    Err(_) => Vec::new(),
+                                }
+                            }
+                            _ => Vec::new(),
                         }
-                    },
-                ).await;
-                let models = match result {
-                    Ok(Ok(ref r)) if r.has_output() => {
-                        if framework == ProcessFramework::Ollama {
-                            crate::scanner::parse_ollama_tags(&r.stdout)
-                        } else {
-                            crate::scanner::parse_v1_models_metadata(&r.stdout)
-                        }
+                    } else {
+                        Vec::new()
                     }
-                    _ => Vec::new(),
+                } else {
+                    let curl_cmd = format!(
+                        "curl -s --connect-timeout 2 --max-time 5 http://127.0.0.1:{}{} 2>/dev/null",
+                        port, endpoint
+                    );
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(8),
+                        ssh_run(&hostname, &curl_cmd, &config),
+                    ).await;
+                    match result {
+                        Ok(Ok(ref r)) if r.has_output() => {
+                            if framework == ProcessFramework::Ollama {
+                                crate::scanner::parse_ollama_tags(&r.stdout)
+                            } else {
+                                crate::scanner::parse_v1_models_metadata(&r.stdout)
+                            }
+                        }
+                        _ => Vec::new(),
+                    }
                 };
                 (i, models)
             }
