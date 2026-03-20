@@ -253,7 +253,7 @@ async fn poll_metrics(
         s.update_nodes(snapshots);
     }
 
-    let _ = epoch.send_modify(|v| *v += 1);
+    epoch.send_modify(|v| *v += 1);
 }
 
 /// Fast probe of seed/registry hosts only — no discovery overhead.
@@ -274,7 +274,7 @@ async fn run_seed_scan(
         s.update_scan(results);
     }
 
-    let _ = epoch.send_modify(|v| *v += 1);
+    epoch.send_modify(|v| *v += 1);
 }
 
 /// Run a full cluster scan (discover + probe). Merges results into
@@ -294,7 +294,7 @@ async fn run_scan(
         s.merge_scan(results);
     }
 
-    let _ = epoch.send_modify(|v| *v += 1);
+    epoch.send_modify(|v| *v += 1);
 }
 
 #[cfg(test)]

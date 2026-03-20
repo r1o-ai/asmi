@@ -392,10 +392,9 @@ async fn collect_via_ssh(
 
         let port_results = futures::future::join_all(port_futs).await;
         for (pid, actual_port) in port_results {
-            if let Some(proc) = processes.iter_mut().find(|p| p.pid == pid) {
-                if let Some(real_port) = actual_port {
-                    match proc.port {
-                        Some(cli_port) if cli_port != real_port => {
+            if let (Some(proc), Some(real_port)) = (processes.iter_mut().find(|p| p.pid == pid), actual_port) {
+                match proc.port {
+                    Some(cli_port) if cli_port != real_port => {
                             // CLI --port takes priority over lsof. The lsof
                             // port may be an internal IPC socket (e.g. Python
                             // runtime or Metal framework) rather than the
@@ -417,7 +416,6 @@ async fn collect_via_ssh(
                             proc.port = Some(real_port);
                         }
                     }
-                }
             }
         }
     }

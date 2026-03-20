@@ -794,11 +794,9 @@ pub fn parse_ifconfig_bridges(text: &str) -> Vec<(String, String)> {
     for line in text.lines() {
         if let Some(caps) = IFACE_RE.captures(line) {
             current_iface = Some(caps.get(1).unwrap().as_str().to_string());
-        } else if let Some(caps) = INET_LINK_LOCAL_RE.captures(line) {
-            if let Some(ref iface) = current_iface {
-                let ip = caps.get(1).unwrap().as_str().to_string();
-                results.push((iface.clone(), ip));
-            }
+        } else if let (Some(caps), Some(iface)) = (INET_LINK_LOCAL_RE.captures(line), &current_iface) {
+            let ip = caps.get(1).unwrap().as_str().to_string();
+            results.push((iface.clone(), ip));
         }
     }
 
@@ -816,11 +814,9 @@ pub fn parse_ifconfig_all_ips(text: &str) -> HashMap<String, Vec<String>> {
     for line in text.lines() {
         if let Some(caps) = IFACE_RE.captures(line) {
             current_iface = Some(caps.get(1).unwrap().as_str().to_string());
-        } else if let Some(caps) = INET_RE.captures(line) {
-            if let Some(ref iface) = current_iface {
-                let ip = caps.get(1).unwrap().as_str().to_string();
-                results.entry(iface.clone()).or_default().push(ip);
-            }
+        } else if let (Some(caps), Some(iface)) = (INET_RE.captures(line), &current_iface) {
+            let ip = caps.get(1).unwrap().as_str().to_string();
+            results.entry(iface.clone()).or_default().push(ip);
         }
     }
 
@@ -844,10 +840,8 @@ pub fn parse_tailscale_peers(json: &str) -> Vec<DiscoveredPeer> {
     let mut peers = Vec::new();
 
     // Also include Self node
-    if let Some(self_node) = value.get("Self") {
-        if let Some(peer) = extract_tailscale_peer(self_node) {
-            peers.push(peer);
-        }
+    if let Some(peer) = value.get("Self").and_then(extract_tailscale_peer) {
+        peers.push(peer);
     }
 
     // Parse Peer map
@@ -988,9 +982,9 @@ fn parse_ibv_devinfo(text: &str) -> Vec<RdmaDevice> {
             }
             current_device = Some(caps.get(1).unwrap().as_str().to_string());
         } else if let Some(caps) = STATE_RE.captures(line) {
+            let state_str = caps.get(1).unwrap().as_str();
+            let port_state = PortState::from_ibstat(state_str);
             if let Some(name) = current_device.take() {
-                let state_str = caps.get(1).unwrap().as_str();
-                let port_state = PortState::from_ibstat(state_str);
                 devices.push(RdmaDevice { name, port_state });
             }
         }

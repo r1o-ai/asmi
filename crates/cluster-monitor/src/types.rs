@@ -746,8 +746,9 @@ impl fmt::Display for ServeState {
 }
 
 /// ML serving engine variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ServeEngine {
+    #[default]
     #[serde(rename = "mlx_lm")]
     MlxLm,
     #[serde(rename = "mlx_vlm")]
@@ -758,11 +759,6 @@ pub enum ServeEngine {
     MlxLmShare,
 }
 
-impl Default for ServeEngine {
-    fn default() -> Self {
-        Self::MlxLm
-    }
-}
 
 impl fmt::Display for ServeEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -776,18 +772,14 @@ impl fmt::Display for ServeEngine {
 }
 
 /// Distributed vs single-node serving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ServeBackend {
+    #[default]
     Single,
     Jaccl,
 }
 
-impl Default for ServeBackend {
-    fn default() -> Self {
-        Self::Single
-    }
-}
 
 impl fmt::Display for ServeBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

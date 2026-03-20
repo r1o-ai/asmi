@@ -93,7 +93,7 @@ pub fn discover_volumes() -> Vec<DiscoveredVolume> {
 }
 
 /// Get total/available bytes for a path via `df`.
-fn df_bytes(path: &PathBuf) -> (u64, u64) {
+fn df_bytes(path: &std::path::Path) -> (u64, u64) {
     // df -k outputs 1K blocks: Filesystem 1K-blocks Used Available ...
     let output = std::process::Command::new("df")
         .args(["-k", &path.to_string_lossy()])
@@ -149,7 +149,7 @@ pub fn scan_models(dirs: &[PathBuf]) -> Vec<LocalModel> {
         debug!(dir = %dir.display(), "scanning for models");
 
         // Determine volume/tier from path
-        let (volume, tier) = classify_dir(dir, &home, &hf_cache);
+        let (volume, tier) = classify_dir(dir, &hf_cache);
 
         scan_dir_into(dir, &volume, &tier, &mut models);
     }
@@ -165,7 +165,7 @@ pub fn scan_models(dirs: &[PathBuf]) -> Vec<LocalModel> {
 }
 
 /// Classify a scan directory by volume name and storage tier.
-fn classify_dir(dir: &PathBuf, home: &PathBuf, hf_cache: &PathBuf) -> (String, String) {
+fn classify_dir(dir: &std::path::Path, hf_cache: &std::path::Path) -> (String, String) {
     if dir.starts_with(hf_cache) {
         ("hf-cache".into(), "ssd".into())
     } else if dir.starts_with("/Volumes/") {
@@ -175,8 +175,6 @@ fn classify_dir(dir: &PathBuf, home: &PathBuf, hf_cache: &PathBuf) -> (String, S
             .map(|c| c.as_os_str().to_string_lossy().to_string())
             .unwrap_or_else(|| "external".into());
         (vol_name, "external".into())
-    } else if dir.starts_with(home) {
-        ("internal".into(), "ssd".into())
     } else {
         ("internal".into(), "ssd".into())
     }
