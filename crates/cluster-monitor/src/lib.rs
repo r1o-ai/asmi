@@ -44,6 +44,7 @@ pub mod collector;
 pub mod config;
 pub mod ioreport;
 pub mod monitor;
+pub mod ane_bridge;
 pub mod footprint;
 pub mod scanner;
 pub mod ssh;

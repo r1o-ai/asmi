@@ -1347,6 +1347,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/disk", get(disk_handler))
         .route("/network", get(network_handler))
         .route("/ane", get(ane_handler))
+        .route("/ane/compute", get(crate::ane::status_handler))
+        .route("/ane/eval", post(crate::ane::eval_handler))
+        .route("/ane/probe", get(crate::ane::probe_handler))
         // RDMA remote monitoring via Tailscale
         .route("/rdma/check", get(rdma_check_handler))
         .route("/rdma/mesh", get(rdma_mesh_handler))

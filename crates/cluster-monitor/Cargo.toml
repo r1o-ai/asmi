@@ -21,7 +21,16 @@ dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+ane-runtime = { path = "../ane-runtime", optional = true }
+objc2-io-surface = { version = "0.3", optional = true, features = ["IOSurfaceRef"] }
+
+[build-dependencies]
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
+
+[features]
+default = []
+ane = ["dep:ane-runtime", "dep:objc2-io-surface", "dep:cc"]

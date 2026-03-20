@@ -22,7 +22,11 @@ pub struct AneState {
 
 impl AneState {
     pub fn new(enabled: bool) -> Self {
-        let available = enabled && cfg!(feature = "ane");
+        let available = if enabled {
+            asmi_core::ane_bridge::init()
+        } else {
+            false
+        };
         Self {
             enabled,
             available,
