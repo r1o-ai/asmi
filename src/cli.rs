@@ -198,14 +198,13 @@ fn spawn_node_map_updater(
                     let mut nm = node_map.write().await;
                     let mut changed = false;
                     for link in &mut nm.rdma_links {
-                        if link.local_interface == interface {
-                            if link.rdma_device.as_deref() != Some(&rdma_device)
-                                || link.port_state != Some(port_state)
-                            {
-                                link.rdma_device = Some(rdma_device.clone());
-                                link.port_state = Some(port_state);
-                                changed = true;
-                            }
+                        if link.local_interface == interface &&
+                            (link.rdma_device.as_deref() != Some(&rdma_device)
+                                || link.port_state != Some(port_state))
+                        {
+                            link.rdma_device = Some(rdma_device.clone());
+                            link.port_state = Some(port_state);
+                            changed = true;
                         }
                     }
                     if changed {

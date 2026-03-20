@@ -22,7 +22,7 @@ impl RopeTable {
     /// - `max_seq`: maximum sequence length to precompute for
     /// - `theta`: base frequency (10_000_000.0 for Qwen 3.5)
     pub fn new(rope_dim: usize, max_seq: usize, theta: f64) -> Self {
-        debug_assert!(rope_dim % 2 == 0, "rope_dim must be even");
+        debug_assert!(rope_dim.is_multiple_of(2), "rope_dim must be even");
         let half_dim = rope_dim / 2;
         let mut cos = vec![0.0f32; max_seq * half_dim];
         let mut sin = vec![0.0f32; max_seq * half_dim];

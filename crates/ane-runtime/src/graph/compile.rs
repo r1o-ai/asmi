@@ -15,6 +15,7 @@ use super::Graph;
 pub const MIN_SPATIAL_WIDTH: usize = 64;
 
 impl Graph {
+    #[allow(clippy::type_complexity)]
     pub(crate) fn to_ops_and_shapes(&self) -> (Box<[Op]>, Box<[(String, Shape)]>) {
         let mut shapes: Vec<(String, Shape)> = self
             .inputs

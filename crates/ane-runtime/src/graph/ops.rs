@@ -87,7 +87,7 @@ impl Graph {
                 kernel_height: kernel_h,
                 kernel_width: kernel_w,
                 groups: descriptor.groups,
-                pad_mode: descriptor.pad_mode.clone(),
+                pad_mode: descriptor.pad_mode,
                 pad_top: 0,
                 pad_bottom: 0,
                 pad_left: 0,
@@ -127,7 +127,7 @@ impl Graph {
                 stride_height: descriptor.stride_height,
                 stride_width: descriptor.stride_width,
                 groups: descriptor.groups,
-                pad_mode: descriptor.pad_mode.clone(),
+                pad_mode: descriptor.pad_mode,
                 pad_top: 0,
                 pad_bottom: 0,
                 pad_left: 0,
@@ -453,6 +453,7 @@ impl Graph {
 
     // ─── Pooling ─────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn pool(
         &mut self,
         input: Tensor,
@@ -473,8 +474,8 @@ impl Graph {
                     (input.shape.width.saturating_sub(kernel_w)) / stride_width + 1,
                 ),
                 PadMode::Same => (
-                    (input.shape.height + stride_height - 1) / stride_height,
-                    (input.shape.width + stride_width - 1) / stride_width,
+                    input.shape.height.div_ceil(stride_height),
+                    input.shape.width.div_ceil(stride_width),
                 ),
             }
         };
@@ -501,6 +502,8 @@ impl Graph {
         output
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn max_pool(
         &mut self,
         input: Tensor,
@@ -513,6 +516,8 @@ impl Graph {
         self.pool(input, PoolType::Max, kernel_h, kernel_w, stride_height, stride_width, pad_mode, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn avg_pool(
         &mut self,
         input: Tensor,
@@ -533,6 +538,7 @@ impl Graph {
 
     // ─── Padding ─────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn pad(
         &mut self,
         input: Tensor,

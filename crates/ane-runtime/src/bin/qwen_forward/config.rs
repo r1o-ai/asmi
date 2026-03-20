@@ -99,7 +99,7 @@ impl QwenConfig {
     /// 2*full_attention_interval-1, ... i.e. every 4th layer starting at 3:
     /// layers 3, 7, 11, 15, 19, 23.
     pub fn is_full_attention(&self, layer_index: usize) -> bool {
-        (layer_index + 1) % self.full_attention_interval == 0
+        (layer_index + 1).is_multiple_of(self.full_attention_interval)
     }
 
     /// Number of dimensions that receive RoPE embeddings.

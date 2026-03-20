@@ -643,9 +643,8 @@ fn emit_layer(
             // Since we only have one blob, we use the same blob reference with different
             // naming to declare gamma only (beta will be zeros via a constant).
             out.push_str(&format!(
-                "        tensor<fp16, [{ch}]> {beta_var} = const()[name = string(\"{beta_var}\"), val = tensor<fp16, [{ch}]>({})];\n",
-                // zero-fill beta
-                format!("[{}]", vec!["0.0"; ch as usize].join(", ")),
+                "        tensor<fp16, [{ch}]> {beta_var} = const()[name = string(\"{beta_var}\"), val = tensor<fp16, [{ch}]>([{zeros}])];\n",
+                zeros = vec!["0.0"; ch].join(", "),
             ));
             out.push_str(&format!(
                 "        fp32 {n}_eps = const()[name = string(\"{n}_eps\"), val = fp32({eps})];\n",
@@ -837,6 +836,7 @@ fn emit_layer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_conv_constants(
     n: &str,
     pt: usize, pb: usize, pl: usize, pr: usize,

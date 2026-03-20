@@ -22,11 +22,7 @@ pub struct AneState {
 
 impl AneState {
     pub fn new(enabled: bool) -> Self {
-        let available = if enabled {
-            cfg!(feature = "ane")
-        } else {
-            false
-        };
+        let available = enabled && cfg!(feature = "ane");
         Self {
             enabled,
             available,
@@ -74,20 +70,20 @@ pub async fn eval_handler(
 
     if !ane.enabled {
         let body = Json(serde_json::json!({"error": "ANE compute not enabled. Start daemon with --experimental-ane"}));
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
 
     #[cfg(not(feature = "ane"))]
     {
         let body = Json(serde_json::json!({"error": "Binary not built with ANE support. Rebuild with: cargo build --features ane"}));
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
 
     #[cfg(feature = "ane")]
     {
         if ane.compile_budget_remaining() == 0 {
             let body = Json(serde_json::json!({"error": "ANE compile budget exhausted (~119 per process). Restart daemon to reset."}));
-            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
         }
 
         let body = Json(serde_json::json!({"error": "ANE eval endpoint is scaffolded but not yet implemented. See /ane/compute for subsystem status."}));
@@ -101,13 +97,13 @@ pub async fn probe_handler(
 ) -> axum::response::Response {
     if !state.ane.enabled {
         let body = Json(serde_json::json!({"error": "ANE compute not enabled. Start daemon with --experimental-ane"}));
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
 
     #[cfg(not(feature = "ane"))]
     {
         let body = Json(serde_json::json!({"error": "Binary not built with ANE support. Rebuild with: cargo build --features ane"}));
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
     }
 
     #[cfg(feature = "ane")]

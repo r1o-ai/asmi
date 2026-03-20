@@ -3,7 +3,7 @@ mod layer_weights;
 mod model_weights;
 mod safetensors_ext;
 
-pub use download::{download_model, load_model_local, ModelFiles};
+pub use download::{download_model, load_model_local};
 pub use layer_weights::{
     FfnWeights, FullAttentionWeights, LayerWeights, LinearAttentionWeights,
 };

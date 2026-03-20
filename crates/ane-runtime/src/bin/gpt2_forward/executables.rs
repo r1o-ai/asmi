@@ -67,7 +67,7 @@ fn gelu(graph: &mut Graph, input: ane::Tensor) -> ane::Tensor {
     let half_constant = graph.constant_with_scalar(0.5, broadcast_scalar);
     let one_constant = graph.constant_with_scalar(1.0, broadcast_scalar);
     let gelu_coefficient = graph.constant_with_scalar(0.044715, broadcast_scalar);
-    let sqrt_2_over_pi = graph.constant_with_scalar(0.7978845608028654, broadcast_scalar);
+    let sqrt_2_over_pi = graph.constant_with_scalar(0.797_884_6, broadcast_scalar);
 
     let input_squared = graph.multiplication(input, input);
     let input_cubed = graph.multiplication(input_squared, input);
@@ -90,6 +90,7 @@ fn causal_mask(sequence_length: usize) -> Box<[f32]> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attention_body(
     graph: &mut Graph,
     normalized: ane::Tensor,

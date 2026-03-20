@@ -35,7 +35,7 @@ pub fn probe_surface(label: &str, byte_count: usize) -> SurfaceProbe {
     let base_addr = surface.baseAddress().as_ptr() as u64;
     surface.unlockWithOptions_seed(IOSurfaceLockOptions::ReadOnly, ptr::null_mut());
 
-    let page_aligned = base_addr % 4096 == 0;
+    let page_aligned = base_addr.is_multiple_of(4096);
 
     SurfaceProbe {
         label: label.to_string(),

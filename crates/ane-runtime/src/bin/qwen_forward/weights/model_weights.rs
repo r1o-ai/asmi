@@ -5,7 +5,7 @@ use crate::config::QwenConfig;
 use super::layer_weights::{
     FfnWeights, FullAttentionWeights, LayerWeights, LinearAttentionWeights,
 };
-use super::safetensors_ext::{tensor_to_f32, try_tensor_to_f32};
+use super::safetensors_ext::try_tensor_to_f32;
 
 /// All model weights: token embeddings, per-layer weights, and final RMSNorm.
 pub struct ModelWeights {

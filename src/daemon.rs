@@ -27,6 +27,7 @@ impl axum::response::IntoResponse for ApiError {
 }
 
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 pub struct AppState {
     pub snapshot: Arc<RwLock<Option<asmi_core::NodeSnapshot>>>,
     pub cluster_state: Option<Arc<RwLock<asmi_core::ClusterState>>>,
@@ -219,7 +220,7 @@ async fn jaccl_config_handler(
                 let requested: Vec<&str> = hosts_param.split(',').collect();
                 if let Some(arr) = hosts.as_array() {
                     let filtered: Vec<&serde_json::Value> = arr.iter().filter(|h| {
-                        h.get("ssh").and_then(|s| s.as_str()).map_or(false, |ssh| {
+                        h.get("ssh").and_then(|s| s.as_str()).is_some_and(|ssh| {
                             requested.iter().any(|r| ssh.starts_with(r))
                         })
                     }).collect();
@@ -636,7 +637,7 @@ async fn serve_load_handler(
     }
 
     // Infer port: explicit ?port= > engine default
-    let port = q.port.unwrap_or_else(|| match req.engine {
+    let port = q.port.unwrap_or(match req.engine {
         asmi_core::ServeEngine::MlxVlm => 19082,
         _ => DEFAULT_SERVE_PORT,
     });

@@ -8,14 +8,14 @@ pub fn final_layer_norm(
     epsilon: f32,
 ) {
     let mut mean = 0.0f32;
-    for dim_index in 0..embedding_dim {
-        mean += input[dim_index];
+    for &val in input.iter().take(embedding_dim) {
+        mean += val;
     }
     mean /= embedding_dim as f32;
 
     let mut variance = 0.0f32;
-    for dim_index in 0..embedding_dim {
-        let centered = input[dim_index] - mean;
+    for &val in input.iter().take(embedding_dim) {
+        let centered = val - mean;
         variance += centered * centered;
     }
     variance /= embedding_dim as f32;

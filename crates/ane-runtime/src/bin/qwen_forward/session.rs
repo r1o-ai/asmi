@@ -216,7 +216,7 @@ impl<'model> Session<'model> {
         seq_len: usize,
         real_length: usize,
     ) {
-        let hidden = config.hidden_size;
+        let _hidden = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
