@@ -44,6 +44,7 @@ pub mod collector;
 pub mod config;
 pub mod ioreport;
 pub mod monitor;
+pub mod footprint;
 pub mod scanner;
 pub mod ssh;
 pub mod types;

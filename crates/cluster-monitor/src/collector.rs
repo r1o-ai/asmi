@@ -439,28 +439,33 @@ async fn collect_via_ssh(
             let hostname = hostname.to_string();
             let config = config.clone();
             async move {
-                let fp_res = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    async {
-                        if is_local {
-                            local_run(&cmd).await
-                        } else {
-                            ssh_run(&hostname, &cmd, &config).await
+                if is_local {
+                    let mb = match crate::footprint::get_phys_footprint(pid) {
+                        Ok(bytes) => Some(bytes as f64 / (1024.0 * 1024.0)),
+                        Err(e) => {
+                            tracing::debug!(pid, error = %e, "failed to read footprint natively");
+                            None
                         }
-                    },
-                ).await;
-                let mb = match fp_res {
-                    Ok(Ok(r)) if r.has_output() => {
-                        let mb = parse_footprint(&r.stdout);
-                        debug!(hostname = hostname.as_str(), pid, footprint_mb = ?mb, "footprint");
-                        mb
-                    }
-                    _ => {
-                        debug!(hostname = hostname.as_str(), pid, "footprint unavailable");
-                        None
-                    }
-                };
-                (pid, mb)
+                    };
+                    (pid, mb)
+                } else {
+                    let fp_res = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        ssh_run(&hostname, &cmd, &config),
+                    ).await;
+                    let mb = match fp_res {
+                        Ok(Ok(r)) if r.has_output() => {
+                            let mb = parse_footprint(&r.stdout);
+                            debug!(hostname = hostname.as_str(), pid, footprint_mb = ?mb, "footprint");
+                            mb
+                        }
+                        _ => {
+                            debug!(hostname = hostname.as_str(), pid, "footprint unavailable");
+                            None
+                        }
+                    };
+                    (pid, mb)
+                }
             }
         }).collect();
 
