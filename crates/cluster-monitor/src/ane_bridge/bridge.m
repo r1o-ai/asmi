@@ -59,6 +59,7 @@ int ane_bridge_available(void) {
 /// Opaque handle to a compiled ANE kernel.
 typedef struct {
     id model;           // _ANEInMemoryModel
+    id request;         // _ANERequest (cached)
     IOSurfaceRef *inputs;
     IOSurfaceRef *outputs;
     int n_inputs;
@@ -150,6 +151,37 @@ void *ane_bridge_compile(
             h->outputs[i] = create_surface(output_sizes[i]);
         }
 
+        // Cache the evaluation request
+        NSMutableArray *inputObjs = [NSMutableArray arrayWithCapacity:n_inputs];
+        NSMutableArray *outputObjs = [NSMutableArray arrayWithCapacity:n_outputs];
+        NSMutableArray *inputIndices = [NSMutableArray arrayWithCapacity:n_inputs];
+        NSMutableArray *outputIndices = [NSMutableArray arrayWithCapacity:n_outputs];
+
+        for (int i = 0; i < n_inputs; i++) {
+            id obj = ((id (*)(id, SEL, IOSurfaceRef))objc_msgSend)(
+                (id)cls_IOSurfaceObject,
+                NSSelectorFromString(@"objectWithIOSurface:"),
+                h->inputs[i]
+            );
+            [inputObjs addObject:obj];
+            [inputIndices addObject:@(i)];
+        }
+        for (int i = 0; i < n_outputs; i++) {
+            id obj = ((id (*)(id, SEL, IOSurfaceRef))objc_msgSend)(
+                (id)cls_IOSurfaceObject,
+                NSSelectorFromString(@"objectWithIOSurface:"),
+                h->outputs[i]
+            );
+            [outputObjs addObject:obj];
+            [outputIndices addObject:@(i)];
+        }
+        id request = ((id (*)(id, SEL, id, id, id, id, id, id, int))objc_msgSend)(
+            (id)cls_Request,
+            NSSelectorFromString(@"requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"),
+            inputObjs, inputIndices, outputObjs, outputIndices, nil, nil, 0
+        );
+        h->request = (__bridge_retained id)request;
+
         return h;
     }
 }
@@ -168,48 +200,15 @@ void ane_bridge_write_input(void *handle, int idx, const void *data, size_t byte
 /// Evaluate the compiled ANE kernel. Returns 1 on success, 0 on failure.
 int ane_bridge_eval(void *handle) {
     ANEKernelHandle *h = (ANEKernelHandle *)handle;
-    if (!h) return 0;
+    if (!h || !h->request) return 0;
 
     @autoreleasepool {
-        // Wrap IOSurfaces as _ANEIOSurfaceObject
-        NSMutableArray *inputObjs = [NSMutableArray arrayWithCapacity:h->n_inputs];
-        NSMutableArray *outputObjs = [NSMutableArray arrayWithCapacity:h->n_outputs];
-        NSMutableArray *inputIndices = [NSMutableArray arrayWithCapacity:h->n_inputs];
-        NSMutableArray *outputIndices = [NSMutableArray arrayWithCapacity:h->n_outputs];
-
-        for (int i = 0; i < h->n_inputs; i++) {
-            id obj = ((id (*)(id, SEL, IOSurfaceRef))objc_msgSend)(
-                (id)cls_IOSurfaceObject,
-                NSSelectorFromString(@"objectWithIOSurface:"),
-                h->inputs[i]
-            );
-            [inputObjs addObject:obj];
-            [inputIndices addObject:@(i)];
-        }
-        for (int i = 0; i < h->n_outputs; i++) {
-            id obj = ((id (*)(id, SEL, IOSurfaceRef))objc_msgSend)(
-                (id)cls_IOSurfaceObject,
-                NSSelectorFromString(@"objectWithIOSurface:"),
-                h->outputs[i]
-            );
-            [outputObjs addObject:obj];
-            [outputIndices addObject:@(i)];
-        }
-
-        // Build request
-        id request = ((id (*)(id, SEL, id, id, id, id, id, id, int))objc_msgSend)(
-            (id)cls_Request,
-            NSSelectorFromString(@"requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:"),
-            inputObjs, inputIndices, outputObjs, outputIndices, nil, nil, 0
-        );
-        if (!request) return 0;
-
-        // Evaluate
+        // Evaluate directly using the cached request
         NSError *error = nil;
         BOOL ok = ((BOOL (*)(id, SEL, int, id, id, NSError **))objc_msgSend)(
             (__bridge id)h->model,
             NSSelectorFromString(@"evaluateWithQoS:options:request:error:"),
-            0, nil, request, &error
+            0, nil, (__bridge id)h->request, &error
         );
         return ok ? 1 : 0;
     }
@@ -239,6 +238,11 @@ void ane_bridge_free(void *handle) {
             NSSelectorFromString(@"unloadWithQoS:error:"),
             0, nil
         );
+
+        if (h->request) {
+            id request = (__bridge_transfer id)h->request;
+            (void)request; // ARC releases it
+        }
 
         for (int i = 0; i < h->n_inputs; i++) {
             if (h->inputs[i]) CFRelease(h->inputs[i]);
