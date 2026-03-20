@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """asmi MCP Server — wraps asmi's HTTP API as MCP tools.
 
-6 workflow-centric tools covering 27 HTTP endpoints:
-  asmi_status   — dashboard (health + metrics + processes)
+6 workflow-centric tools covering 35+ HTTP endpoints:
+  asmi_status   — dashboard (health + metrics + processes + disk + network)
   asmi_cluster  — cluster-wide view (all nodes)
   asmi_models   — local model inventory + serve status
   asmi_serve    — load/stop/reload/share model servers
@@ -37,6 +37,15 @@ async def _get(path: str, base: Optional[str] = None) -> dict:
         resp = await client.get(url)
         resp.raise_for_status()
         return resp.json()
+
+
+async def _get_text(path: str, base: Optional[str] = None) -> str:
+    """GET request returning raw text."""
+    url = f"{base or BASE_URL}{path}"
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        return resp.text
 
 
 async def _post(path: str, data: Optional[dict] = None, base: Optional[str] = None) -> dict:
@@ -231,16 +240,15 @@ async def asmi_serve(
         elif action == "load":
             if not model:
                 return "Error: 'model' parameter required for load action"
-            body = {"model": model}
-            if port:
-                body["port"] = port
+            body = {"model_path": model}
             return json.dumps(await _post(f"/serve/load{port_param}", body, base), indent=2)
         elif action == "stop":
             return json.dumps(await _post(f"/serve/stop{port_param}", base=base), indent=2)
         elif action == "reload":
             return json.dumps(await _post(f"/serve/reload{port_param}", base=base), indent=2)
         elif action == "share":
-            return json.dumps(await _post("/serve/share", base=base), indent=2)
+            body = {"model_path": model} if model else {}
+            return json.dumps(await _post("/serve/share", body, base), indent=2)
         elif action == "share_status":
             return json.dumps(await _get("/serve/share/status", base), indent=2)
         elif action == "share_stop":
@@ -270,10 +278,7 @@ async def asmi_topology(format: str = "json") -> str:
     """
     try:
         if format == "dot":
-            async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-                resp = await client.get(f"{BASE_URL}/topology/dot")
-                resp.raise_for_status()
-                return resp.text
+            return await _get_text("/topology/dot")
         elif format == "validate":
             return json.dumps(await _get("/topology/validate"), indent=2)
         else:
