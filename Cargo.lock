@@ -154,7 +154,6 @@ dependencies = [
  "core-foundation-sys",
  "dirs",
  "futures",
- "libc",
  "regex",
  "reqwest",
  "serde",

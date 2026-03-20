@@ -50,21 +50,43 @@ pub mod types;
 pub mod models;
 pub mod health;
 
-/// Resolve the best python3 binary. Homebrew python has the real MLX install;
-/// the system /usr/bin/python3 (3.9.6) has an older version.
+/// Resolve the best python3 binary.
+///
+/// Priority order:
+/// 1. `python_cmd` from `~/.config/asmi/config.json` (user-configured)
+/// 2. Homebrew python (`/opt/homebrew/bin/python3`)
+/// 3. Local bin (`/usr/local/bin/python3`)
+/// 4. PATH fallback (`python3`)
+///
 /// Returns the path as a string so callers can use it with Command::new().
 pub fn resolve_python() -> &'static str {
-    // Candidates in priority order
-    const CANDIDATES: &[&str] = &[
-        "/opt/homebrew/bin/python3",
-        "/usr/local/bin/python3",
-    ];
-    for p in CANDIDATES {
-        if std::path::Path::new(p).exists() {
-            return p;
+    use std::sync::OnceLock;
+    static PYTHON: OnceLock<String> = OnceLock::new();
+
+    PYTHON.get_or_init(|| {
+        // 1. Check config file for user-specified python_cmd
+        let node_map = config::NodeMap::load();
+        if let Some(ref cmd) = node_map.python_cmd {
+            if std::path::Path::new(cmd).exists() {
+                tracing::info!(python_cmd = %cmd, "using python from config");
+                return cmd.clone();
+            }
+            tracing::warn!(python_cmd = %cmd, "configured python_cmd not found, falling back");
         }
-    }
-    "python3" // fallback to PATH
+
+        // 2. Hardcoded candidates
+        const CANDIDATES: &[&str] = &[
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+        ];
+        for p in CANDIDATES {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+
+        "python3".to_string()
+    })
 }
 
 pub use aggregator::ClusterState;
