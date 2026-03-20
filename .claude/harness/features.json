@@ -53,7 +53,7 @@
       "priority": 1,
       "title": "Add /topology HTTP endpoints to daemon",
       "description": "GET /topology (JSON), GET /topology/dot, GET /topology/validate. 60s cache, follow thunderbolt_cache pattern. Phase 3 from topology handoff.",
-      "status": "pending",
+      "status": "done",
       "depends": []
     },
     {
@@ -62,7 +62,7 @@
       "priority": 2,
       "title": "Update /jaccl/config to use live topology",
       "description": "Replace stale rdma_links in jaccl_config_handler with topology discovery. Proper error on incomplete mesh.",
-      "status": "pending",
+      "status": "done",
       "depends": [
         "topo-http-05"
       ]

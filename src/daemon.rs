@@ -200,6 +200,71 @@ async fn jaccl_config_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Prefer live topology cache over stale NodeMap rdma_links
+    let topo_cache = state.topology_cache.read().await;
+    if let Some((report, scanned_at)) = topo_cache.as_ref() {
+        if report.links.is_empty() {
+            return Err(ApiError::NotFound("Topology scanned but no RDMA links found.".into()));
+        }
+
+        // Build JACCL hostfile from live topology links
+        let nodes = &report.nodes;
+        let links = &report.links;
+
+        let entries: Vec<serde_json::Value> = nodes.iter().map(|node| {
+            let rdma_row: Vec<serde_json::Value> = nodes.iter().map(|other| {
+                if node == other {
+                    serde_json::Value::Null
+                } else {
+                    // Find the link between node and other
+                    links.iter()
+                        .find(|l| {
+                            (l.node_a == *node && l.node_b == *other) ||
+                            (l.node_b == *node && l.node_a == *other)
+                        })
+                        .map(|l| {
+                            let device = if l.node_a == *node { &l.device_a } else { &l.device_b };
+                            serde_json::Value::String(format!("rdma_{device}"))
+                        })
+                        .unwrap_or(serde_json::Value::Null)
+                }
+            }).collect();
+
+            serde_json::json!({
+                "ssh": node,
+                "ips": [],
+                "rdma": rdma_row,
+            })
+        }).collect();
+
+        let filtered = if let Some(hosts_param) = params.get("hosts") {
+            let requested: Vec<&str> = hosts_param.split(',').collect();
+            let filtered: Vec<&serde_json::Value> = entries.iter().filter(|h| {
+                h.get("ssh").and_then(|s| s.as_str()).is_some_and(|ssh| {
+                    requested.iter().any(|r| ssh.starts_with(r))
+                })
+            }).collect();
+            serde_json::to_value(&filtered).unwrap_or(serde_json::json!([]))
+        } else {
+            serde_json::to_value(&entries).unwrap_or(serde_json::json!([]))
+        };
+
+        let count = filtered.as_array().map(|a| a.len()).unwrap_or(0);
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "source": "live_topology",
+            "hosts": filtered,
+            "nodeCount": count,
+            "links_total": links.len(),
+            "mesh_complete": report.mesh_complete,
+            "jaccl_ready": report.jaccl_ready,
+            "scan_age_seconds": scanned_at.elapsed().as_secs(),
+            "local_hostname": state.hostname,
+        })));
+    }
+    drop(topo_cache);
+
+    // Fallback: use stale NodeMap rdma_links (pre-topology scan)
     let nm = state.node_map.read().await;
 
     if nm.rdma_links.is_empty() {
@@ -213,7 +278,6 @@ async fn jaccl_config_handler(
         return Err(ApiError::NotFound("No RDMA-connected nodes found in topology".into()));
     }
 
-    // Parse the JSON string from hostfile_jaccl and optionally filter by requested hosts
     match serde_json::from_str::<serde_json::Value>(&hostfile_json) {
         Ok(hosts) => {
             let filtered = if let Some(hosts_param) = params.get("hosts") {
@@ -235,6 +299,7 @@ async fn jaccl_config_handler(
             let count = filtered.as_array().map(|a| a.len()).unwrap_or(0);
             Ok(Json(serde_json::json!({
                 "success": true,
+                "source": "node_map_fallback",
                 "hosts": filtered,
                 "nodeCount": count,
                 "rdma_links_total": nm.rdma_links.len(),
