@@ -392,26 +392,44 @@ async def _preflight_share(base: str, model: Optional[str] = None) -> dict:
             result["blockers"].append(f"Failed to parse hostfile {hostfile_path}: {e}")
             result["passed"] = False
 
-    # 7. Check mlx.distributed / mlx.launch availability (required for JACCL)
+    # 7. Check mlx._distributed_utils + mlx_lm.share JACCL availability
     try:
         import subprocess
         check = subprocess.run(
-            [_resolve_python(), "-c", "import mlx.distributed; print('ok')"],
+            [_resolve_python(), "-c",
+             "from mlx_lm.share import Hostfile, launch_jaccl; print('ok')"],
             capture_output=True, text=True, timeout=10,
         )
-        mlx_dist_ok = check.returncode == 0 and "ok" in check.stdout
-        result["checks"]["mlx_distributed"] = mlx_dist_ok
-        if not mlx_dist_ok:
+        jaccl_ok = check.returncode == 0 and "ok" in check.stdout
+        result["checks"]["jaccl_launch"] = jaccl_ok
+        if not jaccl_ok:
             stderr = check.stderr.strip().split("\n")[-1] if check.stderr else "import failed"
             result["blockers"].append(
-                f"mlx.distributed not available ({stderr}). "
-                "Install with: pip install mlx-distributed"
+                f"mlx_lm.share JACCL support not available ({stderr}). "
+                "Ensure mlx_lm >= 0.31 is installed: pip install -U mlx-lm"
             )
             result["passed"] = False
+        else:
+            # Validate hostfile is parseable by mlx_lm
+            if hostfile_path:
+                hf_check = subprocess.run(
+                    [_resolve_python(), "-c",
+                     f"from mlx_lm.share import Hostfile; "
+                     f"hf = Hostfile.from_file('{hostfile_path}'); "
+                     f"print(len(hf.hosts))"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if hf_check.returncode == 0:
+                    n = hf_check.stdout.strip()
+                    result["checks"]["hostfile_parsed_by_mlx"] = f"{n} hosts"
+                else:
+                    err = hf_check.stderr.strip().split("\n")[-1]
+                    result["blockers"].append(
+                        f"Hostfile failed mlx_lm parsing: {err}"
+                    )
+                    result["passed"] = False
     except Exception as e:
-        result["checks"]["mlx_distributed"] = f"check_failed: {e}"
-        result["blockers"].append(f"Could not verify mlx.distributed: {e}")
-        result["passed"] = False
+        result["checks"]["jaccl_launch"] = f"check_failed: {e}"
 
     # 8. Port availability check (default share port)
     share_port = 19080
