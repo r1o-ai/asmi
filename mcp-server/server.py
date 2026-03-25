@@ -16,7 +16,18 @@ Usage:
 
 import json
 import os
+import shutil
+from pathlib import Path
 from typing import Optional
+
+
+def _resolve_python() -> str:
+    """Find the best Python 3 interpreter (prefer 3.14+)."""
+    for candidate in ("python3.14", "python3.13", "python3.12", "python3"):
+        p = shutil.which(candidate)
+        if p:
+            return p
+    return "python3"
 
 import httpx
 from fastmcp import FastMCP
@@ -119,6 +130,422 @@ async def _post_flight_check(base: str, port: Optional[int], is_share: bool = Fa
     return check
 
 
+# ─── Preflight Checks ────────────────────────────────────────────────────────
+
+# Engine mapping loaded from engine-map.json (editable without touching Python).
+_ENGINE_MAP_PATH = Path(__file__).parent / "engine-map.json"
+_ENGINE_MAP: dict = {}
+
+
+def _load_engine_map() -> dict:
+    """Load engine-map.json. Cached after first load."""
+    global _ENGINE_MAP
+    if _ENGINE_MAP:
+        return _ENGINE_MAP
+    try:
+        _ENGINE_MAP = json.loads(_ENGINE_MAP_PATH.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        _ENGINE_MAP = {}
+    return _ENGINE_MAP
+
+
+def _detect_engine(model_path: str) -> dict:
+    """Read config.json and engine-map.json to detect the correct serving engine.
+
+    Priority: by_model_type → by_config_key → by_architecture_pattern → default mlx_lm.
+
+    Returns:
+        {engine, port, reason, config_found, is_moe, has_vision, distributed}
+    """
+    emap = _load_engine_map()
+    engines_meta = emap.get("_engines", {})
+    by_model_type = emap.get("by_model_type", {})
+    by_arch = emap.get("by_architecture_pattern", [])
+    by_key = emap.get("by_config_key", [])
+
+    result = {
+        "engine": "unknown",
+        "port": 19080,
+        "reason": "config.json not found — specify engine manually",
+        "config_found": False,
+        "is_moe": False,
+        "has_vision": False,
+    }
+
+    expanded = os.path.expanduser(model_path)
+    config_path = Path(expanded) / "config.json"
+    if not config_path.exists():
+        return result
+
+    try:
+        config = json.loads(config_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return result
+
+    result["config_found"] = True
+    model_type = config.get("model_type", "")
+    architectures = config.get("architectures", [])
+    has_vision = "vision_config" in config or "visual" in config
+    is_moe = "moe" in model_type.lower() or bool(config.get("num_experts") or config.get("num_local_experts"))
+
+    result["has_vision"] = has_vision
+    result["is_moe"] = is_moe
+
+    def _set_engine(engine: str, reason: str):
+        result["engine"] = engine
+        result["port"] = engines_meta.get(engine, {}).get("port", 19080)
+        result["reason"] = reason
+
+    # 1. Exact model_type match from engine-map.json
+    if model_type in by_model_type:
+        entry = by_model_type[model_type]
+        _set_engine(entry["engine"], entry.get("reason", f"model_type='{model_type}'"))
+        return result
+
+    # 2. Config keys (vision_config, visual)
+    for rule in by_key:
+        if rule["key"] in config:
+            _set_engine(rule["engine"], rule.get("reason", f"config has '{rule['key']}'"))
+            return result
+
+    # 3. Architecture pattern match
+    for rule in by_arch:
+        if any(rule["pattern"] in arch for arch in architectures):
+            _set_engine(rule["engine"], rule.get("reason", f"arch matches '{rule['pattern']}'"))
+            return result
+
+    # 4. Default: text-only → mlx_lm
+    _set_engine("mlx_lm", f"text-only model (model_type='{model_type}')")
+    return result
+
+
+async def _preflight_share(base: str, model: Optional[str] = None) -> dict:
+    """Pre-flight checks before starting a distributed share session.
+
+    Returns:
+        {passed: bool, warnings: [...], blockers: [...], checks: {...}}
+    """
+    result = {"passed": True, "warnings": [], "blockers": [], "checks": {}}
+
+    # 1. Check if a share session is already running (singleton)
+    try:
+        share_st = await _get("/serve/share/status", base)
+        state = share_st.get("state", "unknown")
+        result["checks"]["existing_session"] = state
+        if state not in ("idle", "error"):
+            result["blockers"].append(
+                f"Share session already active (state={state}, "
+                f"model={share_st.get('model', '?')}). Stop it first with share_stop."
+            )
+            result["passed"] = False
+    except Exception as e:
+        result["checks"]["existing_session"] = f"check_failed: {e}"
+
+    # 2. Check RDMA mesh health via topology/validate
+    try:
+        topo = await _get("/topology/validate")
+        jaccl_ready = topo.get("jaccl_ready", False)
+        subsets = topo.get("jaccl_ready_subsets", [])
+        result["checks"]["jaccl_ready"] = jaccl_ready
+        result["checks"]["jaccl_subsets"] = subsets
+        if not jaccl_ready and not subsets:
+            result["blockers"].append(
+                "RDMA mesh has no JACCL-ready subsets. "
+                "Check ibv_devinfo on nodes and verify PORT_ACTIVE."
+            )
+            result["passed"] = False
+        elif not jaccl_ready:
+            result["warnings"].append(
+                f"Full mesh not ready, but {len(subsets)} JACCL-ready subset(s) available: "
+                f"{subsets}"
+            )
+    except Exception:
+        result["warnings"].append(
+            "Could not verify RDMA mesh (topology endpoint unavailable). "
+            "Share may still work if hostfile is correct."
+        )
+
+    # 3. Detect engine from config.json
+    if model:
+        engine_info = _detect_engine(model)
+        result["checks"]["engine"] = engine_info
+
+        if engine_info["config_found"]:
+            result["warnings"].append(
+                f"Engine: {engine_info['engine']} (port {engine_info['port']}). "
+                f"{engine_info['reason']}"
+            )
+            # Surface RDMA caveats for this engine (e.g. mlx_vlm utils.py crash)
+            emap = _load_engine_map()
+            engine_meta = emap.get("_engines", {}).get(engine_info["engine"], {})
+            rdma_caveat = engine_meta.get("rdma_caveat")
+            if rdma_caveat:
+                result["warnings"].append(f"RDMA caveat: {rdma_caveat}")
+        else:
+            result["warnings"].append(
+                "Could not read config.json — engine detection unavailable. "
+                "Specify engine manually."
+            )
+
+    # 4. Check node health + RAM
+    hostname = "unknown"
+    try:
+        health = await _get("/health", base)
+        result["checks"]["node_healthy"] = health.get("ok", False)
+        hostname = health.get("hostname", "unknown")
+        result["checks"]["hostname"] = hostname
+    except Exception:
+        result["checks"]["node_healthy"] = False
+        result["blockers"].append("Target node not responding on :9090")
+        result["passed"] = False
+
+    try:
+        metrics = await _get("/metrics", base)
+        ram_total = metrics.get("ram_total_bytes", 0)
+        ram_app = metrics.get("ram_app_bytes", 0)
+        ram_available_gb = (ram_total - ram_app) / (1024**3) if ram_total else 0
+        result["checks"]["ram_available_gb"] = round(ram_available_gb, 1)
+        result["checks"]["ram_total_gb"] = round(ram_total / (1024**3), 0) if ram_total else 0
+        if ram_available_gb < 30:
+            result["warnings"].append(
+                f"Low available RAM: {ram_available_gb:.0f} GiB (app memory: {ram_app / (1024**3):.0f} GiB). "
+                "Large models may fail to load."
+            )
+    except Exception:
+        result["checks"]["ram_free_gb"] = "check_failed"
+
+    # 5. Detect running servers on node — block and let user decide
+    try:
+        serve_status = await _get("/serve/status", base)
+        servers = serve_status.get("servers", [serve_status] if "state" in serve_status else [])
+        running = [s for s in servers if s.get("state") == "ready" and s.get("model")]
+        result["checks"]["running_servers"] = [
+            {"port": s.get("port"), "model": s.get("model")} for s in running
+        ]
+        if running:
+            stop_cmds = [
+                f"  asmi_serve(action='stop', port={s.get('port')}, host='{hostname}')"
+                for s in running
+            ]
+            result["blockers"].append(
+                f"Node {hostname} has {len(running)} running server(s) consuming RAM. "
+                "Stop them first to free memory for the share session:\n"
+                + "\n".join(stop_cmds)
+            )
+            result["passed"] = False
+    except Exception:
+        result["checks"]["running_servers"] = "check_failed"
+
+    # 6. Hostfile existence and validation
+    import os
+    default_hf = os.path.expanduser("~/.r1o/hostfiles/default.json")
+    fallback_hfs = sorted(
+        Path(os.path.expanduser("~")).glob("hostfile-jaccl-*.json"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    hostfile_path = None
+    if os.path.exists(default_hf):
+        hostfile_path = default_hf
+    elif fallback_hfs:
+        hostfile_path = str(fallback_hfs[0])
+        result["warnings"].append(
+            f"No default hostfile at ~/.r1o/hostfiles/default.json — "
+            f"falling back to {hostfile_path}"
+        )
+    result["checks"]["hostfile_path"] = hostfile_path
+
+    if not hostfile_path:
+        result["blockers"].append(
+            "No JACCL hostfile found. Expected at ~/.r1o/hostfiles/default.json "
+            "or ~/hostfile-jaccl-*.json. Generate one with: asmi topology --format=hostfile"
+        )
+        result["passed"] = False
+    else:
+        # Validate hostfile JSON and format
+        try:
+            import json as _json
+            with open(hostfile_path) as f:
+                hf_data = _json.load(f)
+            if not isinstance(hf_data, list) or len(hf_data) < 2:
+                result["blockers"].append(
+                    f"Hostfile {hostfile_path} must be a JSON array with >= 2 node entries, "
+                    f"got {type(hf_data).__name__} with {len(hf_data) if isinstance(hf_data, list) else 0} entries"
+                )
+                result["passed"] = False
+            else:
+                # Verify each entry has 'ssh' and 'rdma' keys
+                for i, entry in enumerate(hf_data):
+                    if not isinstance(entry, dict):
+                        result["blockers"].append(f"Hostfile entry [{i}] is not a dict")
+                        result["passed"] = False
+                        break
+                    if "ssh" not in entry:
+                        result["blockers"].append(f"Hostfile entry [{i}] missing 'ssh' key")
+                        result["passed"] = False
+                        break
+                result["checks"]["hostfile_nodes"] = [
+                    e.get("ssh", "?") for e in hf_data if isinstance(e, dict)
+                ]
+                result["checks"]["hostfile_node_count"] = len(hf_data)
+        except Exception as e:
+            result["blockers"].append(f"Failed to parse hostfile {hostfile_path}: {e}")
+            result["passed"] = False
+
+    # 7. Check mlx.distributed / mlx.launch availability (required for JACCL)
+    try:
+        import subprocess
+        check = subprocess.run(
+            [_resolve_python(), "-c", "import mlx.distributed; print('ok')"],
+            capture_output=True, text=True, timeout=10,
+        )
+        mlx_dist_ok = check.returncode == 0 and "ok" in check.stdout
+        result["checks"]["mlx_distributed"] = mlx_dist_ok
+        if not mlx_dist_ok:
+            stderr = check.stderr.strip().split("\n")[-1] if check.stderr else "import failed"
+            result["blockers"].append(
+                f"mlx.distributed not available ({stderr}). "
+                "Install with: pip install mlx-distributed"
+            )
+            result["passed"] = False
+    except Exception as e:
+        result["checks"]["mlx_distributed"] = f"check_failed: {e}"
+        result["blockers"].append(f"Could not verify mlx.distributed: {e}")
+        result["passed"] = False
+
+    # 8. Port availability check (default share port)
+    share_port = 19080
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        port_in_use = sock.connect_ex(("localhost", share_port)) == 0
+        sock.close()
+        result["checks"]["port_available"] = not port_in_use
+        if port_in_use:
+            result["blockers"].append(
+                f"Port {share_port} is already in use. "
+                f"Stop the existing server first: asmi_serve(action='stop', port={share_port})"
+            )
+            result["passed"] = False
+    except Exception:
+        result["checks"]["port_available"] = "check_failed"
+
+    # 9. Duplicate process detection — check if same model is already loading
+    try:
+        import subprocess
+        ps_out = subprocess.run(
+            ["pgrep", "-af", "mlx_lm.*server.*" + (model or "")],
+            capture_output=True, text=True, timeout=5,
+        )
+        existing = [
+            line.strip() for line in ps_out.stdout.strip().split("\n")
+            if line.strip() and "pgrep" not in line
+        ]
+        result["checks"]["duplicate_processes"] = len(existing)
+        if existing and model:
+            result["warnings"].append(
+                f"Found {len(existing)} existing mlx_lm process(es) matching '{model}'. "
+                "This may cause port conflicts or memory waste. Consider stopping them first."
+            )
+    except Exception:
+        result["checks"]["duplicate_processes"] = "check_failed"
+
+    return result
+
+
+async def _preflight_load(base: str, model: Optional[str] = None, port: Optional[int] = None) -> dict:
+    """Pre-flight checks before loading a model on a server port.
+
+    Returns:
+        {passed: bool, warnings: [...], blockers: [...], checks: {...}}
+    """
+    result = {"passed": True, "warnings": [], "blockers": [], "checks": {}}
+    target_port = port or 19080
+
+    # 1. Check all running servers on this node
+    running_servers = []
+    try:
+        serve_status = await _get("/serve/status", base)
+        servers = serve_status.get("servers", [serve_status] if "state" in serve_status else [])
+        running_servers = [s for s in servers if s.get("state") == "ready" and s.get("model")]
+        result["checks"]["running_servers"] = [
+            {"port": s.get("port"), "model": s.get("model")} for s in running_servers
+        ]
+    except Exception:
+        result["checks"]["running_servers"] = "check_failed"
+
+    # 2. Check if target port specifically has a model loaded
+    target_server = next((s for s in running_servers if s.get("port") == target_port), None)
+    if target_server:
+        current_model = target_server.get("model", "unknown")
+        result["checks"]["port_state"] = "ready"
+        result["checks"]["current_model"] = current_model
+        result["blockers"].append(
+            f"Port {target_port} is serving '{current_model}'. "
+            f"Stop it first: asmi_serve(action='stop', port={target_port})"
+        )
+        result["passed"] = False
+    else:
+        result["checks"]["port_state"] = "idle"
+        result["checks"]["current_model"] = None
+
+    # 3. Check if other ports have servers consuming RAM
+    other_servers = [s for s in running_servers if s.get("port") != target_port]
+    if other_servers:
+        models_str = ", ".join(
+            f"'{s.get('model', '?')}' on port {s.get('port', '?')}" for s in other_servers
+        )
+        result["warnings"].append(
+            f"{len(other_servers)} other server(s) running: {models_str}. "
+            "These consume RAM — stop them if needed to fit a larger model."
+        )
+
+    # 4. Auto-detect engine from config.json and check port match
+    if model:
+        engine_info = _detect_engine(model)
+        result["checks"]["engine"] = engine_info
+        if engine_info["config_found"]:
+            recommended_port = engine_info["port"]
+            if target_port != recommended_port:
+                result["blockers"].append(
+                    f"Port mismatch: loading on port {target_port} but model needs "
+                    f"{engine_info['engine']} (port {recommended_port}). "
+                    f"Reason: {engine_info['reason']}"
+                )
+                result["passed"] = False
+            else:
+                result["warnings"].append(
+                    f"Engine: {engine_info['engine']} on port {recommended_port}. "
+                    f"Reason: {engine_info['reason']}"
+                )
+
+    # 2. Check node RAM
+    try:
+        metrics = await _get("/metrics", base)
+        ram_total = metrics.get("ram_total_bytes", 0)
+        ram_app = metrics.get("ram_app_bytes", 0)
+        ram_available_gb = (ram_total - ram_app) / (1024**3) if ram_total else 0
+        result["checks"]["ram_available_gb"] = round(ram_available_gb, 1)
+        if ram_available_gb < 30:
+            result["warnings"].append(
+                f"Low available RAM: {ram_available_gb:.0f} GiB. Large models may OOM."
+            )
+    except Exception:
+        result["checks"]["ram_free_gb"] = "check_failed"
+
+    # 3. Check node health
+    try:
+        health = await _get("/health", base)
+        result["checks"]["node_healthy"] = health.get("ok", False)
+    except Exception:
+        result["checks"]["node_healthy"] = False
+        result["blockers"].append("Target node not responding on :9090")
+        result["passed"] = False
+
+    return result
+
+
 # ─── Tools ───────────────────────────────────────────────────────────────────
 
 
@@ -160,9 +587,10 @@ async def asmi_status(host: Optional[str] = None) -> str:
         f"CPU: {m.get('cpu_percent', '?')}% | GPU: {m.get('gpu_percent', '?')}%",
     ]
     ram_total = m.get('ram_total_bytes', 0)
-    ram_used = m.get('ram_used_bytes', 0)
+    ram_app = m.get('ram_app_bytes', 0)
     if ram_total:
-        lines.append(f"RAM: {ram_used / (1024**3):.1f}/{ram_total / (1024**3):.0f} GiB")
+        ram_available = ram_total - ram_app
+        lines.append(f"RAM: {ram_app / (1024**3):.1f} GiB used | {ram_available / (1024**3):.0f} GiB available | {ram_total / (1024**3):.0f} GiB total")
     else:
         lines.append("RAM: ?/? GiB")
     lines.append(f"ANE: {ane.get('ane_watts', ane.get('ane_mw', '?'))} mW")
@@ -208,10 +636,10 @@ async def asmi_cluster() -> str:
         cpu = node.get("cpu_percent", "?")
         gpu = node.get("gpu_percent", "?")
         ram_total_bytes = node.get("ram_total_bytes", 0)
-        ram_used_bytes = node.get("ram_used_bytes", 0)
+        ram_app_bytes = node.get("ram_app_bytes", 0)
+        ram_avail = f"{(ram_total_bytes - ram_app_bytes) / (1024**3):.0f}" if ram_total_bytes else "?"
         ram_total = f"{ram_total_bytes / (1024**3):.0f}" if ram_total_bytes else "?"
-        ram_used = f"{ram_used_bytes / (1024**3):.0f}" if ram_used_bytes else "?"
-        lines.append(f"  {hostname}: CPU {cpu}% | GPU {gpu}% | RAM {ram_used}/{ram_total} GiB")
+        lines.append(f"  {hostname}: CPU {cpu}% | GPU {gpu}% | RAM {ram_avail}/{ram_total} GiB available")
 
         procs = node.get("processes", [])
         for p in procs[:5]:
@@ -277,6 +705,7 @@ async def asmi_serve(
       - share: Start distributed inference share session
       - share_status: Check share session status
       - share_stop: Stop share session
+      - preflight: Run pre-flight checks without starting anything (requires 'model')
 
     Parameters:
         action: One of: status, load, stop, reload, share, share_status, share_stop
@@ -293,8 +722,21 @@ async def asmi_serve(
         elif action == "load":
             if not model:
                 return "Error: 'model' parameter required for load action"
+            # Run preflight checks
+            preflight = await _preflight_load(base, model, port)
+            if not preflight["passed"]:
+                return json.dumps({
+                    "error": "Preflight checks failed — load not started",
+                    "preflight": preflight,
+                }, indent=2)
             body = {"model_path": model}
-            return json.dumps(await _post(f"/serve/load{port_param}", body, base), indent=2)
+            load_result = await _post(f"/serve/load{port_param}", body, base)
+            note = "Load started with warnings" if preflight["warnings"] else None
+            return json.dumps({
+                "result": load_result,
+                "preflight": preflight,
+                **({"note": note} if note else {}),
+            }, indent=2)
         elif action == "stop":
             stop_result = await _post(f"/serve/stop{port_param}", base=base)
             # Post-flight check: verify the server actually stopped
@@ -308,8 +750,21 @@ async def asmi_serve(
         elif action == "reload":
             return json.dumps(await _post(f"/serve/reload{port_param}", base=base), indent=2)
         elif action == "share":
-            body = {"model_path": model} if model else {}
-            return json.dumps(await _post("/serve/share", body, base), indent=2)
+            if not model:
+                return "Error: 'model' parameter required for share action"
+            # Run preflight checks
+            preflight = await _preflight_share(base, model)
+            if not preflight["passed"]:
+                return json.dumps({
+                    "error": "Preflight checks failed — share not started",
+                    "preflight": preflight,
+                }, indent=2)
+            body = {"model_path": model}
+            share_result = await _post("/serve/share", body, base)
+            return json.dumps({
+                "result": share_result,
+                "preflight": preflight,
+            }, indent=2)
         elif action == "share_status":
             return json.dumps(await _get("/serve/share/status", base), indent=2)
         elif action == "share_stop":
@@ -321,8 +776,17 @@ async def asmi_serve(
                 "stop_result": stop_result,
                 "post_flight": post_flight,
             }, indent=2)
+        elif action == "preflight":
+            if not model:
+                return "Error: 'model' parameter required for preflight action"
+            share_pf = await _preflight_share(base, model)
+            load_pf = await _preflight_load(base, model, port)
+            return json.dumps({
+                "share_preflight": share_pf,
+                "load_preflight": load_pf,
+            }, indent=2)
         else:
-            return f"Unknown action '{action}'. Use: status, load, stop, reload, share, share_status, share_stop"
+            return f"Unknown action '{action}'. Use: status, load, stop, reload, share, share_status, share_stop, preflight"
     except Exception as e:
         return f"Error: {e}"
 
