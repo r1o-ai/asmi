@@ -486,7 +486,223 @@ async def _preflight_share(base: str, model: Optional[str] = None) -> dict:
     except Exception:
         result["checks"]["duplicate_processes"] = "check_failed"
 
+    # 10. Detect model's distributed parallelism support
+    if model:
+        try:
+            import subprocess
+            # Resolve model path — try ~/Models/<name> first, then as-is (HF ID)
+            model_path = os.path.expanduser(f"~/Models/{model}")
+            if not os.path.isdir(model_path):
+                model_path = model  # fall back to raw (HF ID or full path)
+            check = subprocess.run(
+                [_resolve_python(), "-c",
+                 f"import mlx_lm; "
+                 f"m, _ = mlx_lm.load('{model_path}', lazy=True); "
+                 f"tp = hasattr(m, 'shard'); "
+                 f"pp = hasattr(m, 'model') and hasattr(m.model, 'pipeline'); "
+                 f"print(f'tp={{tp}},pp={{pp}}')"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if check.returncode == 0:
+                parts = dict(p.split("=") for p in check.stdout.strip().split(","))
+                tp = parts.get("tp") == "True"
+                pp = parts.get("pp") == "True"
+                result["checks"]["tensor_parallel"] = tp
+                result["checks"]["pipeline_parallel"] = pp
+                if tp:
+                    result["checks"]["recommended_backend"] = "jaccl"
+                elif pp:
+                    result["checks"]["recommended_backend"] = "ring"
+                else:
+                    result["warnings"].append(
+                        "Model does not support shard() or pipeline(). "
+                        "Distributed inference may not work — falls back to single-node."
+                    )
+            else:
+                stderr = check.stderr.strip().split("\n")[-1] if check.stderr else ""
+                result["checks"]["parallelism_check"] = f"failed: {stderr}"
+        except Exception as e:
+            result["checks"]["parallelism_check"] = f"check_failed: {e}"
+
     return result
+
+
+async def _generate_hostfile(base: str) -> str:
+    """Build JACCL hostfile from live asmi topology + node metrics.
+
+    Queries /topology for RDMA device matrix and /cluster for interface IPs.
+    Writes to ~/.r1o/hostfiles/default.json.
+    """
+    import subprocess
+
+    output_path = os.path.expanduser("~/.r1o/hostfiles/default.json")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Get topology for RDMA device matrix
+    try:
+        topo = await _get("/topology")
+    except Exception as e:
+        return f"Error: Cannot reach topology endpoint: {e}"
+
+    raw_nodes = topo.get("nodes", [])
+    links = topo.get("links", [])
+    if not raw_nodes:
+        return "Error: No nodes in topology"
+
+    # Normalize node names: HUB/Mac → hub (same physical machine)
+    LOCAL_ALIASES = {"HUB", "Mac"}
+    CANONICAL_LOCAL = "hub"
+
+    def canonical(name: str) -> str:
+        return CANONICAL_LOCAL if name in LOCAL_ALIASES else name
+
+    # Deduplicate node list
+    seen: set[str] = set()
+    nodes: list[str] = []
+    for n in raw_nodes:
+        cn = canonical(n)
+        if cn not in seen and cn not in ("MBK", "mini2"):  # skip offline nodes
+            seen.add(cn)
+            nodes.append(cn)
+
+    # Get metrics for each node's interface IPs
+    node_ips: dict[str, str] = {}
+    for node_name in nodes:
+        try:
+            node_base = base if node_name == CANONICAL_LOCAL else f"http://{node_name}:9090"
+            metrics = await _get("/metrics", node_base)
+            iface_ips = metrics.get("interface_ips", {})
+            # Pick first bridge or en* IP
+            ip = None
+            for iface in sorted(iface_ips.keys()):
+                if iface_ips[iface]:
+                    ip = iface_ips[iface][0]
+                    break
+            if ip:
+                node_ips[node_name] = ip
+        except Exception:
+            pass
+
+    online_nodes = [n for n in nodes if n in node_ips]
+    if len(online_nodes) < 2:
+        return f"Error: Need >= 2 online nodes with IPs, got {len(online_nodes)}: {online_nodes}"
+
+    n_nodes = len(online_nodes)
+    node_idx = {name: i for i, name in enumerate(online_nodes)}
+
+    # Build NxN RDMA device matrix from topology links
+    rdma_matrix: list[list] = [[None] * n_nodes for _ in range(n_nodes)]
+    for link in links:
+        a, b = canonical(link.get("node_a", "")), canonical(link.get("node_b", ""))
+        dev_a = link.get("device_a", "")
+        dev_b = link.get("device_b", "")
+        if a in node_idx and b in node_idx and a != b:
+            i, j = node_idx[a], node_idx[b]
+            # device_a is what node_a uses to talk to node_b
+            if dev_a:
+                rdma_matrix[i][j] = dev_a
+            if dev_b:
+                rdma_matrix[j][i] = dev_b
+
+    # Build hostfile
+    hosts = []
+    for node_name in online_nodes:
+        hosts.append({
+            "ssh": node_name,
+            "ips": [node_ips[node_name]],
+            "rdma": rdma_matrix[node_idx[node_name]],
+        })
+
+    hostfile = {
+        "backend": "jaccl",
+        "envs": ["MLX_METAL_FAST_SYNCH=1"],
+        "hosts": hosts,
+    }
+
+    # Write
+    with open(output_path, "w") as f:
+        json.dump(hostfile, f, indent=2)
+
+    # Verify with mlx_lm
+    verify = subprocess.run(
+        [_resolve_python(), "-c",
+         f"from mlx_lm.share import Hostfile; "
+         f"hf = Hostfile.from_file('{output_path}'); "
+         f"print(f'OK: {{hf.backend}}, {{len(hf.hosts)}} hosts')"],
+        capture_output=True, text=True, timeout=10,
+    )
+
+    return json.dumps({
+        "hostfile_path": output_path,
+        "nodes": len(hosts),
+        "backend": "jaccl",
+        "verification": verify.stdout.strip() if verify.returncode == 0 else f"FAILED: {verify.stderr.strip()}",
+        "node_ips": {h["ssh"]: h["ips"][0] for h in hosts},
+    }, indent=2)
+
+
+async def _distributed_launch(base: str, model: str, port: Optional[int] = None) -> str:
+    """One-shot distributed inference: preflight → hostfile → detect parallelism → launch.
+
+    Combines all steps into a single action for easy broadcast.
+    """
+    result: dict = {"steps": []}
+
+    # 1. Run preflight
+    pf = await _preflight_share(base, model)
+    result["steps"].append({"step": "preflight", "passed": pf["passed"]})
+    if not pf["passed"]:
+        result["error"] = "Preflight failed"
+        result["blockers"] = pf["blockers"]
+        return json.dumps(result, indent=2)
+
+    # 2. Check hostfile exists
+    hostfile = pf["checks"].get("hostfile_path")
+    if not hostfile:
+        # Auto-generate
+        gen_result = await _generate_hostfile(base)
+        result["steps"].append({"step": "hostfile_generate", "result": gen_result})
+        # Re-check
+        hostfile = os.path.expanduser("~/.r1o/hostfiles/default.json")
+        if not os.path.exists(hostfile):
+            result["error"] = "Failed to generate hostfile"
+            return json.dumps(result, indent=2)
+    result["hostfile"] = hostfile
+
+    # 3. Determine parallelism
+    tensor = pf["checks"].get("tensor_parallel", False)
+    pipeline = pf["checks"].get("pipeline_parallel", False)
+    if tensor:
+        parallelism = "tensor"
+        backend = "jaccl"
+    elif pipeline:
+        parallelism = "pipeline"
+        backend = "ring"
+    else:
+        parallelism = "auto"
+        backend = "jaccl"  # default to JACCL if we have RDMA
+    result["parallelism"] = parallelism
+    result["backend"] = backend
+
+    # 4. Launch via asmi HTTP API
+    share_port = port or 19080
+    try:
+        resp = await _post("/serve/share", {
+            "model_path": model,
+            "backend": backend,
+            "hostfile": hostfile,
+        }, base)
+        result["steps"].append({"step": "launch", "response": resp})
+        result["status"] = "loading"
+        result["port"] = share_port
+        result["message"] = (
+            f"Distributed {parallelism} inference starting on {pf['checks'].get('hostfile_node_count', '?')} nodes. "
+            f"Server will be at http://hub:{share_port}/v1/chat/completions when ready."
+        )
+    except Exception as e:
+        result["error"] = f"Launch failed: {e}"
+
+    return json.dumps(result, indent=2)
 
 
 async def _preflight_load(base: str, model: Optional[str] = None, port: Optional[int] = None) -> dict:
@@ -820,8 +1036,22 @@ async def asmi_serve(
                 "share_preflight": share_pf,
                 "load_preflight": load_pf,
             }, indent=2)
+
+        elif action == "hostfile_generate":
+            # Build JACCL hostfile from live asmi topology + metrics
+            return await _generate_hostfile(base)
+
+        elif action == "distributed":
+            # One-shot: preflight → hostfile check → launch distributed server
+            if not model:
+                return "Error: 'model' parameter required for distributed action"
+            return await _distributed_launch(base, model, port)
+
         else:
-            return f"Unknown action '{action}'. Use: status, load, stop, reload, share, share_status, share_stop, preflight"
+            return (
+                f"Unknown action '{action}'. Use: status, load, stop, reload, "
+                "share, share_status, share_stop, preflight, hostfile_generate, distributed"
+            )
     except Exception as e:
         return f"Error: {e}"
 

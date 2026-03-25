@@ -28,6 +28,29 @@ pub const MANAGED_PORTS: &[(u16, ServeEngine)] = &[
 
 /// Share session log file.
 const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
+/// Default port for the distributed inference server.
+const SHARE_PORT: u16 = 19080;
+
+/// Resolve the `mlx.launch` CLI script path.
+/// Falls back to running as `python3 -m mlx._distributed_utils.launch`.
+fn resolve_mlx_launch() -> String {
+    // Try the pip-installed CLI script first
+    if let Ok(output) = std::process::Command::new("which").arg("mlx.launch").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+    // Homebrew common path
+    let brew_path = "/opt/homebrew/bin/mlx.launch";
+    if std::path::Path::new(brew_path).exists() {
+        return brew_path.to_string();
+    }
+    // Fallback: invoke as python module (caller must prepend "-m mlx._distributed_utils.launch")
+    resolve_python().to_string()
+}
 
 /// Warmup timeout for bare server start (no model — should be fast).
 const WARMUP_TIMEOUT_BARE_SECS: u64 = 60;
@@ -232,7 +255,7 @@ impl ReadinessCheck for LogMonitor {
     }
 }
 
-/// Poll a log file for readiness/error markers.
+/// Poll a log file for readiness/error markers + HTTP health check on share port.
 /// Returns Ok(true) when ready, Ok(false) on timeout, Err on error markers.
 async fn poll_log(
     log_path: &str,
@@ -241,7 +264,9 @@ async fn poll_log(
     timeout_secs: u64,
 ) -> Result<bool, String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let health_url = format!("http://localhost:{SHARE_PORT}/v1/models");
     loop {
+        // Check log markers
         if let Ok(content) = tokio::fs::read_to_string(log_path).await {
             if ready_markers.iter().any(|m| content.contains(m)) {
                 return Ok(true);
@@ -249,6 +274,18 @@ async fn poll_log(
             if error_markers.iter().any(|m| content.contains(m)) {
                 let detail = read_log_tail(log_path, 10).await;
                 return Err(format!("share error: {detail}"));
+            }
+        }
+        // Also try HTTP health check (server may be ready before log flushes)
+        if let Ok(resp) = reqwest::Client::new()
+            .get(&health_url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                tracing::info!("share server ready via HTTP health check on port {SHARE_PORT}");
+                return Ok(true);
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -780,11 +817,20 @@ impl ShareManager {
             readiness: Arc::new(LogMonitor {
                 log_path: SHARE_LOG_PATH.to_string(),
                 ready_markers: vec![
+                    // mlx_lm.server (uvicorn)
+                    "Uvicorn running on",
+                    "Application startup complete",
+                    // Legacy markers
                     "Starting endpoint",
                     "Connected to",
                     "Listening on",
                 ],
-                error_markers: vec!["Error:", "Exception:"],
+                error_markers: vec![
+                    "Error:",
+                    "Exception:",
+                    "ValueError:",
+                    "RuntimeError:",
+                ],
             }),
         }
     }
@@ -889,32 +935,41 @@ async fn do_share_load_inner(
     // Resolve backend
     let backend = resolve_backend(&req.backend, req.hostfile.as_deref());
 
-    // Build command: python3 -m mlx_lm share --model <path>
     let py = resolve_python().to_string();
-    let cfg = ServeEngine::MlxLmShare.config();
-    let mut cmd_args: Vec<String> = vec![
-        "-m".into(),
-        cfg.binary.to_string(),
-    ];
-    cmd_args.extend(cfg.binary_args.iter().map(|s| s.to_string()));
-    if let Some(flag) = cfg.model_flag {
-        cmd_args.push(flag.into());
-        cmd_args.push(model_path.clone());
-    }
+    let share_port = SHARE_PORT.to_string();
 
-    // JACCL distributed: mlx_lm share handles JACCL internally via --hostfile
-    // (no separate mlx.launch wrapper needed — mlx_lm.share.launch() calls launch_jaccl())
+    // Build the target command: python3 -m mlx_lm.server --model <path> --port <port> --host 0.0.0.0
+    let server_args = vec![
+        "-m".to_string(),
+        "mlx_lm.server".to_string(),
+        "--model".to_string(),
+        model_path.clone(),
+        "--port".to_string(),
+        share_port.clone(),
+        "--host".to_string(),
+        "0.0.0.0".to_string(),
+    ];
+
+    // For distributed: wrap with mlx.launch --hostfile X --backend Y -- <server_args>
+    // For single-node: run server directly
     let (final_program, final_args) = if backend == ServeBackend::Jaccl {
         let hf = req
             .hostfile
             .clone()
             .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
-        // Insert --hostfile before --model in the args
-        cmd_args.insert(2, "--hostfile".to_string());
-        cmd_args.insert(3, hf);
-        (py, cmd_args)
+        let launch = resolve_mlx_launch();
+        let mut args = vec![
+            "--hostfile".to_string(),
+            hf,
+            "--env".to_string(),
+            "MLX_METAL_FAST_SYNCH=1".to_string(),
+            "--".to_string(),
+        ];
+        args.push(py.clone());
+        args.extend(server_args);
+        (launch, args)
     } else {
-        (py, cmd_args)
+        (py, server_args)
     };
 
     // Truncate log for fresh output
@@ -929,7 +984,7 @@ async fn do_share_load_inner(
         program = %final_program,
         args = ?final_args,
         log_path = SHARE_LOG_PATH,
-        "spawning mlx_lm share"
+        "spawning distributed mlx_lm.server"
     );
 
     let mut child = Command::new(&final_program)
