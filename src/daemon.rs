@@ -208,11 +208,20 @@ async fn jaccl_config_handler(
         }
 
         // Build JACCL hostfile from live topology links
-        let nodes = &report.nodes;
+        let target_nodes = if let Some(largest_subset) = report.jaccl_ready_subsets.iter().max_by_key(|s| s.len()) {
+            if largest_subset.len() >= 2 {
+                largest_subset.clone()
+            } else {
+                report.nodes.clone()
+            }
+        } else {
+            report.nodes.clone()
+        };
+
         let links = &report.links;
 
-        let entries: Vec<serde_json::Value> = nodes.iter().map(|node| {
-            let rdma_row: Vec<serde_json::Value> = nodes.iter().map(|other| {
+        let entries: Vec<serde_json::Value> = target_nodes.iter().map(|node| {
+            let rdma_row: Vec<serde_json::Value> = target_nodes.iter().map(|other| {
                 if node == other {
                     serde_json::Value::Null
                 } else {
@@ -224,7 +233,8 @@ async fn jaccl_config_handler(
                         })
                         .map(|l| {
                             let device = if l.node_a == *node { &l.device_a } else { &l.device_b };
-                            serde_json::Value::String(format!("rdma_{device}"))
+                            let clean_device = device.strip_prefix("rdma_").unwrap_or(device);
+                            serde_json::Value::String(format!("rdma_{clean_device}"))
                         })
                         .unwrap_or(serde_json::Value::Null)
                 }
@@ -315,13 +325,67 @@ async fn jaccl_generate_handler(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let nm = state.node_map.read().await;
+    let mut hostfile_json = String::new();
 
-    if nm.rdma_links.is_empty() {
-        return Err(ApiError::NotFound("No RDMA links discovered. Run `asmi` TUI scan first.".into()));
+    // Prefer live topology cache over stale NodeMap rdma_links
+    {
+        let topo_cache = state.topology_cache.read().await;
+        if let Some((report, _)) = topo_cache.as_ref() {
+            if !report.links.is_empty() {
+                // Find the largest jaccl-ready subset
+                let target_nodes = if let Some(largest_subset) = report.jaccl_ready_subsets.iter().max_by_key(|s| s.len()) {
+                    if largest_subset.len() >= 2 {
+                        largest_subset.clone()
+                    } else {
+                        report.nodes.clone() // Fallback if no valid subset >= 2
+                    }
+                } else {
+                    report.nodes.clone() // Fallback
+                };
+
+                let links = &report.links;
+
+                let entries: Vec<serde_json::Value> = target_nodes.iter().map(|node| {
+                    let rdma_row: Vec<serde_json::Value> = target_nodes.iter().map(|other| {
+                        if node == other {
+                            serde_json::Value::Null
+                        } else {
+                            links.iter()
+                                .find(|l| {
+                                    (l.node_a == *node && l.node_b == *other) ||
+                                    (l.node_b == *node && l.node_a == *other)
+                                })
+                                .map(|l| {
+                                    let device = if l.node_a == *node { &l.device_a } else { &l.device_b };
+                                    // Strip "rdma_" prefix if it already exists, then re-add it
+                                    let clean_device = device.strip_prefix("rdma_").unwrap_or(device);
+                                    serde_json::Value::String(format!("rdma_{clean_device}"))
+                                })
+                                .unwrap_or(serde_json::Value::Null)
+                        }
+                    }).collect();
+
+                    serde_json::json!({
+                        "ssh": node,
+                        "ips": [],
+                        "rdma": rdma_row,
+                    })
+                }).collect();
+
+                hostfile_json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+            }
+        }
     }
 
-    let hostfile_json = nm.hostfile_jaccl(&state.hostname);
+    // Fallback: use stale NodeMap rdma_links
+    if hostfile_json.is_empty() || hostfile_json == "[]" {
+        let nm = state.node_map.read().await;
+        if nm.rdma_links.is_empty() {
+            return Err(ApiError::NotFound("No RDMA links discovered. Run `asmi` TUI scan first to discover RDMA topology.".into()));
+        }
+        hostfile_json = nm.hostfile_jaccl(&state.hostname);
+    }
+
     let hosts: serde_json::Value = serde_json::from_str(&hostfile_json)
         .map_err(|e| ApiError::Internal(format!("Failed to build matrix: {e}")))?;
 
@@ -811,6 +875,93 @@ async fn serve_share_stop_handler(
     state.share_manager.stop().await;
     state.peer_heartbeat.stop().await;
     Json(serde_json::json!({"ok": true}))
+}
+
+/// POST /serve/distributed/join — join a distributed inference session as a worker.
+///
+/// Called by the hub's asmi to recruit peers. Each peer starts a local
+/// mlx_lm.server process with JACCL env vars. No SSH — asmi handles it.
+async fn serve_distributed_join_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DistributedJoinRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use tokio::process::Command;
+
+    let py = crate::daemon::resolve_python().to_string();
+    let model_path = if req.model_path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            format!("{}/{}", home.display(), &req.model_path[2..])
+        } else {
+            req.model_path.clone()
+        }
+    } else {
+        req.model_path.clone()
+    };
+
+    // Write IBV devices to temp file (JACCL reads from file path)
+    let ibv_tmp = std::env::temp_dir().join(format!("asmi-ibv-{}.json", req.rank));
+    tokio::fs::write(&ibv_tmp, &req.ibv_devices).await
+        .map_err(|e| ApiError::Internal(format!("write ibv devices: {e}")))?;
+
+    // Build command: python3 -m mlx_lm.server --model <path> --port <port> --host 0.0.0.0
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m").arg("mlx_lm.server")
+        .arg("--model").arg(&model_path)
+        .arg("--port").arg(req.port.to_string())
+        .arg("--host").arg("0.0.0.0");
+
+    // Set JACCL env vars
+    cmd.env("MLX_RANK", req.rank.to_string())
+        .env("MLX_WORLD_SIZE", req.world_size.to_string())
+        .env("MLX_JACCL_COORDINATOR", &req.coordinator)
+        .env("MLX_DISTRIBUTED_BACKEND", &req.backend)
+        .env("MLX_IBV_DEVICES", ibv_tmp.to_string_lossy().to_string())
+        .env("MLX_METAL_FAST_SYNCH", "1");
+
+    // Log file
+    let log_path = format!("/tmp/r1o-distributed-rank{}.log", req.rank);
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true)
+        .open(&log_path)
+        .map_err(|e| ApiError::Internal(format!("open log: {e}")))?;
+    let log_stderr = log_file.try_clone()
+        .map_err(|e| ApiError::Internal(format!("clone log: {e}")))?;
+
+    cmd.stdout(log_file).stderr(log_stderr).kill_on_drop(false);
+
+    tracing::info!(
+        rank = req.rank,
+        world_size = req.world_size,
+        model = %model_path,
+        coordinator = %req.coordinator,
+        "joining distributed session"
+    );
+
+    let child = cmd.spawn()
+        .map_err(|e| ApiError::Internal(format!("spawn worker: {e}")))?;
+    let pid = child.id().unwrap_or(0);
+
+    // Store in share manager so it can be stopped
+    state.share_manager.adopt_child(child, &model_path, asmi_core::ServeBackend::Jaccl).await;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "rank": req.rank,
+        "pid": pid,
+        "log": log_path,
+        "hostname": state.hostname,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DistributedJoinRequest {
+    model_path: String,
+    rank: u32,
+    world_size: u32,
+    coordinator: String,
+    backend: String,
+    ibv_devices: String,
+    port: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,6 +1554,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/share", post(serve_share_handler))
         .route("/serve/share/status", get(serve_share_status_handler))
         .route("/serve/share/stop", post(serve_share_stop_handler))
+        .route("/serve/distributed/join", post(serve_distributed_join_handler))
         .route("/watchdog", get(watchdog_handler))
         .route("/watchdog/peers", get(peer_heartbeat_handler))
         .route("/watchdog/gpu-lock", get(gpu_lock_handler))

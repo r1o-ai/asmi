@@ -920,6 +920,24 @@ impl ShareManager {
             error: s.error.clone(),
         }
     }
+
+    /// Adopt an externally-spawned child process (used by /serve/distributed/join).
+    pub async fn adopt_child(
+        &self,
+        child: tokio::process::Child,
+        model: &str,
+        backend: ServeBackend,
+    ) {
+        let mut s = self.inner.write().await;
+        let pid = child.id().unwrap_or(0);
+        s.pid = Some(pid);
+        s.child = Some(child);
+        s.model = Some(model.to_string());
+        s.backend = backend;
+        s.state = ServeState::Loading;
+        s.load_started = Some(std::time::Instant::now());
+        tracing::info!(pid, model, "adopted distributed worker process");
+    }
 }
 
 /// Background share load task.
@@ -956,42 +974,27 @@ async fn do_share_load_inner(
     let py = resolve_python().to_string();
     let share_port = SHARE_PORT.to_string();
 
-    // Server args (model, port, host)
+    // For distributed JACCL: orchestrate via asmi peer HTTP APIs
+    // For single-node: run python3 -m mlx_lm.server directly
+    if backend == ServeBackend::Jaccl {
+        let hf_path = req
+            .hostfile
+            .clone()
+            .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
+        return do_jaccl_orchestrate(inner, readiness, &model_path, &hf_path).await;
+    }
+
     let model_args = vec![
         "--model".to_string(),
         model_path.clone(),
         "--port".to_string(),
-        share_port.clone(),
+        SHARE_PORT.to_string(),
         "--host".to_string(),
         "0.0.0.0".to_string(),
     ];
-
-    // For distributed: mlx.launch --hostfile X -- mlx_lm.server --model Y --port Z
-    // mlx.launch SSHes to each node and runs the mlx_lm.server CLI script
-    // (which() resolves per-node since mlx_lm.server is a pip-installed script)
-    //
-    // For single-node: python3 -m mlx_lm.server --model Y --port Z
-    let (final_program, final_args) = if backend == ServeBackend::Jaccl {
-        let hf = req
-            .hostfile
-            .clone()
-            .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
-        let launch = resolve_mlx_launch();
-        let mut args = vec![
-            "--hostfile".to_string(),
-            hf,
-            "--env".to_string(),
-            "MLX_METAL_FAST_SYNCH=1".to_string(),
-            "--".to_string(),
-            resolve_mlx_lm_server(),
-        ];
-        args.extend(model_args);
-        (launch, args)
-    } else {
-        let mut args = vec!["-m".to_string(), "mlx_lm.server".to_string()];
-        args.extend(model_args);
-        (py, args)
-    };
+    let final_program = py;
+    let mut final_args = vec!["-m".to_string(), "mlx_lm.server".to_string()];
+    final_args.extend(model_args);
 
     // Truncate log for fresh output
     let log_file = std::fs::OpenOptions::new()
@@ -1048,6 +1051,173 @@ async fn do_share_load_inner(
             s.state = ServeState::Error;
             s.error = Some(crash_msg.clone());
             tracing::error!(%crash_msg, "share process crashed during startup");
+        }
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// JACCL orchestration via asmi peer HTTP APIs
+// ===========================================================================
+
+/// Orchestrate distributed JACCL inference by calling each peer's asmi daemon.
+/// No SSH, no mlx.launch — asmi is the launcher on every node.
+async fn do_jaccl_orchestrate(
+    inner: &Arc<RwLock<ManagedProcess>>,
+    readiness: &Arc<LogMonitor>,
+    model_path: &str,
+    hostfile_path: &str,
+) -> Result<(), anyhow::Error> {
+    use serde_json::json;
+
+    // Parse hostfile to get hosts + RDMA matrix
+    let hf_content = tokio::fs::read_to_string(hostfile_path).await?;
+    let hf: serde_json::Value = serde_json::from_str(&hf_content)?;
+    let hosts = hf.get("hosts")
+        .and_then(|h| h.as_array())
+        .ok_or_else(|| anyhow::anyhow!("hostfile missing 'hosts' array"))?;
+
+    let world_size = hosts.len() as u32;
+    if world_size < 2 {
+        anyhow::bail!("need >= 2 hosts for distributed, got {world_size}");
+    }
+
+    // Coordinator is rank 0's IP
+    let coordinator_ip = hosts[0]
+        .get("ips").and_then(|i| i.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("rank 0 missing ips in hostfile"))?;
+    let coordinator = format!("{coordinator_ip}:32323");
+
+    // Build IBV devices JSON (the full RDMA matrix for all ranks)
+    let ibv_devices: Vec<serde_json::Value> = hosts.iter()
+        .map(|h| h.get("rdma").cloned().unwrap_or(json!([])))
+        .collect();
+    let ibv_json = serde_json::to_string(&ibv_devices)?;
+
+    tracing::info!(
+        world_size,
+        coordinator = %coordinator,
+        model = model_path,
+        "orchestrating JACCL distributed session via asmi peers"
+    );
+
+    // Step 1: Call each remote peer's /serve/distributed/join
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let mut peer_results = Vec::new();
+    for (rank, host) in hosts.iter().enumerate().skip(1) {
+        let ssh_name = host.get("ssh").and_then(|s| s.as_str()).unwrap_or("unknown");
+        let peer_url = format!("http://{}:9090/serve/distributed/join", ssh_name);
+
+        tracing::info!(rank, peer = ssh_name, "recruiting peer");
+        let resp = client.post(&peer_url)
+            .json(&json!({
+                "model_path": model_path,
+                "rank": rank,
+                "world_size": world_size,
+                "coordinator": coordinator,
+                "backend": "jaccl",
+                "ibv_devices": ibv_json,
+                "port": SHARE_PORT,
+            }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let body: serde_json::Value = r.json().await.unwrap_or(json!({"ok": false}));
+                tracing::info!(rank, peer = ssh_name, pid = ?body.get("pid"), "peer joined");
+                peer_results.push((rank, ssh_name.to_string(), true));
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                tracing::error!(rank, peer = ssh_name, %status, body = %body, "peer join failed");
+                peer_results.push((rank, ssh_name.to_string(), false));
+            }
+            Err(e) => {
+                tracing::error!(rank, peer = ssh_name, error = %e, "peer unreachable");
+                peer_results.push((rank, ssh_name.to_string(), false));
+            }
+        }
+    }
+
+    // Check all peers joined
+    let failed: Vec<_> = peer_results.iter().filter(|(_, _, ok)| !ok).collect();
+    if !failed.is_empty() {
+        let names: Vec<_> = failed.iter().map(|(r, n, _)| format!("rank{r}={n}")).collect();
+        anyhow::bail!("peers failed to join: {}", names.join(", "));
+    }
+
+    // Step 2: Start rank 0 locally with same env vars
+    let py = resolve_python().to_string();
+    let ibv_tmp = std::env::temp_dir().join("asmi-ibv-0.json");
+    tokio::fs::write(&ibv_tmp, &ibv_json).await?;
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true)
+        .open(SHARE_LOG_PATH)?;
+    let log_stderr = log_file.try_clone()?;
+
+    let mut cmd = Command::new(&py);
+    cmd.arg("-m").arg("mlx_lm.server")
+        .arg("--model").arg(model_path)
+        .arg("--port").arg(SHARE_PORT.to_string())
+        .arg("--host").arg("0.0.0.0")
+        .env("MLX_RANK", "0")
+        .env("MLX_WORLD_SIZE", world_size.to_string())
+        .env("MLX_JACCL_COORDINATOR", &coordinator)
+        .env("MLX_DISTRIBUTED_BACKEND", "jaccl")
+        .env("MLX_IBV_DEVICES", ibv_tmp.to_string_lossy().to_string())
+        .env("MLX_METAL_FAST_SYNCH", "1")
+        .stdout(log_file)
+        .stderr(log_stderr)
+        .kill_on_drop(false);
+
+    tracing::info!(
+        model = model_path,
+        port = SHARE_PORT,
+        "starting rank 0 locally"
+    );
+
+    let mut child = cmd.spawn()?;
+    let child_pid = child.id().unwrap_or(0);
+
+    // Step 3: Wait for readiness (HTTP health check + log markers)
+    let readiness_result = readiness.poll_ready(&mut child, WARMUP_TIMEOUT_SHARE_SECS).await;
+
+    let mut s = inner.write().await;
+    match readiness_result {
+        Ok(true) => {
+            s.pid = Some(child_pid);
+            s.child = Some(child);
+            s.model = Some(model_path.to_string());
+            s.backend = ServeBackend::Jaccl;
+            s.state = ServeState::Ready;
+            tracing::info!(
+                pid = child_pid,
+                model = model_path,
+                world_size,
+                "distributed JACCL session ready"
+            );
+            persist_state(&s).await;
+        }
+        Ok(false) => {
+            s.state = ServeState::Error;
+            let detail = read_log_tail(SHARE_LOG_PATH, 10).await;
+            s.error = Some(format!(
+                "distributed warmup timeout ({WARMUP_TIMEOUT_SHARE_SECS}s) — {detail}"
+            ));
+            let _ = child.kill().await;
+        }
+        Err(crash_msg) => {
+            s.state = ServeState::Error;
+            s.error = Some(crash_msg);
         }
     }
 
