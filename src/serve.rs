@@ -32,24 +32,42 @@ const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
 const SHARE_PORT: u16 = 19080;
 
 /// Resolve the `mlx.launch` CLI script path.
-/// Falls back to running as `python3 -m mlx._distributed_utils.launch`.
+/// Checks known locations first (launchd doesn't have Homebrew in PATH).
 fn resolve_mlx_launch() -> String {
-    // Try the pip-installed CLI script first
+    // Check known Homebrew locations first (launchd has no PATH)
+    for path in &[
+        "/opt/homebrew/bin/mlx.launch",
+        "/usr/local/bin/mlx.launch",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+    }
+    // Try which (works in interactive shells)
     if let Ok(output) = std::process::Command::new("which").arg("mlx.launch").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
+            if !path.is_empty() && std::path::Path::new(&path).exists() {
                 return path;
             }
         }
     }
-    // Homebrew common path
-    let brew_path = "/opt/homebrew/bin/mlx.launch";
-    if std::path::Path::new(brew_path).exists() {
-        return brew_path.to_string();
+    // Should not reach here — mlx.launch is installed via pip
+    tracing::warn!("mlx.launch not found! Distributed inference will fail.");
+    "mlx.launch".to_string()
+}
+
+/// Resolve the `mlx_lm.server` CLI script path.
+fn resolve_mlx_lm_server() -> String {
+    for path in &[
+        "/opt/homebrew/bin/mlx_lm.server",
+        "/usr/local/bin/mlx_lm.server",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
     }
-    // Fallback: invoke as python module (caller must prepend "-m mlx._distributed_utils.launch")
-    resolve_python().to_string()
+    "mlx_lm.server".to_string()
 }
 
 /// Warmup timeout for bare server start (no model — should be fast).
@@ -938,10 +956,8 @@ async fn do_share_load_inner(
     let py = resolve_python().to_string();
     let share_port = SHARE_PORT.to_string();
 
-    // Build the target command: python3 -m mlx_lm.server --model <path> --port <port> --host 0.0.0.0
-    let server_args = vec![
-        "-m".to_string(),
-        "mlx_lm.server".to_string(),
+    // Server args (model, port, host)
+    let model_args = vec![
         "--model".to_string(),
         model_path.clone(),
         "--port".to_string(),
@@ -950,8 +966,11 @@ async fn do_share_load_inner(
         "0.0.0.0".to_string(),
     ];
 
-    // For distributed: wrap with mlx.launch --hostfile X --backend Y -- <server_args>
-    // For single-node: run server directly
+    // For distributed: mlx.launch --hostfile X -- mlx_lm.server --model Y --port Z
+    // mlx.launch SSHes to each node and runs the mlx_lm.server CLI script
+    // (which() resolves per-node since mlx_lm.server is a pip-installed script)
+    //
+    // For single-node: python3 -m mlx_lm.server --model Y --port Z
     let (final_program, final_args) = if backend == ServeBackend::Jaccl {
         let hf = req
             .hostfile
@@ -964,12 +983,14 @@ async fn do_share_load_inner(
             "--env".to_string(),
             "MLX_METAL_FAST_SYNCH=1".to_string(),
             "--".to_string(),
+            resolve_mlx_lm_server(),
         ];
-        args.push(py.clone());
-        args.extend(server_args);
+        args.extend(model_args);
         (launch, args)
     } else {
-        (py, server_args)
+        let mut args = vec!["-m".to_string(), "mlx_lm.server".to_string()];
+        args.extend(model_args);
+        (py, args)
     };
 
     // Truncate log for fresh output
