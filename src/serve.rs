@@ -1091,17 +1091,32 @@ async fn do_jaccl_orchestrate(
         .ok_or_else(|| anyhow::anyhow!("rank 0 missing ips in hostfile"))?;
     let coordinator = format!("{coordinator_ip}:32323");
 
-    // Build IBV devices JSON (the full RDMA matrix for all ranks)
+    // Build backend-specific payloads
+    let backend_str = hf.get("backend").and_then(|b| b.as_str()).unwrap_or("ring");
+
     let ibv_devices: Vec<serde_json::Value> = hosts.iter()
         .map(|h| h.get("rdma").cloned().unwrap_or(json!([])))
         .collect();
     let ibv_json = serde_json::to_string(&ibv_devices)?;
 
+    // Ring hostfile: [["ip1:port1"], ["ip2:port2"]]
+    let ring_port_start = 32323u16;
+    let ring_hostfile: Vec<Vec<String>> = hosts.iter().enumerate()
+        .map(|(i, h)| {
+            let ip = h.get("ips").and_then(|a| a.as_array())
+                .and_then(|a| a.first()).and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1");
+            vec![format!("{}:{}", ip, ring_port_start + i as u16)]
+        })
+        .collect();
+    let ring_hostfile_json = serde_json::to_string(&ring_hostfile)?;
+
     tracing::info!(
         world_size,
         coordinator = %coordinator,
+        backend = backend_str,
         model = model_path,
-        "orchestrating JACCL distributed session via asmi peers"
+        "orchestrating distributed session via asmi peers"
     );
 
     // Step 1: Call each remote peer's /serve/distributed/join
@@ -1110,7 +1125,20 @@ async fn do_jaccl_orchestrate(
         .build()?;
 
     let mut peer_results = Vec::new();
-    for (rank, host) in hosts.iter().enumerate().skip(1) {
+    // If hub is NOT rank 0 (orchestrator-only), recruit ALL ranks including rank 0
+    // If hub IS rank 0, skip rank 0 (started locally below)
+    let local_hostname = std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let rank0_ssh = hosts[0].get("ssh").and_then(|s| s.as_str()).unwrap_or("");
+    let hub_is_rank0 = rank0_ssh == "127.0.0.1"
+        || rank0_ssh == "localhost"
+        || rank0_ssh == local_hostname;
+    let start_rank = if hub_is_rank0 { 1 } else { 0 };
+
+    for (rank, host) in hosts.iter().enumerate().skip(start_rank) {
         let ssh_name = host.get("ssh").and_then(|s| s.as_str()).unwrap_or("unknown");
         let peer_url = format!("http://{}:9090/serve/distributed/join", ssh_name);
 
@@ -1121,8 +1149,9 @@ async fn do_jaccl_orchestrate(
                 "rank": rank,
                 "world_size": world_size,
                 "coordinator": coordinator,
-                "backend": "jaccl",
+                "backend": backend_str,
                 "ibv_devices": ibv_json,
+                "ring_hostfile": ring_hostfile_json,
                 "port": SHARE_PORT,
             }))
             .send()
@@ -1154,7 +1183,38 @@ async fn do_jaccl_orchestrate(
         anyhow::bail!("peers failed to join: {}", names.join(", "));
     }
 
-    // Step 2: Start rank 0 locally with same env vars
+    // Step 2: Start rank 0 locally (only if hub IS rank 0)
+    if !hub_is_rank0 {
+        // Hub is orchestrator-only — all ranks run on remote peers
+        // Monitor readiness via HTTP to rank 0's node
+        let rank0_url = format!("http://{}:{}/v1/models", rank0_ssh, SHARE_PORT);
+        tracing::info!(rank0_url = %rank0_url, "hub is orchestrator-only, polling rank 0 remotely");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(WARMUP_TIMEOUT_SHARE_SECS);
+        loop {
+            if let Ok(resp) = reqwest::Client::new()
+                .get(&rank0_url)
+                .timeout(std::time::Duration::from_secs(2))
+                .send().await
+            {
+                if resp.status().is_success() {
+                    let mut s = inner.write().await;
+                    s.model = Some(model_path.to_string());
+                    s.backend = ServeBackend::Jaccl;
+                    s.state = ServeState::Ready;
+                    tracing::info!(world_size, "distributed session ready (orchestrator-only mode)");
+                    return Ok(());
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let mut s = inner.write().await;
+                s.state = ServeState::Error;
+                s.error = Some("timeout waiting for rank 0 to become ready".into());
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    }
+
     let py = resolve_python().to_string();
     let ibv_tmp = std::env::temp_dir().join("asmi-ibv-0.json");
     tokio::fs::write(&ibv_tmp, &ibv_json).await?;
@@ -1171,13 +1231,22 @@ async fn do_jaccl_orchestrate(
         .arg("--host").arg("0.0.0.0")
         .env("MLX_RANK", "0")
         .env("MLX_WORLD_SIZE", world_size.to_string())
-        .env("MLX_JACCL_COORDINATOR", &coordinator)
-        .env("MLX_DISTRIBUTED_BACKEND", "jaccl")
-        .env("MLX_IBV_DEVICES", ibv_tmp.to_string_lossy().to_string())
         .env("MLX_METAL_FAST_SYNCH", "1")
         .stdout(log_file)
         .stderr(log_stderr)
         .kill_on_drop(false);
+
+    if backend_str == "jaccl" {
+        cmd.env("MLX_DISTRIBUTED_BACKEND", "jaccl")
+            .env("MLX_JACCL_COORDINATOR", &coordinator)
+            .env("MLX_IBV_DEVICES", ibv_tmp.to_string_lossy().to_string());
+    } else {
+        // Ring: write hostfile JSON to temp file, set env to file path
+        let ring_tmp = std::env::temp_dir().join("asmi-ring-0.json");
+        tokio::fs::write(&ring_tmp, &ring_hostfile_json).await?;
+        cmd.env("MLX_DISTRIBUTED_BACKEND", "ring")
+            .env("MLX_HOSTFILE", ring_tmp.to_string_lossy().to_string());
+    }
 
     tracing::info!(
         model = model_path,

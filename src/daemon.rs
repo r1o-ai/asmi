@@ -910,13 +910,25 @@ async fn serve_distributed_join_handler(
         .arg("--port").arg(req.port.to_string())
         .arg("--host").arg("0.0.0.0");
 
-    // Set JACCL env vars
+    // Set distributed env vars (backend-specific)
     cmd.env("MLX_RANK", req.rank.to_string())
         .env("MLX_WORLD_SIZE", req.world_size.to_string())
-        .env("MLX_JACCL_COORDINATOR", &req.coordinator)
-        .env("MLX_DISTRIBUTED_BACKEND", &req.backend)
-        .env("MLX_IBV_DEVICES", ibv_tmp.to_string_lossy().to_string())
         .env("MLX_METAL_FAST_SYNCH", "1");
+
+    if req.backend == "jaccl" {
+        cmd.env("MLX_DISTRIBUTED_BACKEND", "jaccl")
+            .env("MLX_JACCL_COORDINATOR", &req.coordinator)
+            .env("MLX_IBV_DEVICES", ibv_tmp.to_string_lossy().to_string());
+    } else {
+        // Ring backend: MLX_HOSTFILE must point to a temp file containing the ring JSON
+        cmd.env("MLX_DISTRIBUTED_BACKEND", "ring");
+        if let Some(ref hf) = req.ring_hostfile {
+            let hf_tmp = std::env::temp_dir().join(format!("asmi-ring-{}.json", req.rank));
+            std::fs::write(&hf_tmp, hf)
+                .map_err(|e| ApiError::Internal(format!("write ring hostfile: {e}")))?;
+            cmd.env("MLX_HOSTFILE", hf_tmp.to_string_lossy().to_string());
+        }
+    }
 
     // Log file
     let log_path = format!("/tmp/r1o-distributed-rank{}.log", req.rank);
@@ -962,6 +974,8 @@ struct DistributedJoinRequest {
     backend: String,
     ibv_devices: String,
     port: u16,
+    /// Ring backend: JSON hostfile string e.g. [["ip1:port1"], ["ip2:port2"]]
+    ring_hostfile: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
