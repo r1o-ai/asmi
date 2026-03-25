@@ -902,25 +902,17 @@ async fn do_share_load_inner(
         cmd_args.push(model_path.clone());
     }
 
-    // JACCL distributed wrapper
+    // JACCL distributed: mlx_lm share handles JACCL internally via --hostfile
+    // (no separate mlx.launch wrapper needed — mlx_lm.share.launch() calls launch_jaccl())
     let (final_program, final_args) = if backend == ServeBackend::Jaccl {
         let hf = req
             .hostfile
             .clone()
             .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
-        let jaccl_py = resolve_python().to_string();
-        let mut jaccl_args = vec![
-            "-m".to_string(),
-            "mlx.launch".to_string(),
-            "--hostfile".to_string(),
-            hf,
-            "--backend".to_string(),
-            "jaccl".to_string(),
-            "--".to_string(),
-            py,
-        ];
-        jaccl_args.extend(cmd_args);
-        (jaccl_py, jaccl_args)
+        // Insert --hostfile before --model in the args
+        cmd_args.insert(2, "--hostfile".to_string());
+        cmd_args.insert(3, hf);
+        (py, cmd_args)
     } else {
         (py, cmd_args)
     };

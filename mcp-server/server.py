@@ -362,32 +362,49 @@ async def _preflight_share(base: str, model: Optional[str] = None) -> dict:
         )
         result["passed"] = False
     else:
-        # Validate hostfile JSON and format
+        # Validate hostfile JSON structure
         try:
             import json as _json
             with open(hostfile_path) as f:
                 hf_data = _json.load(f)
-            if not isinstance(hf_data, list) or len(hf_data) < 2:
+
+            # Must be dict with {backend, hosts} (mlx_lm >= 0.31 format)
+            if isinstance(hf_data, list):
                 result["blockers"].append(
-                    f"Hostfile {hostfile_path} must be a JSON array with >= 2 node entries, "
-                    f"got {type(hf_data).__name__} with {len(hf_data) if isinstance(hf_data, list) else 0} entries"
+                    f"Hostfile {hostfile_path} is a bare array — needs dict format with "
+                    "'backend' and 'hosts' keys. Fix with:\n"
+                    "  python3 -c \"import json; d=json.load(open('{hf}')); "
+                    "json.dump({{'backend':'jaccl','envs':['MLX_METAL_FAST_SYNCH=1'],'hosts':d}}, "
+                    f"open('{hostfile_path}','w'), indent=2)\""
                 )
                 result["passed"] = False
-            else:
-                # Verify each entry has 'ssh' and 'rdma' keys
-                for i, entry in enumerate(hf_data):
-                    if not isinstance(entry, dict):
-                        result["blockers"].append(f"Hostfile entry [{i}] is not a dict")
+            elif isinstance(hf_data, dict):
+                backend_val = hf_data.get("backend", "")
+                hosts_list = hf_data.get("hosts", [])
+                if not backend_val:
+                    result["blockers"].append(
+                        f"Hostfile missing 'backend' field. Add '\"backend\": \"jaccl\"' to {hostfile_path}"
+                    )
+                    result["passed"] = False
+                if len(hosts_list) < 2:
+                    result["blockers"].append(
+                        f"Hostfile needs >= 2 host entries, got {len(hosts_list)}"
+                    )
+                    result["passed"] = False
+                # Verify each host entry
+                for i, entry in enumerate(hosts_list):
+                    if not isinstance(entry, dict) or "ssh" not in entry:
+                        result["blockers"].append(f"Hostfile hosts[{i}] missing 'ssh' key")
                         result["passed"] = False
                         break
-                    if "ssh" not in entry:
-                        result["blockers"].append(f"Hostfile entry [{i}] missing 'ssh' key")
-                        result["passed"] = False
-                        break
+                result["checks"]["hostfile_backend"] = backend_val or "(empty)"
                 result["checks"]["hostfile_nodes"] = [
-                    e.get("ssh", "?") for e in hf_data if isinstance(e, dict)
+                    e.get("ssh", "?") for e in hosts_list if isinstance(e, dict)
                 ]
-                result["checks"]["hostfile_node_count"] = len(hf_data)
+                result["checks"]["hostfile_node_count"] = len(hosts_list)
+            else:
+                result["blockers"].append(f"Hostfile must be a JSON dict, got {type(hf_data).__name__}")
+                result["passed"] = False
         except Exception as e:
             result["blockers"].append(f"Failed to parse hostfile {hostfile_path}: {e}")
             result["passed"] = False
