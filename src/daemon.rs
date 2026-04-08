@@ -928,6 +928,7 @@ async fn serve_reload_handler(
         backend: status.backend.to_string(),
         hostfile: None,
         engine: status.engine,
+        ..Default::default()
     };
     mgr.load(req).await;
     Ok(Json(serde_json::json!({"ok": true, "state": "loading", "port": status.port})))

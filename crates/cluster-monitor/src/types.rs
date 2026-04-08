@@ -880,10 +880,56 @@ pub struct LoadRequest {
     pub hostfile: Option<String>,
     #[serde(default)]
     pub engine: ServeEngine,
+
+    // --- Optimization parameters (mlx_lm.server passthrough) ---
+
+    /// Speculative decoding: path/repo for the draft model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model: Option<String>,
+    /// Speculative decoding: number of draft tokens per step (default: 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_draft_tokens: Option<u32>,
+    /// Max concurrent decode requests in a batch (incompatible with draft_model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_concurrency: Option<u32>,
+    /// Max concurrent prompt/prefill requests in a batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_concurrency: Option<u32>,
+    /// Prefill step size in tokens (default: 2048).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_step_size: Option<u32>,
+    /// Use pipeline parallelism instead of tensor parallelism (JACCL only).
+    #[serde(default)]
+    pub pipeline: bool,
+    /// Max KV caches held in prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_size: Option<u32>,
+    /// Max bytes for prompt KV cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_bytes: Option<u64>,
 }
 
 fn default_backend_str() -> String {
     "auto".to_string()
+}
+
+impl Default for LoadRequest {
+    fn default() -> Self {
+        Self {
+            model_path: None,
+            backend: default_backend_str(),
+            hostfile: None,
+            engine: ServeEngine::default(),
+            draft_model: None,
+            num_draft_tokens: None,
+            decode_concurrency: None,
+            prompt_concurrency: None,
+            prefill_step_size: None,
+            pipeline: false,
+            prompt_cache_size: None,
+            prompt_cache_bytes: None,
+        }
+    }
 }
 
 /// Request body for POST /serve/share.

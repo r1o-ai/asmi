@@ -489,6 +489,7 @@ impl ServeManager {
                                 backend,
                                 hostfile: None,
                                 engine,
+                                ..Default::default()
                             };
                             tracing::info!(model, %engine, port, "restoring last served model");
                             mgr.load(req).await;
@@ -530,6 +531,7 @@ impl ServeManager {
                 backend: "single".to_string(),
                 hostfile: None,
                 engine,
+                ..Default::default()
             };
             do_serve_load(inner, readiness, req).await;
         });
@@ -698,6 +700,34 @@ async fn do_serve_load_inner(
             cmd_args.push(model_path.clone());
         }
         cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
+
+        // Optimization passthrough (mlx_lm only — these flags are mlx_lm.server-specific)
+        if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
+            if let Some(ref draft) = req.draft_model {
+                cmd_args.extend(["--draft-model".into(), draft.clone()]);
+            }
+            if let Some(n) = req.num_draft_tokens {
+                cmd_args.extend(["--num-draft-tokens".into(), n.to_string()]);
+            }
+            if let Some(n) = req.decode_concurrency {
+                cmd_args.extend(["--decode-concurrency".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prompt_concurrency {
+                cmd_args.extend(["--prompt-concurrency".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prefill_step_size {
+                cmd_args.extend(["--prefill-step-size".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prompt_cache_size {
+                cmd_args.extend(["--prompt-cache-size".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prompt_cache_bytes {
+                cmd_args.extend(["--prompt-cache-bytes".into(), n.to_string()]);
+            }
+            if req.pipeline {
+                cmd_args.push("--pipeline".into());
+            }
+        }
     }
 
     // JACCL distributed wrapper (only for engines with model_flag and non-bare)
