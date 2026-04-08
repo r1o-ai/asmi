@@ -4,7 +4,7 @@
 //! ShareManager is in the asmi binary crate's serve.rs module and manages
 //! a single mlx_lm.share distributed session with crash recovery.
 
-use asmi_core::{ServeBackend, ServeState, ShareRequest, ShareStatus};
+use asmi_core::{LoadRequest, ServeBackend, ServeEngine, ServeState, ShareRequest, ShareStatus};
 use std::time::Duration;
 
 #[tokio::test]
@@ -381,4 +381,111 @@ async fn test_share_http_stop() {
     assert!(status.pid.is_none());
     assert!(status.error.is_none());
     eprintln!("status after stop: {:?}", status);
+}
+
+// ---------------------------------------------------------------------------
+// LoadRequest optimization parameter tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_load_request_default_has_no_optimization_params() {
+    let json = r#"{"model_path": "~/models/Qwen3.5-35B"}"#;
+    let req: LoadRequest = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(req.backend, "auto");
+    assert_eq!(req.engine, ServeEngine::MlxLm);
+    assert!(req.draft_model.is_none());
+    assert!(req.num_draft_tokens.is_none());
+    assert!(req.decode_concurrency.is_none());
+    assert!(req.prompt_concurrency.is_none());
+    assert!(req.prefill_step_size.is_none());
+    assert!(!req.pipeline);
+    assert!(req.prompt_cache_size.is_none());
+    assert!(req.prompt_cache_bytes.is_none());
+}
+
+#[tokio::test]
+async fn test_load_request_with_spec_decode_params() {
+    let json = r#"{
+        "model_path": "~/models/Qwen3.5-397B-A17B-nvfp4",
+        "backend": "jaccl",
+        "draft_model": "~/models/Qwen3.5-35B-A3B-4bit",
+        "num_draft_tokens": 5,
+        "decode_concurrency": 1
+    }"#;
+    let req: LoadRequest = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(req.draft_model, Some("~/models/Qwen3.5-35B-A3B-4bit".to_string()));
+    assert_eq!(req.num_draft_tokens, Some(5));
+    assert_eq!(req.decode_concurrency, Some(1));
+}
+
+#[tokio::test]
+async fn test_load_request_with_batching_params() {
+    let json = r#"{
+        "model_path": "~/models/Qwen3.5-397B-A17B-nvfp4",
+        "decode_concurrency": 16,
+        "prompt_concurrency": 8,
+        "prefill_step_size": 4096,
+        "prompt_cache_size": 10,
+        "prompt_cache_bytes": 68719476736
+    }"#;
+    let req: LoadRequest = serde_json::from_str(json).expect("should deserialize");
+    assert_eq!(req.decode_concurrency, Some(16));
+    assert_eq!(req.prompt_concurrency, Some(8));
+    assert_eq!(req.prefill_step_size, Some(4096));
+    assert_eq!(req.prompt_cache_size, Some(10));
+    assert_eq!(req.prompt_cache_bytes, Some(68719476736));
+    assert!(req.draft_model.is_none()); // no spec decode with batching
+}
+
+#[tokio::test]
+async fn test_load_request_pipeline_flag() {
+    let json = r#"{"model_path": "test", "backend": "jaccl", "pipeline": true}"#;
+    let req: LoadRequest = serde_json::from_str(json).expect("should deserialize");
+    assert!(req.pipeline);
+    assert_eq!(req.backend, "jaccl");
+}
+
+#[tokio::test]
+async fn test_load_request_json_round_trip_with_all_fields() {
+    let original = LoadRequest {
+        model_path: Some("~/models/Qwen3.5-397B-A17B-nvfp4".to_string()),
+        backend: "jaccl".to_string(),
+        hostfile: Some("~/.r1o/hostfiles/default.json".to_string()),
+        engine: ServeEngine::MlxLm,
+        draft_model: Some("~/models/Qwen3.5-35B-A3B-4bit".to_string()),
+        num_draft_tokens: Some(5),
+        decode_concurrency: Some(1),
+        prompt_concurrency: Some(4),
+        prefill_step_size: Some(4096),
+        pipeline: true,
+        prompt_cache_size: Some(8),
+        prompt_cache_bytes: Some(34359738368),
+    };
+
+    let json_str = serde_json::to_string(&original).expect("should serialize");
+    let deserialized: LoadRequest = serde_json::from_str(&json_str).expect("should deserialize");
+
+    assert_eq!(deserialized.model_path, original.model_path);
+    assert_eq!(deserialized.draft_model, original.draft_model);
+    assert_eq!(deserialized.num_draft_tokens, original.num_draft_tokens);
+    assert_eq!(deserialized.decode_concurrency, original.decode_concurrency);
+    assert_eq!(deserialized.prompt_concurrency, original.prompt_concurrency);
+    assert_eq!(deserialized.prefill_step_size, original.prefill_step_size);
+    assert_eq!(deserialized.pipeline, original.pipeline);
+    assert_eq!(deserialized.prompt_cache_size, original.prompt_cache_size);
+    assert_eq!(deserialized.prompt_cache_bytes, original.prompt_cache_bytes);
+}
+
+#[tokio::test]
+async fn test_load_request_skip_serializing_none_fields() {
+    let req = LoadRequest {
+        model_path: Some("test".to_string()),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&req).expect("should serialize");
+    // None fields with skip_serializing_if should be absent
+    assert!(json.get("draft_model").is_none());
+    assert!(json.get("num_draft_tokens").is_none());
+    assert!(json.get("decode_concurrency").is_none());
+    assert!(json.get("prompt_cache_bytes").is_none());
 }
