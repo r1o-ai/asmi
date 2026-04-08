@@ -39,7 +39,7 @@ pub struct AppState {
     pub thunderbolt_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     pub topology_cache: Arc<RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>>,
     pub runtime: Arc<RuntimeInfo>,
-    pub serve_managers: Arc<HashMap<u16, crate::serve::ServeManager>>,
+    pub serve_managers: Arc<RwLock<HashMap<u16, crate::serve::ServeManager>>>,
     pub share_manager: crate::serve::ShareManager,
     pub peer_heartbeat: Arc<crate::serve::PeerHeartbeat>,
     pub watchdog: Arc<crate::watchdog::Watchdog>,
@@ -418,15 +418,287 @@ async fn jaccl_generate_handler(
 }
 
 /// GET /models → cached local model file listing (now includes external volumes)
+/// Each model is annotated with live serving info if it's currently loaded.
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let cache = state.model_cache.read().await;
     let (models, scanned_at) = match cache.as_ref() {
         Some((m, t)) => (m.clone(), t.elapsed().as_secs()),
         None => (vec![], 0),
     };
+
+    // Collect serving info: map of normalized-model-name → serving details
+    let serving_map = collect_serving_map(&state).await;
+
+    // Annotate each model with serving status
+    let annotated: Vec<serde_json::Value> = models.iter().map(|m| {
+        let mut v = serde_json::to_value(m).unwrap_or_default();
+        if let Some(serving) = match_serving(&m.name, &m.path, &serving_map) {
+            v.as_object_mut().map(|o| o.insert("serving".into(), serving));
+        }
+        v
+    }).collect();
+
     Json(serde_json::json!({
-        "models": models,
+        "models": annotated,
         "scan_age_seconds": scanned_at,
+    }))
+}
+
+/// Serving info for a model currently loaded in memory.
+#[derive(Debug, Clone, serde::Serialize)]
+struct ServingInfo {
+    port: u16,
+    engine: String,
+    pid: Option<u32>,
+    managed: bool,
+}
+
+/// Collect all currently-serving models from managed servers and detected processes.
+/// Returns a map of normalized name fragments → serving info.
+async fn collect_serving_map(state: &AppState) -> Vec<(Vec<String>, ServingInfo)> {
+    let mut entries = Vec::new();
+
+    // 1. Managed servers
+    for (&port, mgr) in state.serve_managers.read().await.iter() {
+        let status = mgr.status().await;
+        if let Some(ref model_id) = status.model {
+            let info = ServingInfo {
+                port,
+                engine: format!("{:?}", status.engine).to_lowercase(),
+                pid: status.pid,
+                managed: true,
+            };
+            entries.push((normalize_model_id(model_id), info));
+        }
+    }
+
+    // 2. Unmanaged processes from latest snapshot
+    if let Some(snap) = state.snapshot.read().await.as_ref() {
+        for proc in &snap.processes {
+            let port = match proc.port {
+                Some(p) => p,
+                None => continue,
+            };
+            let engine = format!("{:?}", proc.framework).to_lowercase();
+
+            // From server_models (probed /v1/models)
+            for sm in &proc.server_models {
+                let info = ServingInfo {
+                    port,
+                    engine: engine.clone(),
+                    pid: Some(proc.pid),
+                    managed: false,
+                };
+                entries.push((normalize_model_id(&sm.id), info));
+            }
+            // Fallback to ps-parsed model name
+            if proc.server_models.is_empty() {
+                if let Some(ref model) = proc.model {
+                    let info = ServingInfo {
+                        port,
+                        engine: engine.clone(),
+                        pid: Some(proc.pid),
+                        managed: false,
+                    };
+                    entries.push((normalize_model_id(model), info));
+                }
+            }
+        }
+    }
+
+    entries
+}
+
+/// Extract searchable name fragments from a model ID.
+/// "mlx-community/Qwen3.5-122B-A10B-6bit" → ["qwen3.5-122b-a10b-6bit"]
+/// "/Users/ma/Models/Qwen3.5-REAP-262B-A17B-4bit-mlx" → ["qwen3.5-reap-262b-a17b-4bit-mlx"]
+fn normalize_model_id(id: &str) -> Vec<String> {
+    let mut frags = Vec::new();
+    // Last path component (works for both HF IDs and absolute paths)
+    if let Some(last) = id.rsplit('/').next() {
+        frags.push(last.to_lowercase());
+    }
+    // Full ID lowercased
+    frags.push(id.to_lowercase());
+    frags
+}
+
+/// Try to match a LocalModel against the serving map.
+/// Returns the first match. Deduplicates by only matching once per model.
+fn match_serving(
+    name: &str,
+    path: &std::path::Path,
+    serving_map: &[(Vec<String>, ServingInfo)],
+) -> Option<serde_json::Value> {
+    let name_lower = name.to_lowercase();
+    let path_lower = path.to_string_lossy().to_lowercase();
+    let dir_name = path.file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    // Track which ports we've already matched to avoid duplicate annotations
+    let mut matched_port: Option<u16> = None;
+
+    for (frags, info) in serving_map {
+        // Skip if we already matched this model to a server on the same port
+        if matched_port == Some(info.port) {
+            continue;
+        }
+        for frag in frags {
+            if frag == &name_lower || frag == &dir_name || frag == &path_lower {
+                matched_port = Some(info.port);
+                return Some(serde_json::to_value(info).unwrap_or_default());
+            }
+        }
+    }
+    None
+}
+
+/// GET /cluster/models → cluster-wide model inventory.
+/// Fetches /models from every node in the NodeMap in parallel, merges into
+/// a unified list. Each model gets a `node` field. Includes local models too.
+/// Response groups models by name across nodes for easy dedup analysis.
+async fn cluster_models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let node_map = state.node_map.read().await;
+    let local_hostname = state.hostname.clone();
+
+    // Deduplicate nodes: resolve aliases to canonical names, then dedup
+    let mut canonical_nodes: Vec<String> = node_map.nodes.iter()
+        .map(|n| node_map.resolve(n).to_string())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    canonical_nodes.sort();
+
+    if canonical_nodes.is_empty() {
+        // Fallback: just return local models with node tag
+        let cache = state.model_cache.read().await;
+        let models = match cache.as_ref() {
+            Some((m, _)) => m.clone(),
+            None => vec![],
+        };
+        let tagged: Vec<serde_json::Value> = models.iter().map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or_default();
+            v.as_object_mut().map(|o| o.insert("node".into(), serde_json::json!(local_hostname)));
+            v
+        }).collect();
+        return Json(serde_json::json!({
+            "models": tagged,
+            "nodes_polled": 1,
+            "nodes_responded": 1,
+            "total_models": tagged.len(),
+        }));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_default();
+
+    // Fetch /models from every node in parallel
+    let futures: Vec<_> = canonical_nodes.iter().map(|node| {
+        let client = client.clone();
+        let node = node.clone();
+        let local_hostname = local_hostname.clone();
+        let model_cache = state.model_cache.clone();
+        async move {
+            // For local node, use the in-memory cache (faster, no HTTP round-trip)
+            let is_local = node.eq_ignore_ascii_case(&local_hostname)
+                || node == "hub" || node == "HUB" || node == "localhost";
+            if is_local {
+                let cache = model_cache.read().await;
+                let models = match cache.as_ref() {
+                    Some((m, _)) => m.clone(),
+                    None => vec![],
+                };
+                return (local_hostname.clone(), Some(models));
+            }
+
+            // Remote node: try .local mDNS first, then Tailscale hostname
+            let urls = vec![
+                format!("http://{}.local:9090/models", node),
+                format!("http://{}:9090/models", node),
+            ];
+            for url in &urls {
+                if let Ok(resp) = client.get(url).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(data) = resp.json::<serde_json::Value>().await {
+                            if let Some(arr) = data.get("models").and_then(|v| v.as_array()) {
+                                let models: Vec<asmi_core::LocalModel> = arr.iter()
+                                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                                    .collect();
+                                return (node, Some(models));
+                            }
+                        }
+                    }
+                }
+            }
+            (node, None)
+        }
+    }).collect();
+
+    let results = futures::future::join_all(futures).await;
+
+    // Merge all models with node attribution
+    let mut all_models: Vec<serde_json::Value> = Vec::new();
+    let mut nodes_responded = 0usize;
+    let mut node_summaries: Vec<serde_json::Value> = Vec::new();
+
+    for (node, models_opt) in &results {
+        match models_opt {
+            Some(models) => {
+                nodes_responded += 1;
+                // Dedup within node (old binaries may have case-insensitive dupes)
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut node_count = 0usize;
+                let mut node_bytes = 0u64;
+                for m in models {
+                    let key = m.name.to_lowercase();
+                    if seen.insert(key) {
+                        let mut v = serde_json::to_value(m).unwrap_or_default();
+                        v.as_object_mut().map(|o| o.insert("node".into(), serde_json::json!(node)));
+                        node_bytes += m.size_bytes;
+                        node_count += 1;
+                        all_models.push(v);
+                    }
+                }
+                node_summaries.push(serde_json::json!({
+                    "node": node,
+                    "online": true,
+                    "model_count": node_count,
+                    "total_bytes": node_bytes,
+                }));
+            }
+            None => {
+                node_summaries.push(serde_json::json!({
+                    "node": node,
+                    "online": false,
+                    "model_count": 0,
+                    "total_bytes": 0,
+                }));
+            }
+        }
+    }
+
+    // Sort by name for consistent output
+    all_models.sort_by(|a, b| {
+        let an = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let bn = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        an.cmp(bn)
+    });
+
+    let total_bytes: u64 = all_models.iter()
+        .filter_map(|m| m.get("size_bytes").and_then(|v| v.as_u64()))
+        .sum();
+
+    Json(serde_json::json!({
+        "models": all_models,
+        "nodes_polled": canonical_nodes.len(),
+        "nodes_responded": nodes_responded,
+        "total_models": all_models.len(),
+        "total_bytes": total_bytes,
+        "total_human": asmi_core::models::human_size(total_bytes),
+        "node_summary": node_summaries,
     }))
 }
 
@@ -719,12 +991,6 @@ struct ServeQuery {
 /// Default MLX server port (backwards compatible).
 const DEFAULT_SERVE_PORT: u16 = 19080;
 
-/// Look up the ServeManager for a given port. Falls back to default.
-fn get_manager(state: &AppState, port: Option<u16>) -> Option<&crate::serve::ServeManager> {
-    let p = port.unwrap_or(DEFAULT_SERVE_PORT);
-    state.serve_managers.get(&p)
-}
-
 /// GET /serve/status → serve status.
 /// No ?port= → returns all servers: {"servers": [...], "unmanaged": [...]}
 /// ?port=19080 → returns single ServeStatus for that port
@@ -734,16 +1000,21 @@ async fn serve_status_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if let Some(port) = q.port {
         // Single-port query
-        let mgr = get_manager(&state, Some(port))
-            .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+        let managers = state.serve_managers.read().await;
+        let p = port;
+        let mgr = managers.get(&p)
+            .ok_or_else(|| ApiError::NotFound(format!("unknown port: {p}")))?;
         let status = mgr.status().await;
         Ok(Json(serde_json::to_value(&status)
             .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?))
     } else {
         // All ports → {"servers": [...], "unmanaged": [...]}
         let mut servers = Vec::new();
-        for mgr in state.serve_managers.values() {
-            servers.push(mgr.status().await);
+        {
+            let managers = state.serve_managers.read().await;
+            for mgr in managers.values() {
+                servers.push(mgr.status().await);
+            }
         }
         servers.sort_by_key(|s| s.port);
 
@@ -755,13 +1026,16 @@ async fn serve_status_handler(
             }
         }
 
-        // Auto-adopt unmanaged processes into their port's manager
+        // Auto-adopt unmanaged processes — creates new managers for unknown ports
         let orphans = adopt_unmanaged(&state, &managed_pids).await;
 
-        // Re-read statuses after adoption (managers may have updated)
+        // Re-read statuses after adoption (managers may have been created)
         let mut servers = Vec::new();
-        for mgr in state.serve_managers.values() {
-            servers.push(mgr.status().await);
+        {
+            let managers = state.serve_managers.read().await;
+            for mgr in managers.values() {
+                servers.push(mgr.status().await);
+            }
         }
         servers.sort_by_key(|s| s.port);
 
@@ -772,9 +1046,10 @@ async fn serve_status_handler(
     }
 }
 
-/// Auto-adopt unmanaged model processes into the serve managers.
+/// Auto-adopt unmanaged model processes into serve managers.
 /// If a process is on a managed port → adopt into that manager.
-/// Returns any processes that couldn't be adopted (no matching port manager).
+/// If on an unknown port → dynamically create a new manager and adopt.
+/// Returns any processes that truly couldn't be adopted (no port).
 async fn adopt_unmanaged(
     state: &AppState,
     managed_pids: &std::collections::HashSet<u32>,
@@ -802,15 +1077,28 @@ async fn adopt_unmanaged(
 
         let engine = framework_to_engine(proc.framework);
 
-        // Try to adopt into existing manager for this port
         if let Some(port) = proc.port {
-            if let Some(mgr) = state.serve_managers.get(&port) {
-                mgr.adopt_external(proc.pid, model, engine).await;
-                continue;
+            // Try existing manager first
+            {
+                let managers = state.serve_managers.read().await;
+                if let Some(mgr) = managers.get(&port) {
+                    mgr.adopt_external(proc.pid, model, engine).await;
+                    continue;
+                }
             }
+
+            // No manager for this port — create one dynamically and adopt
+            tracing::info!(port, pid = proc.pid, "auto-adopting server on new port");
+            let new_mgr = crate::serve::ServeManager::restore(port, engine).await;
+            new_mgr.adopt_external(proc.pid, model, engine).await;
+            {
+                let mut managers = state.serve_managers.write().await;
+                managers.insert(port, new_mgr);
+            }
+            continue;
         }
 
-        // No manager for this port — report as orphan
+        // No port at all — truly unmanageable
         let models: Vec<String> = if !proc.server_models.is_empty() {
             proc.server_models.iter().map(|m| m.id.clone()).collect()
         } else if let Some(ref m) = proc.model {
@@ -872,8 +1160,15 @@ async fn serve_load_handler(
     // Infer port: explicit ?port= > engine default (from env or built-in)
     let port = q.port.unwrap_or(crate::serve::port_for_engine(req.engine));
 
-    let mgr = get_manager(&state, Some(port))
-        .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+    // Get or create a manager for this port
+    {
+        let managers = state.serve_managers.read().await;
+        if !managers.contains_key(&port) {
+            drop(managers);
+            let new_mgr = crate::serve::ServeManager::restore(port, req.engine).await;
+            state.serve_managers.write().await.insert(port, new_mgr);
+        }
+    }
 
     // Start peer heartbeat for JACCL distributed sessions
     let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
@@ -890,11 +1185,13 @@ async fn serve_load_handler(
                 .await;
         }
     } else {
-        // Non-distributed load — stop heartbeat if running
         state.peer_heartbeat.stop().await;
     }
 
     let engine = req.engine;
+    let managers = state.serve_managers.read().await;
+    let mgr = managers.get(&port)
+        .ok_or_else(|| ApiError::Internal(format!("manager for port {port} disappeared")))?;
     mgr.load(req).await;
     Ok(Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port})))
 }
@@ -905,9 +1202,11 @@ async fn serve_stop_handler(
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let port = q.port.unwrap_or(DEFAULT_SERVE_PORT);
-    let mgr = get_manager(&state, q.port)
+    let managers = state.serve_managers.read().await;
+    let mgr = managers.get(&port)
         .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
     mgr.stop().await;
+    drop(managers);
     state.peer_heartbeat.stop().await;
     Ok(Json(serde_json::json!({"ok": true, "port": port})))
 }
@@ -918,7 +1217,8 @@ async fn serve_reload_handler(
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let port = q.port.unwrap_or(DEFAULT_SERVE_PORT);
-    let mgr = get_manager(&state, q.port)
+    let managers = state.serve_managers.read().await;
+    let mgr = managers.get(&port)
         .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
     let status = mgr.status().await;
     let model = status.model
@@ -1851,6 +2151,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logs", get(logs_handler))
         .route("/runtime", get(runtime_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/cluster/models", get(cluster_models_handler))
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))
         .route("/jaccl/config", get(jaccl_config_handler).post(jaccl_generate_handler))

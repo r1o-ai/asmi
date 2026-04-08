@@ -73,7 +73,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     for (i, mgr) in managers.into_iter().enumerate() {
         serve_managers.insert(ports[i].0, mgr);
     }
-    let serve_managers = Arc::new(serve_managers);
+    let serve_managers = Arc::new(tokio::sync::RwLock::new(serve_managers));
 
     // Create IOReport energy subscription for ANE power monitoring.
     // This uses the private IOReport framework (same data source as powermetrics)
@@ -125,7 +125,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
                 for proc in &mut snap.processes {
                     if proc.model.is_none() {
                         if let Some(port) = proc.port {
-                            if let Some(mgr) = serve_managers.get(&port) {
+                            if let Some(mgr) = serve_managers.read().await.get(&port) {
                                 let (state, model) = mgr.model_snapshot().await;
                                 if state == asmi_core::ServeState::Ready || state == asmi_core::ServeState::Loading {
                                     if let Some(ref model_path) = model {
@@ -377,6 +377,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     eprintln!("  Managed ports: {}", ports_str.join(", "));
     if cluster_hub {
         eprintln!("  GET  /cluster          All node snapshots (hub mode)");
+        eprintln!("  GET  /cluster/models   Cluster-wide model inventory");
         eprintln!("  GET  /nodes            Known node hostnames");
         eprintln!("  GET  /jaccl/config     RDMA topology for JACCL");
         eprintln!("  POST /jaccl/config     Generate JACCL hostfile");

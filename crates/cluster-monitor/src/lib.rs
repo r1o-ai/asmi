@@ -114,7 +114,7 @@ pub use types::{
     ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy, UnmanagedProcess,
     WatchdogReport, WatchdogVerdict, WatchedProcess,
 };
-pub use models::{LocalModel, DiscoveredVolume, default_model_dirs, discover_volumes, external_model_dirs, parse_model_name, scan_models};
+pub use models::{LocalModel, ModelConfig, DiscoveredVolume, default_model_dirs, discover_volumes, external_model_dirs, human_size, parse_model_name, scan_models};
 pub use health::{
     CheckResult, SetupChecks, ThunderboltFixResult, ThunderboltServiceStatus,
     find_thunderbolt_issues, fix_thunderbolt_services, parse_thunderbolt_services,

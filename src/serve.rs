@@ -1416,7 +1416,7 @@ impl PeerHeartbeat {
         &self,
         peer_hostnames: Vec<String>,
         asmi_port: u16,
-        serve_managers: Arc<std::collections::HashMap<u16, ServeManager>>,
+        serve_managers: Arc<tokio::sync::RwLock<std::collections::HashMap<u16, ServeManager>>>,
         share_manager: ShareManager,
     ) {
         // Stop any existing heartbeat first
@@ -1498,7 +1498,7 @@ impl PeerHeartbeat {
 
                         if any_dead {
                             // EMERGENCY: Kill all local inference to prevent GPU Lock
-                            for mgr in serve_managers.values() {
+                            for mgr in serve_managers.read().await.values() {
                                 mgr.emergency_stop().await;
                             }
                             share_manager.emergency_stop().await;
@@ -1586,7 +1586,7 @@ mod tests {
 
         // Create heartbeat with empty managers (emergency_stop is a no-op on empty)
         let hb = Arc::new(PeerHeartbeat::new());
-        let managers = Arc::new(HashMap::<u16, ServeManager>::new());
+        let managers = Arc::new(tokio::sync::RwLock::new(HashMap::<u16, ServeManager>::new()));
         let share = ShareManager::new();
 
         hb.start(vec!["127.0.0.1".to_string()], port, managers, share)
@@ -1635,7 +1635,7 @@ mod tests {
         });
 
         let hb = Arc::new(PeerHeartbeat::new());
-        let managers = Arc::new(HashMap::<u16, ServeManager>::new());
+        let managers = Arc::new(tokio::sync::RwLock::new(HashMap::<u16, ServeManager>::new()));
         let share = ShareManager::new();
 
         hb.start(vec!["127.0.0.1".to_string()], port, managers, share)
