@@ -44,6 +44,7 @@ pub struct AppState {
     pub peer_heartbeat: Arc<crate::serve::PeerHeartbeat>,
     pub watchdog: Arc<crate::watchdog::Watchdog>,
     pub ane: crate::ane::AneState,
+    pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -725,7 +726,7 @@ fn get_manager(state: &AppState, port: Option<u16>) -> Option<&crate::serve::Ser
 }
 
 /// GET /serve/status → serve status.
-/// No ?port= → returns all servers: {"servers": [...]}
+/// No ?port= → returns all servers: {"servers": [...], "unmanaged": [...]}
 /// ?port=19080 → returns single ServeStatus for that port
 async fn serve_status_handler(
     State(state): State<AppState>,
@@ -739,15 +740,118 @@ async fn serve_status_handler(
         Ok(Json(serde_json::to_value(&status)
             .map_err(|e| ApiError::Internal(format!("serialize failed: {e}")))?))
     } else {
-        // All ports → {"servers": [...]}
+        // All ports → {"servers": [...], "unmanaged": [...]}
         let mut servers = Vec::new();
         for mgr in state.serve_managers.values() {
             servers.push(mgr.status().await);
         }
-        // Sort by port for deterministic output
         servers.sort_by_key(|s| s.port);
-        Ok(Json(serde_json::json!({"servers": servers})))
+
+        // Collect managed PIDs for diffing against detected processes
+        let mut managed_pids = std::collections::HashSet::new();
+        for s in &servers {
+            if let Some(pid) = s.pid {
+                managed_pids.insert(pid);
+            }
+        }
+
+        // Auto-adopt unmanaged processes into their port's manager
+        let orphans = adopt_unmanaged(&state, &managed_pids).await;
+
+        // Re-read statuses after adoption (managers may have updated)
+        let mut servers = Vec::new();
+        for mgr in state.serve_managers.values() {
+            servers.push(mgr.status().await);
+        }
+        servers.sort_by_key(|s| s.port);
+
+        Ok(Json(serde_json::json!({
+            "servers": servers,
+            "unmanaged": orphans,
+        })))
     }
+}
+
+/// Auto-adopt unmanaged model processes into the serve managers.
+/// If a process is on a managed port → adopt into that manager.
+/// Returns any processes that couldn't be adopted (no matching port manager).
+async fn adopt_unmanaged(
+    state: &AppState,
+    managed_pids: &std::collections::HashSet<u32>,
+) -> Vec<asmi_core::UnmanagedProcess> {
+    let snap = state.snapshot.read().await;
+    let processes = match snap.as_ref() {
+        Some(s) => &s.processes,
+        None => return Vec::new(),
+    };
+
+    let mut orphans = Vec::new();
+    for proc in processes {
+        if !is_model_server_framework(proc.framework) {
+            continue;
+        }
+        if managed_pids.contains(&proc.pid) {
+            continue;
+        }
+
+        let model: Option<String> = if !proc.server_models.is_empty() {
+            Some(proc.server_models[0].id.clone())
+        } else {
+            proc.model.clone()
+        };
+
+        let engine = framework_to_engine(proc.framework);
+
+        // Try to adopt into existing manager for this port
+        if let Some(port) = proc.port {
+            if let Some(mgr) = state.serve_managers.get(&port) {
+                mgr.adopt_external(proc.pid, model, engine).await;
+                continue;
+            }
+        }
+
+        // No manager for this port — report as orphan
+        let models: Vec<String> = if !proc.server_models.is_empty() {
+            proc.server_models.iter().map(|m| m.id.clone()).collect()
+        } else if let Some(ref m) = proc.model {
+            vec![m.clone()]
+        } else {
+            Vec::new()
+        };
+        orphans.push(asmi_core::UnmanagedProcess {
+            pid: proc.pid,
+            port: proc.port,
+            engine: proc.framework.to_string(),
+            models,
+            source: "external",
+        });
+    }
+    orphans.sort_by_key(|u| u.pid);
+    orphans
+}
+
+/// Map ProcessFramework to ServeEngine for adoption.
+fn framework_to_engine(fw: asmi_core::ProcessFramework) -> asmi_core::ServeEngine {
+    match fw {
+        asmi_core::ProcessFramework::MlxLm | asmi_core::ProcessFramework::MlxLmShare
+            => asmi_core::ServeEngine::MlxLm,
+        asmi_core::ProcessFramework::MlxVlm => asmi_core::ServeEngine::MlxVlm,
+        asmi_core::ProcessFramework::VllmMlx => asmi_core::ServeEngine::VllmMlx,
+        _ => asmi_core::ServeEngine::MlxLm, // fallback
+    }
+}
+
+/// Whether a `ProcessFramework` represents a model-serving process
+/// (as opposed to a watchdog, distributed launcher, or unknown binary).
+fn is_model_server_framework(fw: asmi_core::ProcessFramework) -> bool {
+    matches!(
+        fw,
+        asmi_core::ProcessFramework::MlxLm
+            | asmi_core::ProcessFramework::MlxLmShare
+            | asmi_core::ProcessFramework::MlxVlm
+            | asmi_core::ProcessFramework::VllmMlx
+            | asmi_core::ProcessFramework::MlxAudio
+    )
 }
 
 /// POST /serve/load → begin loading a model.
@@ -765,11 +869,8 @@ async fn serve_load_handler(
         }
     }
 
-    // Infer port: explicit ?port= > engine default
-    let port = q.port.unwrap_or(match req.engine {
-        asmi_core::ServeEngine::MlxVlm => 19082,
-        _ => DEFAULT_SERVE_PORT,
-    });
+    // Infer port: explicit ?port= > engine default (from env or built-in)
+    let port = q.port.unwrap_or(crate::serve::port_for_engine(req.engine));
 
     let mgr = get_manager(&state, Some(port))
         .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
@@ -1186,6 +1287,202 @@ async fn ane_handler(
 }
 
 // ---------------------------------------------------------------------------
+// eGPU / TinyGPU detection
+// ---------------------------------------------------------------------------
+
+/// Scan for eGPU devices and TinyGPU DriverKit extension.
+/// Checks three layers:
+///   1. DriverKit extension status (systemextensionsctl)
+///   2. Discrete/external GPUs (system_profiler SPDisplaysDataType)
+///   3. tinygrad runtime availability
+pub async fn scan_egpu(hostname: &str) -> serde_json::Value {
+    use tokio::process::Command;
+
+    // 1. Check TinyGPU DriverKit extension
+    let (driver_installed, driver_version, driver_status) = {
+        let output = Command::new("systemextensionsctl")
+            .arg("list")
+            .output()
+            .await;
+        match output {
+            Ok(o) => {
+                let text = String::from_utf8_lossy(&o.stdout).to_string()
+                    + &String::from_utf8_lossy(&o.stderr);
+                // Lines look like: "--- com.tinygrad.tinygpu.dext (1.0.0/1) [activated enabled]"
+                if let Some(line) = text.lines().find(|l| {
+                    let lower = l.to_lowercase();
+                    lower.contains("tinygpu") || lower.contains("tinygrad")
+                }) {
+                    let version = line.split('(')
+                        .nth(1)
+                        .and_then(|s| s.split(')').next())
+                        .map(|s| s.split('/').next().unwrap_or(s).trim().to_string());
+                    let status = if line.contains("activated") && line.contains("enabled") {
+                        "activated"
+                    } else if line.contains("activated") {
+                        "activated_disabled"
+                    } else {
+                        "installed"
+                    };
+                    (true, version, status.to_string())
+                } else {
+                    (false, None, "not_found".to_string())
+                }
+            }
+            Err(_) => (false, None, "check_failed".to_string()),
+        }
+    };
+
+    // 2. Enumerate external/discrete GPUs via system_profiler
+    let egpus = {
+        let output = Command::new("system_profiler")
+            .args(["SPDisplaysDataType", "-json"])
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {
+                let json: serde_json::Value = serde_json::from_slice(&o.stdout)
+                    .unwrap_or(serde_json::Value::Null);
+                let mut devices = Vec::new();
+                if let Some(displays) = json.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
+                    for gpu in displays {
+                        let name = gpu.get("sppci_model")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        // Skip Apple integrated GPUs
+                        if name.starts_with("Apple") {
+                            continue;
+                        }
+                        let vendor_str = gpu.get("sppci_vendor")
+                            .or_else(|| gpu.get("spdisplays_vendor"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let vendor = if vendor_str.to_lowercase().contains("nvidia") {
+                            "nvidia"
+                        } else if vendor_str.to_lowercase().contains("amd")
+                            || vendor_str.to_lowercase().contains("ati")
+                        {
+                            "amd"
+                        } else if vendor_str.to_lowercase().contains("intel") {
+                            "intel"
+                        } else {
+                            "unknown"
+                        };
+                        let vram = gpu.get("sppci_vram")
+                            .or_else(|| gpu.get("_spdisplays_vram"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0");
+                        // Parse VRAM like "24 GB" or "24576 MB"
+                        let vram_gb: f64 = {
+                            let lower = vram.to_lowercase();
+                            let num: f64 = lower.split_whitespace()
+                                .next()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0.0);
+                            if lower.contains("mb") { num / 1024.0 } else { num }
+                        };
+                        let bus = gpu.get("sppci_bus")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let bus_type = if bus.to_lowercase().contains("thunderbolt") {
+                            "thunderbolt"
+                        } else if bus.to_lowercase().contains("usb") {
+                            "usb4"
+                        } else if bus.to_lowercase().contains("pci") {
+                            "pcie"
+                        } else {
+                            bus
+                        };
+                        let pci_slot = gpu.get("sppci_slot_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let device_id = gpu.get("sppci_device_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        devices.push(serde_json::json!({
+                            "name": name,
+                            "vendor": vendor,
+                            "vram_gb": vram_gb,
+                            "bus": bus_type,
+                            "pci_slot": pci_slot,
+                            "device_id": device_id,
+                        }));
+                    }
+                }
+                devices
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    // 3. Check tinygrad availability
+    let py = resolve_python();
+    let tinygrad_info = {
+        let output = Command::new(py)
+            .args(["-c", "import tinygrad; print(tinygrad.__version__); print(tinygrad.Device.DEFAULT)"])
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let mut lines = text.lines();
+                let version = lines.next().map(|s| s.to_string());
+                let device = lines.next().map(|s| s.to_string());
+                (true, version, device)
+            }
+            _ => (false, None, None),
+        }
+    };
+
+    serde_json::json!({
+        "hostname": hostname,
+        "tinygpu_driver": {
+            "installed": driver_installed,
+            "version": driver_version,
+            "status": driver_status,
+        },
+        "egpus": egpus,
+        "egpu_count": egpus.len(),
+        "tinygrad": {
+            "available": tinygrad_info.0,
+            "version": tinygrad_info.1,
+            "default_device": tinygrad_info.2,
+        },
+        "scanned_at": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// GET /egpu → cached eGPU/TinyGPU status (refreshed every 30s).
+/// Gated behind `--experimental-egpu` CLI flag.
+async fn egpu_handler(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let cache = state.egpu_cache.read().await;
+    match cache.as_ref() {
+        Some((data, scanned_at)) => {
+            let mut result = data.clone();
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("experimental".to_string(), serde_json::Value::Bool(true));
+                obj.insert("cache_age_secs".to_string(),
+                    serde_json::Value::from(scanned_at.elapsed().as_secs()));
+            }
+            Json(result).into_response()
+        }
+        None => {
+            // Cache is None → --experimental-egpu was not passed
+            let body = Json(serde_json::json!({
+                "experimental": true,
+                "enabled": false,
+                "hostname": state.hostname,
+                "error": "eGPU detection not enabled. Start daemon with --experimental-egpu",
+            }));
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RDMA check endpoints — remote monitoring via Tailscale
 // ---------------------------------------------------------------------------
 
@@ -1578,6 +1875,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/disk", get(disk_handler))
         .route("/network", get(network_handler))
         .route("/ane", get(ane_handler))
+        .route("/egpu", get(egpu_handler))
+        .route("/rdma/check", get(rdma_check_handler))
+        .route("/rdma/mesh", get(rdma_mesh_handler))
         // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
         .route("/ane/compute", get(crate::ane::status_handler))
         .route("/ane/eval", post(crate::ane::eval_handler))

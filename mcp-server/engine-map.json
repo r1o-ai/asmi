@@ -1,0 +1,35 @@
+{
+  "_doc": "Model architecture → engine mapping. Edit this file to add new models without touching Python.",
+  "_engines": {
+    "mlx_lm": {"port": 19080, "desc": "Standard text LLM inference"},
+    "mlx_vlm": {"port": 19082, "desc": "Vision-language models (image/video input)", "rdma_caveat": "utils.py crashes on VLM models in distributed mode — hasattr(model.model, 'pipeline') fails because VLMs lack .model attr. Patch required on all nodes: change to hasattr(getattr(model, 'model', None), 'pipeline')"},
+    "vllm_mlx": {"port": 19080, "desc": "Continuous batching, hybrid cache architectures"}
+  },
+  "_tensor_parallel_note": "TP works on any model whose hidden dimensions are divisible by node count. Not a per-model restriction.",
+
+  "by_model_type": {
+    "qwen3_5":          {"engine": "vllm_mlx", "reason": "Hybrid DeltaNet/KVCache needs vllm_mlx batching"},
+    "qwen3_5_moe":      {"engine": "vllm_mlx", "reason": "MoE + hybrid DeltaNet/KVCache, use vllm_mlx"},
+    "qwen3":            {"engine": "mlx_lm",   "reason": "Dense Qwen3 text model"},
+    "glm4v":            {"engine": "mlx_vlm",  "reason": "GLM-4.6V vision-language model"},
+    "llama":            {"engine": "mlx_lm",   "reason": "Llama family"},
+    "mistral":          {"engine": "mlx_lm",   "reason": "Mistral"},
+    "deepseek_v3":      {"engine": "mlx_lm",   "reason": "DeepSeek V3/R1"},
+    "nemotron_h":       {"engine": "mlx_lm",   "reason": "Nemotron hybrid"},
+    "phi3":             {"engine": "mlx_lm",   "reason": "Phi-3 text model"},
+    "gemma2":           {"engine": "mlx_lm",   "reason": "Gemma 2"},
+    "cohere2":          {"engine": "mlx_lm",   "reason": "Command R+"},
+    "starcoder2":       {"engine": "mlx_lm",   "reason": "StarCoder 2 code model"}
+  },
+
+  "by_architecture_pattern": [
+    {"pattern": "ForConditionalGeneration", "engine": "mlx_vlm", "reason": "VLM-style architecture class"},
+    {"pattern": "VLModel",                  "engine": "mlx_vlm", "reason": "Explicit VL model class"},
+    {"pattern": "ForCausalLM",              "engine": "mlx_lm",  "reason": "Standard causal LM"}
+  ],
+
+  "by_config_key": [
+    {"key": "vision_config", "engine": "mlx_vlm", "reason": "Has vision encoder config"},
+    {"key": "visual",        "engine": "mlx_vlm", "reason": "Has visual encoder section"}
+  ]
+}

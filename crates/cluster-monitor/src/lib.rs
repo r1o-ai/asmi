@@ -111,8 +111,8 @@ pub use types::{
     InterfaceStats, LoadRequest, MetricsHistory, MlxServerInfo, ModelServerMetadata, MonitorError,
     NetworkStats, NodeSnapshot, PeerHeartbeatStatus, PeerStatus, PortState, ProcessFramework,
     ProcessInfo, ProcessTreeNode, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
-    ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy, WatchdogReport,
-    WatchdogVerdict, WatchedProcess,
+    ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy, UnmanagedProcess,
+    WatchdogReport, WatchdogVerdict, WatchedProcess,
 };
 pub use models::{LocalModel, DiscoveredVolume, default_model_dirs, discover_volumes, external_model_dirs, parse_model_name, scan_models};
 pub use health::{

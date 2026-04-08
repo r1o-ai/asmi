@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long, hide = true)]
     experimental_ane: bool,
 
+    /// Enable experimental eGPU/TinyGPU detection (scans for DriverKit extensions + discrete GPUs).
+    #[arg(long, hide = true)]
+    experimental_egpu: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -183,7 +187,7 @@ async fn main() -> Result<()> {
     if args.serve {
         return daemon_startup::run_serve(
             args.port, args.interval, args.cluster,
-            args.models_dir, args.experimental_ane,
+            args.models_dir, args.experimental_ane, args.experimental_egpu,
         ).await;
     }
 

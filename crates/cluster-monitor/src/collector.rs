@@ -84,7 +84,7 @@ const CMD_POWERMETRICS: &str =
     "sudo powermetrics -n 1 -i 1000 --samplers cpu_power,gpu_power 2>/dev/null";
 
 const CMD_VMSTAT_SYSCTL: &str =
-    "hostname -s; echo '---HOSTNAME---'; vm_stat; echo '---MEMSIZE---'; sysctl -n hw.memsize";
+    "scutil --get LocalHostName 2>/dev/null | tr '[:upper:]' '[:lower:]' || hostname -s; echo '---HOSTNAME---'; vm_stat; echo '---MEMSIZE---'; sysctl -n hw.memsize";
 
 /// Hardware identity via system_profiler (for remote nodes via SSH).
 const CMD_HW_IDENTITY: &str =

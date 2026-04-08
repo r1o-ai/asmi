@@ -19,12 +19,25 @@ use crate::daemon::resolve_python;
 // Constants and helpers
 // ===========================================================================
 
-/// Managed ports and their default engines.
-/// This is the single source of truth for which ports asmi auto-starts.
-pub const MANAGED_PORTS: &[(u16, ServeEngine)] = &[
-    (19080, ServeEngine::MlxLm),
-    (19082, ServeEngine::MlxVlm),
-];
+/// Default managed ports (overridable via ASMI_MLX_LM_PORT / ASMI_MLX_VLM_PORT).
+pub fn managed_ports() -> Vec<(u16, ServeEngine)> {
+    vec![
+        (port_for_engine(ServeEngine::MlxLm), ServeEngine::MlxLm),
+        (port_for_engine(ServeEngine::MlxVlm), ServeEngine::MlxVlm),
+    ]
+}
+
+/// Resolve port for an engine: env var > default.
+pub fn port_for_engine(engine: ServeEngine) -> u16 {
+    match engine {
+        ServeEngine::MlxLm | ServeEngine::MlxLmShare => std::env::var("ASMI_MLX_LM_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(19080),
+        ServeEngine::MlxVlm => std::env::var("ASMI_MLX_VLM_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(19084),
+        ServeEngine::VllmMlx => std::env::var("ASMI_VLLM_MLX_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(8000),
+    }
+}
 
 /// Share session log file.
 const SHARE_LOG_PATH: &str = "/tmp/r1o-mlx-share.log";
@@ -578,6 +591,23 @@ impl ServeManager {
             error: s.error.clone(),
         }
     }
+
+    /// Adopt an external process we don't own (detected by metrics scanner).
+    /// We track PID + model but don't hold a Child handle — can't send signals.
+    pub async fn adopt_external(&self, pid: u32, model: Option<String>, engine: ServeEngine) {
+        let mut s = self.inner.write().await;
+        // Don't overwrite a managed process that's already running
+        if s.child.is_some() || s.state == ServeState::Loading {
+            return;
+        }
+        s.pid = Some(pid);
+        s.engine = engine;
+        s.model = model.clone();
+        s.backend = ServeBackend::Single;
+        s.state = if model.is_some() { ServeState::Ready } else { ServeState::Bare };
+        s.load_started = Some(std::time::Instant::now());
+        tracing::info!(pid, model = model.as_deref().unwrap_or("none"), "adopted external process");
+    }
 }
 
 /// Background serve load task.
@@ -938,6 +968,7 @@ impl ShareManager {
         s.load_started = Some(std::time::Instant::now());
         tracing::info!(pid, model, "adopted distributed worker process");
     }
+
 }
 
 /// Background share load task.

@@ -6,18 +6,31 @@ use std::time::Duration;
 use crate::{ane::AneState, bin_name, daemon, serve, watchdog};
 
 /// Run asmi as an HTTP daemon serving local node metrics.
-pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>, _experimental_ane: bool) -> Result<()> {
+pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>, _experimental_ane: bool, experimental_egpu: bool) -> Result<()> {
     // Init tracing to stderr
     tracing_subscriber::fmt()
         .with_env_filter("asmi_core=info,asmi=info")
         .with_ansi(true)
         .init();
 
-    let hostname = std::process::Command::new("hostname")
-        .arg("-s")
+    // Prefer scutil LocalHostName (Bonjour/mDNS identity, matches .local resolution
+    // and Tailscale names) over `hostname -s` (Unix hostname, often the default
+    // machine name like "Mac" which doesn't match cluster identity).
+    let hostname = std::process::Command::new("scutil")
+        .args(["--get", "LocalHostName"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        });
 
     tracing::info!(
         hostname = %hostname,
@@ -49,15 +62,16 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     let (metrics_tx, _) = tokio::sync::broadcast::channel::<String>(16);
 
     // Init all managed MLX servers (before poll loop so we can enrich metrics)
+    let ports = serve::managed_ports();
     let managers: Vec<_> = futures::future::join_all(
-        serve::MANAGED_PORTS.iter().map(|&(port, engine)| {
+        ports.iter().map(|&(port, engine)| {
             serve::ServeManager::restore(port, engine)
         })
     ).await;
 
     let mut serve_managers = std::collections::HashMap::new();
     for (i, mgr) in managers.into_iter().enumerate() {
-        serve_managers.insert(serve::MANAGED_PORTS[i].0, mgr);
+        serve_managers.insert(ports[i].0, mgr);
     }
     let serve_managers = Arc::new(serve_managers);
 
@@ -223,6 +237,35 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         });
     }
 
+    // eGPU cache — scan for TinyGPU DriverKit + external GPUs every 30s
+    // Gated behind --experimental-egpu flag
+    let egpu_cache: Arc<tokio::sync::RwLock<Option<(serde_json::Value, std::time::Instant)>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    if experimental_egpu {
+        tracing::info!("experimental eGPU detection enabled");
+        let egpu_c = Arc::clone(&egpu_cache);
+        let egpu_hostname = hostname.clone();
+        tokio::spawn(async move {
+            loop {
+                let data = daemon::scan_egpu(&egpu_hostname).await;
+                let egpu_count = data.get("egpu_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                let driver = data.get("tinygpu_driver")
+                    .and_then(|d| d.get("installed"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if driver || egpu_count > 0 {
+                    tracing::info!(
+                        driver = driver,
+                        egpu_count = egpu_count,
+                        "eGPU scan: detected"
+                    );
+                }
+                *egpu_c.write().await = Some((data, std::time::Instant::now()));
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    }
+
     // Topology cache — runs mlx.distributed_config every 60s (only in cluster hub mode)
     let topology_cache: Arc<tokio::sync::RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>> =
         Arc::new(tokio::sync::RwLock::new(None));
@@ -294,6 +337,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         peer_heartbeat,
         watchdog: wd,
         ane: AneState::new(_experimental_ane),
+        egpu_cache,
     };
 
     let app = daemon::build_router(app_state);
@@ -325,10 +369,11 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     eprintln!("  GET  /serve/share/status Share session status");
     eprintln!("  POST /serve/share/stop  Stop share session");
     eprintln!("  GET  /ane              ANE power + status (IOReport)");
+    eprintln!("  GET  /egpu             eGPU / TinyGPU detection");
     eprintln!("  GET  /watchdog          Full watchdog report");
     eprintln!("  GET  /watchdog/peers    RDMA peer heartbeat status");
     eprintln!("  GET  /watchdog/gpu-lock GPU Lock detection status");
-    let ports_str: Vec<String> = serve::MANAGED_PORTS.iter().map(|(p, e)| format!("{p}({e})")).collect();
+    let ports_str: Vec<String> = serve::managed_ports().iter().map(|(p, e)| format!("{p}({e})")).collect();
     eprintln!("  Managed ports: {}", ports_str.join(", "));
     if cluster_hub {
         eprintln!("  GET  /cluster          All node snapshots (hub mode)");

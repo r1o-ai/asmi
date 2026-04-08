@@ -7,11 +7,13 @@ pub fn get_phys_footprint(pid: u32) -> Result<u64, Error> {
     {
         unsafe {
             let mut rusage: libc::rusage_info_v4 = std::mem::zeroed();
-            let mut info: libc::rusage_info_t = &mut rusage as *mut _ as libc::rusage_info_t;
+            // proc_pid_rusage treats buffer as a flat destination address
+            // (XNU kernel uses user_addr_t internally). Pass the struct
+            // pointer directly — NOT a pointer-to-pointer.
             let ret = libc::proc_pid_rusage(
                 pid as libc::pid_t,
                 libc::RUSAGE_INFO_V4,
-                &mut info,
+                &mut rusage as *mut libc::rusage_info_v4 as *mut libc::rusage_info_t,
             );
 
             if ret == 0 {

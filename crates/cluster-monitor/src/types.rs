@@ -859,6 +859,17 @@ pub struct ServeStatus {
     pub error: Option<String>,
 }
 
+/// A model process detected on the node that was NOT launched by asmi.
+/// Found by diffing the metrics process scanner against managed ServeManagers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnmanagedProcess {
+    pub pid: u32,
+    pub port: Option<u16>,
+    pub engine: String,
+    pub models: Vec<String>,
+    pub source: &'static str,
+}
+
 /// Request body for POST /serve/load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadRequest {

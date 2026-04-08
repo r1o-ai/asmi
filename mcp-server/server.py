@@ -527,7 +527,7 @@ async def _preflight_share(base: str, model: Optional[str] = None) -> dict:
     return result
 
 
-async def _generate_hostfile(base: str) -> str:
+async def _generate_hostfile(base: str) -> dict | str:
     """Build JACCL hostfile from live asmi topology + node metrics.
 
     Queries /topology for RDMA device matrix and /cluster for interface IPs.
@@ -632,16 +632,16 @@ async def _generate_hostfile(base: str) -> str:
         capture_output=True, text=True, timeout=10,
     )
 
-    return json.dumps({
+    return {
         "hostfile_path": output_path,
         "nodes": len(hosts),
         "backend": "jaccl",
         "verification": verify.stdout.strip() if verify.returncode == 0 else f"FAILED: {verify.stderr.strip()}",
         "node_ips": {h["ssh"]: h["ips"][0] for h in hosts},
-    }, indent=2)
+    }
 
 
-async def _distributed_launch(base: str, model: str, port: Optional[int] = None) -> str:
+async def _distributed_launch(base: str, model: str, port: Optional[int] = None) -> dict:
     """One-shot distributed inference: preflight → hostfile → detect parallelism → launch.
 
     Combines all steps into a single action for easy broadcast.
@@ -654,7 +654,7 @@ async def _distributed_launch(base: str, model: str, port: Optional[int] = None)
     if not pf["passed"]:
         result["error"] = "Preflight failed"
         result["blockers"] = pf["blockers"]
-        return json.dumps(result, indent=2)
+        return result
 
     # 2. Check hostfile exists
     hostfile = pf["checks"].get("hostfile_path")
@@ -666,7 +666,7 @@ async def _distributed_launch(base: str, model: str, port: Optional[int] = None)
         hostfile = os.path.expanduser("~/.r1o/hostfiles/default.json")
         if not os.path.exists(hostfile):
             result["error"] = "Failed to generate hostfile"
-            return json.dumps(result, indent=2)
+            return result
     result["hostfile"] = hostfile
 
     # 3. Determine parallelism
@@ -702,7 +702,7 @@ async def _distributed_launch(base: str, model: str, port: Optional[int] = None)
     except Exception as e:
         result["error"] = f"Launch failed: {e}"
 
-    return json.dumps(result, indent=2)
+    return result
 
 
 async def _preflight_load(base: str, model: Optional[str] = None, port: Optional[int] = None) -> dict:
@@ -808,7 +808,7 @@ async def _preflight_load(base: str, model: Optional[str] = None, port: Optional
         "openWorldHint": True,
     }
 )
-async def asmi_status(host: Optional[str] = None) -> str:
+async def asmi_status(host: Optional[str] = None) -> dict | str:
     """Dashboard view of a node: health, CPU/GPU/RAM metrics, ANE power, and running processes.
 
     Combines /health, /metrics, /processes, and /ane into one call.
@@ -854,7 +854,7 @@ async def asmi_status(host: Optional[str] = None) -> str:
             port = p.get("port", "?")
             lines.append(f"  - {model} (port {port})")
 
-    return "\n".join(lines) + "\n\n" + json.dumps(results, indent=2, default=str)
+    return {"summary": "\n".join(lines), **results}
 
 
 @mcp.tool(
@@ -865,7 +865,7 @@ async def asmi_status(host: Optional[str] = None) -> str:
         "openWorldHint": True,
     }
 )
-async def asmi_cluster() -> str:
+async def asmi_cluster() -> dict | str:
     """Cluster-wide view: snapshots from all nodes via the hub's /cluster endpoint.
 
     Shows each node's CPU, GPU, RAM, power, and running models.
@@ -896,7 +896,7 @@ async def asmi_cluster() -> str:
         for p in procs[:5]:
             lines.append(f"    - {p.get('model', '?')} (port {p.get('port', '?')})")
 
-    return "\n".join(lines) + "\n\n" + json.dumps(data, indent=2, default=str)
+    return {"summary": "\n".join(lines), "nodes": data}
 
 
 @mcp.tool(
@@ -907,7 +907,7 @@ async def asmi_cluster() -> str:
         "openWorldHint": False,
     }
 )
-async def asmi_models(host: Optional[str] = None) -> str:
+async def asmi_models(host: Optional[str] = None) -> dict:
     """List local model inventory and active server states.
 
     Combines /models (downloaded models) with /serve/status (running servers).
@@ -929,7 +929,7 @@ async def asmi_models(host: Optional[str] = None) -> str:
     except Exception as e:
         serve = {"error": str(e)}
 
-    return json.dumps({"models": models, "serve_status": serve}, indent=2, default=str)
+    return {"models": models, "serve_status": serve}
 
 
 @mcp.tool(
@@ -945,7 +945,7 @@ async def asmi_serve(
     model: Optional[str] = None,
     port: Optional[int] = None,
     host: Optional[str] = None,
-) -> str:
+) -> dict | str:
     """Manage model servers: load, stop, reload, or start distributed share sessions.
 
     Actions:
@@ -969,73 +969,73 @@ async def asmi_serve(
 
     try:
         if action == "status":
-            return json.dumps(await _get(f"/serve/status{port_param}", base), indent=2)
+            return await _get(f"/serve/status{port_param}", base)
         elif action == "load":
             if not model:
                 return "Error: 'model' parameter required for load action"
             # Run preflight checks
             preflight = await _preflight_load(base, model, port)
             if not preflight["passed"]:
-                return json.dumps({
+                return {
                     "error": "Preflight checks failed — load not started",
                     "preflight": preflight,
-                }, indent=2)
+                }
             body = {"model_path": model}
             load_result = await _post(f"/serve/load{port_param}", body, base)
             note = "Load started with warnings" if preflight["warnings"] else None
-            return json.dumps({
+            return {
                 "result": load_result,
                 "preflight": preflight,
                 **({"note": note} if note else {}),
-            }, indent=2)
+            }
         elif action == "stop":
             stop_result = await _post(f"/serve/stop{port_param}", base=base)
             # Post-flight check: verify the server actually stopped
             import asyncio
             await asyncio.sleep(1)
             post_flight = await _post_flight_check(base, port)
-            return json.dumps({
+            return {
                 "stop_result": stop_result,
                 "post_flight": post_flight,
-            }, indent=2)
+            }
         elif action == "reload":
-            return json.dumps(await _post(f"/serve/reload{port_param}", base=base), indent=2)
+            return await _post(f"/serve/reload{port_param}", base=base)
         elif action == "share":
             if not model:
                 return "Error: 'model' parameter required for share action"
             # Run preflight checks
             preflight = await _preflight_share(base, model)
             if not preflight["passed"]:
-                return json.dumps({
+                return {
                     "error": "Preflight checks failed — share not started",
                     "preflight": preflight,
-                }, indent=2)
+                }
             body = {"model_path": model}
             share_result = await _post("/serve/share", body, base)
-            return json.dumps({
+            return {
                 "result": share_result,
                 "preflight": preflight,
-            }, indent=2)
+            }
         elif action == "share_status":
-            return json.dumps(await _get("/serve/share/status", base), indent=2)
+            return await _get("/serve/share/status", base)
         elif action == "share_stop":
             stop_result = await _post("/serve/share/stop", base=base)
             import asyncio
             await asyncio.sleep(1)
             post_flight = await _post_flight_check(base, None, is_share=True)
-            return json.dumps({
+            return {
                 "stop_result": stop_result,
                 "post_flight": post_flight,
-            }, indent=2)
+            }
         elif action == "preflight":
             if not model:
                 return "Error: 'model' parameter required for preflight action"
             share_pf = await _preflight_share(base, model)
             load_pf = await _preflight_load(base, model, port)
-            return json.dumps({
+            return {
                 "share_preflight": share_pf,
                 "load_preflight": load_pf,
-            }, indent=2)
+            }
 
         elif action == "hostfile_generate":
             # Build JACCL hostfile from live asmi topology + metrics
@@ -1064,7 +1064,7 @@ async def asmi_serve(
         "openWorldHint": True,
     }
 )
-async def asmi_topology(format: str = "json") -> str:
+async def asmi_topology(format: str = "json") -> dict | str:
     """RDMA/Thunderbolt mesh topology and validation.
 
     Shows node interconnections, link speeds, and JACCL readiness.
@@ -1077,9 +1077,9 @@ async def asmi_topology(format: str = "json") -> str:
         if format == "dot":
             return await _get_text("/topology/dot")
         elif format == "validate":
-            return json.dumps(await _get("/topology/validate"), indent=2)
+            return await _get("/topology/validate")
         else:
-            return json.dumps(await _get("/topology"), indent=2)
+            return await _get("/topology")
     except Exception as e:
         return f"Topology unavailable (requires cluster hub mode): {e}"
 
@@ -1092,7 +1092,7 @@ async def asmi_topology(format: str = "json") -> str:
         "openWorldHint": True,
     }
 )
-async def asmi_watchdog(host: Optional[str] = None) -> str:
+async def asmi_watchdog(host: Optional[str] = None) -> dict | str:
     """Process watchdog report: monitored processes, GPU lock detection, RDMA peer heartbeats.
 
     Combines /watchdog, /watchdog/gpu-lock, and /watchdog/peers.
@@ -1112,7 +1112,7 @@ async def asmi_watchdog(host: Optional[str] = None) -> str:
         except Exception as e:
             results[key] = {"error": str(e)}
 
-    return json.dumps(results, indent=2, default=str)
+    return results
 
 
 if __name__ == "__main__":

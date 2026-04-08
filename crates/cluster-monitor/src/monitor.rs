@@ -87,14 +87,24 @@ impl ClusterMonitor {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Normalize to short hostname (strip .local / .tailnet-xxx.ts.net suffix)
-        // so it matches the short names in NodeMap seed_hosts.
-        let local_hostname = whoami::fallible::hostname()
-            .unwrap_or_else(|_| "localhost".to_string())
-            .split('.')
-            .next()
-            .unwrap_or("localhost")
-            .to_string();
+        // Prefer scutil LocalHostName (Bonjour identity, matches Tailscale names)
+        // over whoami (which returns the Unix hostname — often a stale default).
+        let local_hostname = std::process::Command::new("scutil")
+            .args(["--get", "LocalHostName"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+                if s.is_empty() { None } else { Some(s) }
+            })
+            .unwrap_or_else(|| {
+                whoami::fallible::hostname()
+                    .unwrap_or_else(|_| "localhost".to_string())
+                    .split('.')
+                    .next()
+                    .unwrap_or("localhost")
+                    .to_string()
+            });
 
         let events = self.event_sink();
 
