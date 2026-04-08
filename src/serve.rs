@@ -635,6 +635,18 @@ async fn do_serve_load_inner(
 
     let is_bare = req.model_path.is_none();
 
+    // Validate optimization param conflicts
+    if req.draft_model.is_some() {
+        if let Some(dc) = req.decode_concurrency {
+            if dc > 1 {
+                anyhow::bail!(
+                    "draft_model (speculative decoding) is incompatible with decode_concurrency > 1 (batching). \
+                     Set decode_concurrency to 1 or remove draft_model."
+                );
+            }
+        }
+    }
+
     // Engines with model_flag: None lazy-load models via request body (e.g. mlx_vlm).
     // The server starts bare, then a warmup request pre-loads the model.
     let cfg_check = engine.config();
