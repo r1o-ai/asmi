@@ -945,12 +945,21 @@ async def asmi_serve(
     model: Optional[str] = None,
     port: Optional[int] = None,
     host: Optional[str] = None,
+    draft_model: Optional[str] = None,
+    num_draft_tokens: Optional[int] = None,
+    decode_concurrency: Optional[int] = None,
+    prompt_concurrency: Optional[int] = None,
+    prefill_step_size: Optional[int] = None,
+    pipeline: bool = False,
+    prompt_cache_size: Optional[int] = None,
+    prompt_cache_bytes: Optional[int] = None,
+    backend: Optional[str] = None,
 ) -> dict | str:
     """Manage model servers: load, stop, reload, or start distributed share sessions.
 
     Actions:
       - status: Show all server states
-      - load: Load a model (requires 'model' param, optional 'port')
+      - load: Load a model with optional optimization params (requires 'model')
       - stop: Stop a server (optional 'port')
       - reload: Reload a model (optional 'port')
       - share: Start distributed inference share session
@@ -960,9 +969,18 @@ async def asmi_serve(
 
     Parameters:
         action: One of: status, load, stop, reload, share, share_status, share_stop
-        model: Model repo path (required for load action)
+        model: Model repo path (required for load action). NVFP4 models work directly.
         port: Server port (default: 19080)
         host: Target hostname. Defaults to local node.
+        draft_model: Speculative decoding draft model path (incompatible with decode_concurrency > 1)
+        num_draft_tokens: Number of draft tokens per step (default: mlx_lm uses 3)
+        decode_concurrency: Max concurrent decode batches. Set to 1 if using draft_model.
+        prompt_concurrency: Max concurrent prompt/prefill batches.
+        prefill_step_size: Prefill chunk size in tokens. Community optimal: 4096-8192.
+        pipeline: Use pipeline parallelism instead of tensor parallelism (JACCL only).
+        prompt_cache_size: Max KV caches held in prompt cache.
+        prompt_cache_bytes: Max bytes for prompt KV cache.
+        backend: "auto", "single", or "jaccl". Auto-detects JACCL if hostfile exists.
     """
     base = _resolve_base(host)
     port_param = f"?port={port}" if port else ""
@@ -981,6 +999,25 @@ async def asmi_serve(
                     "preflight": preflight,
                 }
             body = {"model_path": model}
+            # Optimization passthrough
+            if draft_model is not None:
+                body["draft_model"] = draft_model
+            if num_draft_tokens is not None:
+                body["num_draft_tokens"] = num_draft_tokens
+            if decode_concurrency is not None:
+                body["decode_concurrency"] = decode_concurrency
+            if prompt_concurrency is not None:
+                body["prompt_concurrency"] = prompt_concurrency
+            if prefill_step_size is not None:
+                body["prefill_step_size"] = prefill_step_size
+            if pipeline:
+                body["pipeline"] = True
+            if prompt_cache_size is not None:
+                body["prompt_cache_size"] = prompt_cache_size
+            if prompt_cache_bytes is not None:
+                body["prompt_cache_bytes"] = prompt_cache_bytes
+            if backend is not None:
+                body["backend"] = backend
             load_result = await _post(f"/serve/load{port_param}", body, base)
             note = "Load started with warnings" if preflight["warnings"] else None
             return {
@@ -1011,6 +1048,8 @@ async def asmi_serve(
                     "preflight": preflight,
                 }
             body = {"model_path": model}
+            if backend is not None:
+                body["backend"] = backend
             share_result = await _post("/serve/share", body, base)
             return {
                 "result": share_result,
