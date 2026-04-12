@@ -123,6 +123,10 @@ const CMD_RDMA_NET: &str =
 const CMD_JACCL_ENV: &str =
     "ps aux | grep 'mlx\\.launch.*--backend' | grep -v grep | head -5";
 
+/// Top CPU-consuming processes (sorted by CPU% descending, top 8).
+const CMD_PS_TOP: &str =
+    "ps -arcxo pid,pcpu,comm 2>/dev/null | head -8";
+
 /// iostat: 2 samples, 1s apart. Take the second (real-time) sample.
 const CMD_IOSTAT: &str =
     "iostat -d -C -K -c 2 -w 1 2>/dev/null";
@@ -281,13 +285,14 @@ async fn collect_via_ssh(
         }
     };
 
-    let (power, mem_res, ps_res, jaccl_res, rdma_net_res, iostat_res) = tokio::join!(
+    let (power, mem_res, ps_res, jaccl_res, rdma_net_res, iostat_res, ps_top_res) = tokio::join!(
         power_fut,
         run(CMD_VMSTAT_SYSCTL),
         run(CMD_PS_MLX),
         run(CMD_JACCL_ENV),
         run(CMD_RDMA_NET),
         run(CMD_IOSTAT),
+        run(CMD_PS_TOP),
     );
     // Hardware identity: local uses cached OnceLock, remote runs via SSH
     let hw_identity = if is_local {
@@ -560,7 +565,10 @@ async fn collect_via_ssh(
         cpu_temp_c: None,
         gpu_temp_c: None,
         processes,
-        top_tasks: Vec::new(),
+        top_tasks: match &ps_top_res {
+            Ok(r) if r.has_output() => parse_ps_top(&r.stdout),
+            _ => Vec::new(),
+        },
         rdma: rdma_status,
         interface_ips,
     }
@@ -1062,6 +1070,40 @@ pub fn parse_cpu_clusters(text: &str) -> Vec<CpuClusterInfo> {
 /// macOS iostat format:
 /// ```text
 ///               disk0               disk3
+/// Parse `ps -arcxo pid,pcpu,comm` output into top tasks.
+///
+/// Example output:
+/// ```text
+///   PID  %CPU COMM
+/// 62339  24.1 node
+///   501   3.2 WindowServer
+///   412   1.0 mds_stores
+/// ```
+fn parse_ps_top(text: &str) -> Vec<TaskEnergy> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            // Skip header
+            if line.starts_with("PID") || line.is_empty() {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            let pid: u32 = parts.next()?.parse().ok()?;
+            let cpu: f64 = parts.next()?.parse().ok()?;
+            let name = parts.collect::<Vec<_>>().join(" ");
+            if name.is_empty() || cpu <= 0.0 {
+                return None;
+            }
+            Some(TaskEnergy {
+                pid,
+                name,
+                energy_impact: cpu,
+                watts_share: 0.0, // calculated downstream if needed
+            })
+        })
+        .collect()
+}
+
 ///     KB/t  tps  MB/s     KB/t  tps  MB/s
 ///    21.91   29  0.62    54.03   72  3.79
 ///     0.00    0  0.00     0.00    0  0.00
