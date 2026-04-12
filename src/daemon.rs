@@ -1867,7 +1867,23 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
         d.get("port_state").and_then(|v| v.as_str()) == Some("Active")
     }).count();
 
-    // 3. Get ARP peers (169.254.x.x) and ping each one
+    // 3. Collect known RDMA IPs from NodeMap + ARP discovery, then ping all.
+    //
+    // Two sources of peer IPs:
+    //   a) NodeMap.rdma_ips — persisted from previous scans, survives reboots
+    //   b) ARP table — ephemeral, only populated when traffic has flowed recently
+    // Using both ensures we find peers even when ARP has gone stale.
+
+    let known_rdma_ips: Vec<(String, String)> = {
+        let nm = state.node_map.read().await;
+        nm.rdma_ips
+            .iter()
+            .flat_map(|(hostname, ips)| {
+                ips.iter().map(move |ip| (ip.clone(), hostname.clone()))
+            })
+            .collect()
+    };
+
     let arp_out = Command::new("arp")
         .args(["-an"])
         .output()
@@ -1895,14 +1911,21 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
         .collect();
 
     // Collect interfaces that have a link-local (169.254.x.x) address assigned.
-    // An interface with an Active RDMA device but no link-local IP (e.g. en4 with
-    // 192.168.x.x from Internet Sharing) cannot reach 169.254 peers.
     let link_local_ifaces: std::collections::HashSet<String> = link_local
         .iter()
         .filter_map(|v| v.get("interface").and_then(|i| i.as_str()).map(|s| s.to_string()))
         .collect();
 
-    let mut peer_ips: Vec<(String, String)> = Vec::new(); // (ip, interface)
+    // Start with known RDMA IPs from NodeMap (interface unknown, will be resolved by ping)
+    let mut peer_ips: Vec<(String, String)> = known_rdma_ips
+        .iter()
+        .filter(|(ip, _)| !own_ips.contains(ip))
+        .map(|(ip, _)| (ip.clone(), "nodemap".to_string()))
+        .collect();
+
+    // Also add ARP-discovered peers (may overlap — dedup below)
+    let mut seen_ips: std::collections::HashSet<String> = peer_ips.iter().map(|(ip, _)| ip.clone()).collect();
+
     for line in arp_out.lines() {
         if line.contains("incomplete") || !line.contains("169.254.") {
             continue;
@@ -1923,7 +1946,9 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
             if !link_local_ifaces.contains(iface) {
                 continue; // Active RDMA but no link-local IP (e.g. bridge/sharing) — skip
             }
-            peer_ips.push((ip.to_string(), iface.to_string()));
+            if seen_ips.insert(ip.to_string()) {
+                peer_ips.push((ip.to_string(), iface.to_string()));
+            }
         }
     }
 
@@ -1960,6 +1985,28 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
 
     let peers_reachable = ping_results.iter().filter(|p| p.reachable).count();
     let peers_total = ping_results.len();
+
+    // 3b. Persist newly discovered reachable IPs to NodeMap so future scans
+    //     don't depend on ARP cache being warm.
+    {
+        let reachable_ips: Vec<String> = ping_results
+            .iter()
+            .filter(|p| p.reachable)
+            .map(|p| p.ip.clone())
+            .collect();
+        if !reachable_ips.is_empty() {
+            let mut nm = state.node_map.write().await;
+            let changed = nm.add_rdma_ips(hostname, &reachable_ips);
+            if changed {
+                nm.save();
+                tracing::info!(
+                    ips = ?reachable_ips,
+                    "persisted {} new RDMA peer IPs to NodeMap",
+                    reachable_ips.len()
+                );
+            }
+        }
+    }
 
     // 4. Get RDMA links from node_map (discovered link ↔ peer mapping)
     let rdma_links = {
@@ -2017,32 +2064,34 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
     }))
 }
 
-/// Known RDMA cluster nodes with their Tailscale IPs.
-/// These nodes have TB5 direct connections for RDMA.
-const RDMA_NODES: &[(&str, &str)] = &[
-    ("m3u2", "100.125.18.51"),
-    ("m3u1", "100.127.90.10"),
-    ("m3u3", "100.112.127.66"),
-    ("m4m1", "100.78.120.10"),
-];
-
-/// GET /rdma/mesh → query all RDMA nodes via Tailscale, aggregate mesh health.
+/// GET /rdma/mesh → query all cluster nodes, aggregate mesh health.
 ///
-/// This is the "single pane of glass" endpoint. Hit it from your phone,
-/// laptop, or any Tailscale-connected device to see the full RDMA mesh status.
+/// Reads node list from NodeMap (seeded from ~/.r1o/cluster.json).
+/// Queries each node over local network (hostname.local:9090), not Tailscale.
 async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let nm = state.node_map.read().await;
+    let all_nodes: Vec<String> = nm.nodes.clone();
+    let local_hostname = state.hostname.clone();
+    drop(nm);
+
+    // Exclude self — we'll include our own /rdma/check inline
+    let remote_nodes: Vec<&str> = all_nodes.iter()
+        .filter(|n| n.as_str() != local_hostname)
+        .map(|s| s.as_str())
+        .collect();
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_default();
 
-    // Query all RDMA nodes' /rdma/check endpoint in parallel via Tailscale
-    let futures: Vec<_> = RDMA_NODES
+    // Query remote nodes over local network (.local mDNS)
+    let futures: Vec<_> = remote_nodes
         .iter()
-        .map(|(name, ts_ip)| {
+        .map(|&name| {
             let client = client.clone();
             let name = name.to_string();
-            let url = format!("http://{}:9090/rdma/check", ts_ip);
+            let url = format!("http://{}.local:9090/rdma/check", name);
             async move {
                 match client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
@@ -2096,13 +2145,14 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
                     "hostname": name,
                     "online": false,
                     "healthy": false,
-                    "summary": "unreachable via Tailscale",
+                    "summary": "unreachable on local network",
                 }));
             }
         }
     }
 
-    let mesh_healthy = nodes_healthy == nodes_online && nodes_online == RDMA_NODES.len();
+    let nodes_total = all_nodes.len();
+    let mesh_healthy = nodes_healthy == nodes_online && nodes_online > 0;
 
     // Get topology from local cache for mesh-level summary
     let mesh_topology = {
@@ -2123,17 +2173,17 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         "mesh_healthy": mesh_healthy,
         "summary": format!(
             "{}/{} nodes healthy, {} RDMA devices active, {}/{} peer links verified",
-            nodes_healthy, RDMA_NODES.len(), total_active, total_reachable_peers, total_peers
+            nodes_healthy, nodes_total, total_active, total_reachable_peers, total_peers
         ),
         "nodes_online": nodes_online,
-        "nodes_total": RDMA_NODES.len(),
+        "nodes_total": nodes_total,
         "nodes_healthy": nodes_healthy,
         "total_rdma_active": total_active,
         "total_peers_reachable": total_reachable_peers,
         "total_peers": total_peers,
         "topology": mesh_topology,
         "nodes": nodes,
-        "queried_via": "tailscale",
+        "queried_via": "local_network",
         "queried_from": state.hostname,
     }))
 }

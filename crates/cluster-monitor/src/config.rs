@@ -172,13 +172,46 @@ impl NodeMap {
             .join("config.json")
     }
 
-    /// Load from disk. Returns empty map if file doesn't exist.
+    /// Load from disk. If `~/.config/asmi/config.json` doesn't exist, seeds
+    /// the node list from `~/.r1o/cluster.json` (the shared cluster inventory)
+    /// and persists it so subsequent loads are self-contained.
     pub fn load() -> Self {
         let path = Self::config_path();
-        std::fs::read_to_string(&path)
+        if let Some(nm) = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+        {
+            return nm;
+        }
+
+        // Seed from ~/.r1o/cluster.json if it exists
+        let mut nm = Self::default();
+        if let Some(nodes) = Self::load_r1o_cluster_nodes() {
+            for node in &nodes {
+                nm.register_node(node);
+            }
+            nm.save();
+            tracing::info!(
+                nodes = ?nm.nodes,
+                "seeded NodeMap from ~/.r1o/cluster.json ({} nodes)",
+                nm.nodes.len()
+            );
+        }
+        nm
+    }
+
+    /// Read node hostnames from `~/.r1o/cluster.json`.
+    /// Format: `{ "nodes": [{ "hostname": "hub", ... }, ...] }`
+    fn load_r1o_cluster_nodes() -> Option<Vec<String>> {
+        let path = dirs::home_dir()?.join(".r1o").join("cluster.json");
+        let content = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let nodes = json.get("nodes")?.as_array()?;
+        let hostnames: Vec<String> = nodes
+            .iter()
+            .filter_map(|n| n.get("hostname")?.as_str().map(String::from))
+            .collect();
+        if hostnames.is_empty() { None } else { Some(hostnames) }
     }
 
     /// Save to disk.
