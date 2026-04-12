@@ -2138,6 +2138,256 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
     }))
 }
 
+// ---------------------------------------------------------------------------
+// POST /prep — benchmark prep mode: kill apps, flush cache, toggle spotlight
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PrepBody {
+    /// "on" — kill non-essential apps, flush caches, disable Spotlight
+    /// "off" — re-enable Spotlight, report
+    /// "status" — check if prep mode is active
+    action: String,
+}
+
+const PREP_STATE_FILE: &str = "/tmp/.bench-prep-active";
+
+/// Processes to kill during prep (background daemons that waste RAM/GPU)
+const KILL_PROCS: &[&str] = &[
+    "speechrecognitiond",
+    "localspeechrecognition",
+    "DictationIM",
+    "SpeechSynthesisServerXPC",
+    "Playwright",
+    "playwright",
+    "SpringBoard.app",
+    "SimulatorTrampoline",
+    "Simulator.app",
+];
+
+/// Apps to keep alive (everything else gets killed)
+const KEEP_APPS: &[&str] = &["Finder", "cmux"];
+
+/// Snapshot RAM + process state for pre/post-flight comparison.
+/// Uses sysctl + vm_stat for fresh memory numbers (not the cached asmi snapshot).
+async fn prep_snapshot() -> serde_json::Value {
+    use tokio::process::Command;
+
+    // RAM via sysctl (total) + vm_stat (free/inactive pages → available)
+    let total_bytes: f64 = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let total_gb = total_bytes / 1_073_741_824.0;
+
+    // vm_stat gives page counts; page size is 16384 on Apple Silicon
+    let available_gb = Command::new("vm_stat")
+        .output()
+        .await
+        .ok()
+        .map(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let page_size: f64 = 16384.0;
+            let mut free: f64 = 0.0;
+            let mut inactive: f64 = 0.0;
+            let mut purgeable: f64 = 0.0;
+            for line in text.lines() {
+                let val = || -> Option<f64> {
+                    line.split(':').nth(1)?.trim().trim_end_matches('.').parse().ok()
+                };
+                if line.starts_with("Pages free") {
+                    free = val().unwrap_or(0.0);
+                } else if line.starts_with("Pages inactive") {
+                    inactive = val().unwrap_or(0.0);
+                } else if line.starts_with("Pages purgeable") {
+                    purgeable = val().unwrap_or(0.0);
+                }
+            }
+            (free + inactive + purgeable) * page_size / 1_073_741_824.0
+        })
+        .unwrap_or(0.0);
+
+    let used_gb = total_gb - available_gb;
+
+    // Process count
+    let process_count: u32 = Command::new("ps")
+        .args(["-A", "-o", "pid="])
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() as u32)
+        .unwrap_or(0);
+
+    // GUI app count via osascript
+    let app_count = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to count of (every application process whose background only is false)"#)
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())
+        .unwrap_or(0);
+
+    // Spotlight status
+    let spotlight_on = Command::new("mdutil")
+        .args(["-s", "/"])
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("Indexing enabled"))
+        .unwrap_or(false);
+
+    serde_json::json!({
+        "ram_total_gb": (total_gb * 10.0).round() / 10.0,
+        "ram_used_gb": (used_gb * 10.0).round() / 10.0,
+        "ram_available_gb": (available_gb * 10.0).round() / 10.0,
+        "process_count": process_count,
+        "gui_app_count": app_count,
+        "spotlight_indexing": spotlight_on,
+    })
+}
+
+async fn prep_handler(
+    State(_state): State<AppState>,
+    Json(body): Json<PrepBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use tokio::process::Command;
+    use tokio::fs;
+
+    match body.action.as_str() {
+        "status" => {
+            let active = fs::metadata(PREP_STATE_FILE).await.is_ok();
+            let snapshot = prep_snapshot().await;
+            Ok(Json(serde_json::json!({
+                "prep": active,
+                "current": snapshot,
+            })))
+        }
+
+        "on" => {
+            let start = std::time::Instant::now();
+
+            // ── Pre-flight snapshot ──
+            let preflight = prep_snapshot().await;
+
+            let mut killed = Vec::new();
+            let mut errors = Vec::new();
+
+            // 1. Kill non-essential macOS GUI apps via osascript
+            let script = format!(
+                r#"tell application "System Events"
+                    set keepList to {{{}}}
+                    set appNames to name of every application process whose background only is false
+                    set killList to {{}}
+                    repeat with a in appNames
+                        if a is not in keepList then
+                            set end of killList to (a as text)
+                        end if
+                    end repeat
+                    return killList
+                end tell"#,
+                KEEP_APPS.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(", ")
+            );
+
+            if let Ok(out) = Command::new("osascript").arg("-e").arg(&script).output().await {
+                let apps = String::from_utf8_lossy(&out.stdout);
+                for app in apps.trim().split(", ").filter(|a| !a.is_empty()) {
+                    let app = app.trim();
+                    if Command::new("osascript")
+                        .arg("-e")
+                        .arg(format!(r#"tell application "{app}" to quit"#))
+                        .output()
+                        .await
+                        .is_ok()
+                    {
+                        killed.push(app.to_string());
+                    }
+                }
+            }
+
+            // 2. Kill background processes
+            for proc in KILL_PROCS {
+                if Command::new("pkill").arg("-x").arg(proc).output().await.is_ok() {
+                    killed.push(proc.to_string());
+                }
+            }
+
+            // 3. Flush file cache
+            if let Err(e) = Command::new("purge").output().await {
+                errors.push(format!("purge failed: {e}"));
+            }
+
+            // 4. Disable Spotlight
+            if let Err(e) = Command::new("mdutil").args(["-a", "-i", "off"]).output().await {
+                errors.push(format!("mdutil failed: {e}"));
+            }
+
+            // 5. Mark prep active
+            let _ = fs::write(PREP_STATE_FILE, "on").await;
+
+            // Brief settle for OS to release memory
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // ── Post-flight snapshot ──
+            let postflight = prep_snapshot().await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            // Compute delta
+            let ram_freed_gb = postflight["ram_available_gb"].as_f64().unwrap_or(0.0)
+                - preflight["ram_available_gb"].as_f64().unwrap_or(0.0);
+            let procs_killed = preflight["process_count"].as_u64().unwrap_or(0) as i64
+                - postflight["process_count"].as_u64().unwrap_or(0) as i64;
+
+            Ok(Json(serde_json::json!({
+                "prep": true,
+                "duration_ms": duration_ms,
+                "killed": killed,
+                "errors": errors,
+                "preflight": preflight,
+                "postflight": postflight,
+                "delta": {
+                    "ram_freed_gb": (ram_freed_gb * 10.0).round() / 10.0,
+                    "processes_removed": procs_killed.max(0),
+                    "gui_apps_removed": preflight["gui_app_count"].as_u64().unwrap_or(0) as i64
+                        - postflight["gui_app_count"].as_u64().unwrap_or(0) as i64,
+                },
+            })))
+        }
+
+        "off" => {
+            let start = std::time::Instant::now();
+            let preflight = prep_snapshot().await;
+            let mut errors = Vec::new();
+
+            // Re-enable Spotlight
+            if let Err(e) = Command::new("mdutil").args(["-a", "-i", "on"]).output().await {
+                errors.push(format!("mdutil failed: {e}"));
+            }
+
+            // Remove state file
+            let _ = tokio::fs::remove_file(PREP_STATE_FILE).await;
+
+            let postflight = prep_snapshot().await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            Ok(Json(serde_json::json!({
+                "prep": false,
+                "duration_ms": duration_ms,
+                "errors": errors,
+                "preflight": preflight,
+                "postflight": postflight,
+            })))
+        }
+
+        other => Err(ApiError::BadRequest(format!(
+            "unknown prep action: {other} (use 'on', 'off', or 'status')"
+        ))),
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -2180,6 +2430,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/egpu", get(egpu_handler))
         .route("/rdma/check", get(rdma_check_handler))
         .route("/rdma/mesh", get(rdma_mesh_handler))
+        .route("/prep", post(prep_handler))
         // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
         .route("/ane/compute", get(crate::ane::status_handler))
         .route("/ane/eval", post(crate::ane::eval_handler))

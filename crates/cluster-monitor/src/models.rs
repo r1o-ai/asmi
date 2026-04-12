@@ -418,11 +418,13 @@ fn has_model_files(path: &PathBuf) -> bool {
 }
 
 /// Sum file sizes in a directory (non-recursive, top-level files only).
+/// Uses `std::fs::metadata` (not `DirEntry::metadata`) to follow symlinks,
+/// so HF cache snapshots (symlinks → blobs) report their true size.
 fn dir_size(path: &PathBuf) -> u64 {
     std::fs::read_dir(path)
         .map(|entries| {
             entries.flatten()
-                .filter_map(|e| e.metadata().ok())
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
                 .filter(|m| m.is_file())
                 .map(|m| m.len())
                 .sum()
@@ -563,6 +565,33 @@ mod tests {
             .collect();
         // Should only appear once despite scanning twice
         assert_eq!(test_models.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_dir_size_follows_symlinks() {
+        // Simulate HF cache layout: model dir contains symlinks → blob files
+        let tmp = std::env::temp_dir().join("asmi-test-symlink-size");
+        let blobs = tmp.join("blobs");
+        let snapshot = tmp.join("snapshot");
+        let _ = std::fs::create_dir_all(&blobs);
+        let _ = std::fs::create_dir_all(&snapshot);
+
+        // Create a "blob" file with known size
+        let payload = vec![0u8; 4096];
+        std::fs::write(blobs.join("sha256-abc"), &payload).unwrap();
+        std::fs::write(blobs.join("sha256-def"), &payload).unwrap();
+
+        // Symlink from snapshot → blobs (like HF cache does)
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(blobs.join("sha256-abc"), snapshot.join("model.safetensors")).unwrap();
+            std::os::unix::fs::symlink(blobs.join("sha256-def"), snapshot.join("config.json")).unwrap();
+        }
+
+        let size = dir_size(&snapshot);
+        assert_eq!(size, 8192, "dir_size must follow symlinks to get real file sizes");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
