@@ -180,7 +180,143 @@ pub async fn run_setup(port: u16, cluster: bool, skip_bridge0: bool, dry_run: bo
         }
     }
 
-    // ── Step 5: Install binary ───────────────────────────────────────
+    // ── Step 5: SSH ControlMaster config ──────────────────────────────
+    let ssh_config = home.join(".ssh/config");
+    let ssh_config_content = std::fs::read_to_string(&ssh_config).unwrap_or_default();
+    if ssh_config_content.contains("ControlMaster") {
+        step("ssh-mux", "SSH ControlMaster already configured");
+    } else {
+        step("ssh-mux", "Adding ControlMaster to ~/.ssh/config");
+        if !dry_run {
+            let block = "\n\
+# r1o cluster — persistent SSH multiplexing\n\
+Host *\n\
+    ControlMaster auto\n\
+    ControlPath /tmp/asmi-%r@%h:%p\n\
+    ControlPersist 10m\n\
+    AddKeysToAgent yes\n\
+    UseKeychain yes\n\
+    IdentityFile ~/.ssh/id_ed25519\n\
+    ServerAliveInterval 30\n\
+    ServerAliveCountMax 3\n";
+            let mut content = ssh_config_content.clone();
+            content.push_str(block);
+            if std::fs::write(&ssh_config, &content).is_ok() {
+                println!("  ControlPath: /tmp/asmi-<user>@<host>:<port>");
+                println!("  ControlPersist: 10m (connections stay open after last session)");
+            } else {
+                eprintln!("  ⚠ Failed to write ~/.ssh/config");
+            }
+        }
+    }
+
+    // ── Step 6: autossh for persistent node connections ─────────────────
+    let has_autossh = Command::new("which").arg("autossh").output()
+        .map_or(false, |o| o.status.success());
+
+    if remote_nodes.is_empty() {
+        step("autossh", "No remote nodes — skipping persistent connections");
+    } else if !has_autossh {
+        step("autossh", "Installing autossh via Homebrew");
+        if !dry_run {
+            let brew = Command::new("brew")
+                .args(["install", "autossh"])
+                .output();
+            if brew.map_or(false, |o| o.status.success()) {
+                println!("  autossh installed");
+            } else {
+                eprintln!("  ⚠ brew install autossh failed — install manually");
+            }
+        }
+    } else {
+        step("autossh", "autossh already installed");
+    }
+
+    // Write per-node autossh launchd plists
+    if !remote_nodes.is_empty() {
+        let autossh_bin = Command::new("which").arg("autossh").output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "/opt/homebrew/bin/autossh".to_string());
+        let user = std::env::var("USER").unwrap_or_else(|_| "ma".to_string());
+        let la_dir = home.join("Library/LaunchAgents");
+
+        for node in &remote_nodes {
+            let plist_name = format!("com.r1o.autossh.{}.plist", node);
+            let plist_path = la_dir.join(&plist_name);
+
+            if plist_path.exists() {
+                println!("  [autossh] {} — plist exists", node);
+                continue;
+            }
+
+            step("autossh", &format!("Creating persistent connection to {}", node));
+            if !dry_run {
+                // autossh with ControlMaster: opens an SSH mux master connection
+                // that stays alive. asmi and mlx.launch reuse it via ControlPath.
+                // -M 0 disables autossh's monitoring port (ServerAlive handles it)
+                // -N = no command, -f = background (but launchd manages lifecycle)
+                let content = format!(
+r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.r1o.autossh.{node}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{autossh}</string>
+        <string>-M</string>
+        <string>0</string>
+        <string>-N</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=30</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>ControlMaster=auto</string>
+        <string>-o</string>
+        <string>ControlPath=/tmp/asmi-{user}@{node}:22</string>
+        <string>-o</string>
+        <string>ControlPersist=yes</string>
+        <string>{user}@{node}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/autossh-{node}.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/autossh-{node}.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AUTOSSH_GATETIME</key>
+        <string>0</string>
+    </dict>
+</dict>
+</plist>"#,
+                    node = node,
+                    autossh = autossh_bin,
+                    user = user,
+                );
+
+                if std::fs::write(&plist_path, &content).is_ok() {
+                    // Load the agent
+                    let uid = Command::new("id").arg("-u").output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_else(|_| "501".to_string());
+                    let _ = Command::new("launchctl")
+                        .args(["bootstrap", &format!("gui/{}", uid), plist_path.to_str().unwrap_or("")])
+                        .output();
+                    println!("  {} — autossh agent started (mux: /tmp/asmi-{}@{}:22)", node, user, node);
+                }
+            }
+        }
+    }
+
+    // ── Step 7: Install binary ───────────────────────────────────────
     let cargo_bin = home.join(".cargo/bin/asmi");
     let current_exe = std::env::current_exe().unwrap_or_default();
     if current_exe == cargo_bin {
