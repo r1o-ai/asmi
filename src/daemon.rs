@@ -1817,6 +1817,7 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
 
     let mut bridges: Vec<serde_json::Value> = Vec::new();
     let mut link_local: Vec<serde_json::Value> = Vec::new();
+    let mut bridge0_members: Vec<String> = Vec::new();
     let mut current_iface = String::new();
 
     for line in ifconfig_out.lines() {
@@ -1824,6 +1825,15 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
         if !line.starts_with('\t') && !line.starts_with(' ') {
             if let Some(name) = line.split(':').next() {
                 current_iface = name.to_string();
+            }
+        }
+        // Capture bridge0 member interfaces: "	member: en1 flags=3<...>"
+        if current_iface == "bridge0" {
+            let trimmed = line.trim();
+            if trimmed.starts_with("member:") {
+                if let Some(iface) = trimmed.split_whitespace().nth(1) {
+                    bridge0_members.push(iface.to_string());
+                }
             }
         }
         if line.contains("inet ") && !line.contains("inet6") {
@@ -1843,6 +1853,8 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
             }
         }
     }
+
+    let bridge0_blocking = !bridge0_members.is_empty();
 
     // 2. RDMA device states from snapshot
     let rdma_devices = {
@@ -2055,6 +2067,8 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
         "rdma_devices": rdma_devices,
         "rdma_active_count": active_count,
         "bridges": bridges,
+        "bridge0_blocking": bridge0_blocking,
+        "bridge0_members": bridge0_members,
         "link_local_ips": link_local,
         "peer_pings": ping_results,
         "peers_reachable": peers_reachable,
@@ -2062,6 +2076,201 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
         "rdma_links": rdma_links,
         "topology": topology,
     }))
+}
+
+/// POST /bridge0/destroy — Remove bridge0 and create individual TB5 network services.
+/// Localhost-only for safety. Returns the list of freed interfaces.
+async fn bridge0_destroy_handler(
+    State(_state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use tokio::process::Command;
+
+    // Safety: only allow from localhost
+    if !addr.ip().is_loopback() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "bridge0/destroy is localhost-only"
+        }))).into_response();
+    }
+
+    // 1. Detect bridge0 members from ifconfig
+    let ifconfig = Command::new("ifconfig").arg("bridge0").output().await;
+    let members: Vec<String> = match ifconfig {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.trim().starts_with("member:"))
+                .filter_map(|l| l.split_whitespace().nth(1).map(String::from))
+                .collect()
+        }
+        _ => {
+            return Json(serde_json::json!({
+                "status": "ok",
+                "message": "No bridge0 found — nothing to do",
+                "bridge0_gone": true,
+                "freed_interfaces": [],
+            })).into_response();
+        }
+    };
+
+    if members.is_empty() {
+        return Json(serde_json::json!({
+            "status": "ok",
+            "message": "bridge0 exists but has no member interfaces",
+            "bridge0_gone": false,
+            "freed_interfaces": [],
+        })).into_response();
+    }
+
+    let mut steps_log: Vec<serde_json::Value> = Vec::new();
+    let plist = "/Library/Preferences/SystemConfiguration/preferences.plist";
+
+    // 2. Remove bridge0 from preferences.plist
+    let rm = Command::new("sudo")
+        .args(["/usr/libexec/PlistBuddy", "-c",
+               "Delete :VirtualNetworkInterfaces:Bridge:bridge0", plist])
+        .output().await;
+    steps_log.push(serde_json::json!({
+        "step": "remove_plist",
+        "ok": rm.as_ref().map_or(false, |o| o.status.success()),
+    }));
+
+    // 3. Create network services for each freed interface
+    for iface in &members {
+        let svc_name = format!("r1o TB {}", iface);
+        let create = Command::new("sudo")
+            .args(["networksetup", "-createnetworkservice", &svc_name, iface])
+            .output().await;
+        steps_log.push(serde_json::json!({
+            "step": format!("create_service_{}", iface),
+            "ok": create.as_ref().map_or(false, |o| o.status.success()),
+        }));
+    }
+
+    // 4. Restart configd to apply changes
+    let _ = Command::new("sudo").args(["killall", "configd"]).output().await;
+    steps_log.push(serde_json::json!({"step": "restart_configd", "ok": true}));
+
+    // 5. Wait for IPv4LL assignment
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let _ = Command::new("sudo").args(["ipconfig", "waitall"]).output().await;
+    steps_log.push(serde_json::json!({"step": "wait_ipv4ll", "ok": true}));
+
+    // 6. Verify bridge0 is gone
+    let verify = Command::new("ifconfig").arg("bridge0").output().await;
+    let bridge0_gone = verify.map_or(true, |o| !o.status.success());
+    steps_log.push(serde_json::json!({"step": "verify", "ok": bridge0_gone}));
+
+    // 7. Collect new link-local IPs on freed interfaces
+    let mut new_ips: Vec<serde_json::Value> = Vec::new();
+    for iface in &members {
+        let out = Command::new("ifconfig").arg(iface).output().await;
+        if let Ok(o) = out {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for line in text.lines() {
+                if line.contains("inet 169.254") {
+                    if let Some(ip) = line.split_whitespace().nth(1) {
+                        new_ips.push(serde_json::json!({"interface": iface, "ip": ip}));
+                    }
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": if bridge0_gone { "ok" } else { "partial" },
+        "bridge0_gone": bridge0_gone,
+        "freed_interfaces": members,
+        "new_ips": new_ips,
+        "steps": steps_log,
+    })).into_response()
+}
+
+/// POST /bridge0/restore — Recreate bridge0 from r1o TB network services.
+/// Localhost-only. Reverses the effect of /bridge0/destroy.
+async fn bridge0_restore_handler(
+    State(_state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use tokio::process::Command;
+
+    if !addr.ip().is_loopback() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "bridge0/restore is localhost-only"
+        }))).into_response();
+    }
+
+    // Check if bridge0 already exists
+    let check = Command::new("ifconfig").arg("bridge0").output().await;
+    if check.as_ref().map_or(false, |o| o.status.success()) {
+        return Json(serde_json::json!({
+            "status": "ok",
+            "message": "bridge0 already exists — nothing to restore",
+        })).into_response();
+    }
+
+    // Find r1o TB services to convert back
+    let svc_out = Command::new("networksetup")
+        .arg("-listallnetworkservices")
+        .output().await;
+    let services: Vec<String> = svc_out.map_or(vec![], |o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| l.starts_with("r1o TB "))
+            .map(String::from)
+            .collect()
+    });
+
+    let ifaces: Vec<String> = services.iter()
+        .filter_map(|s| s.strip_prefix("r1o TB ").map(String::from))
+        .collect();
+
+    if ifaces.is_empty() {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "No r1o TB services found to restore",
+        })).into_response();
+    }
+
+    let plist = "/Library/Preferences/SystemConfiguration/preferences.plist";
+
+    // Recreate bridge0 in preferences.plist
+    let _ = Command::new("sudo").args(["/usr/libexec/PlistBuddy", "-c",
+        "Add :VirtualNetworkInterfaces:Bridge:bridge0:Options:__AUTO__ string thunderbolt-bridge",
+        plist]).output().await;
+    let _ = Command::new("sudo").args(["/usr/libexec/PlistBuddy", "-c",
+        "Add :VirtualNetworkInterfaces:Bridge:bridge0:Interfaces array",
+        plist]).output().await;
+
+    for iface in &ifaces {
+        let _ = Command::new("sudo").args(["/usr/libexec/PlistBuddy", "-c",
+            &format!("Add :VirtualNetworkInterfaces:Bridge:bridge0:Interfaces: string {}", iface),
+            plist]).output().await;
+    }
+
+    // Remove r1o TB services
+    for svc in &services {
+        let _ = Command::new("sudo")
+            .args(["networksetup", "-removenetworkservice", svc])
+            .output().await;
+    }
+
+    // Apply
+    let _ = Command::new("sudo").args(["killall", "configd"]).output().await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let verify = Command::new("ifconfig").arg("bridge0").output().await;
+    let restored = verify.as_ref().map_or(false, |o| o.status.success());
+
+    Json(serde_json::json!({
+        "status": if restored { "ok" } else { "error" },
+        "bridge0_restored": restored,
+        "interfaces_returned": ifaces,
+    })).into_response()
 }
 
 /// GET /rdma/mesh → query all cluster nodes, aggregate mesh health.
@@ -2480,6 +2689,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/egpu", get(egpu_handler))
         .route("/rdma/check", get(rdma_check_handler))
         .route("/rdma/mesh", get(rdma_mesh_handler))
+        .route("/bridge0/destroy", post(bridge0_destroy_handler))
+        .route("/bridge0/restore", post(bridge0_restore_handler))
         .route("/prep", post(prep_handler))
         // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
         .route("/ane/compute", get(crate::ane::status_handler))

@@ -387,7 +387,10 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    ).await?;
 
     Ok(())
 }
