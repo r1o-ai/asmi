@@ -3,6 +3,7 @@ mod cli;
 mod daemon;
 mod daemon_startup;
 mod serve;
+mod setup;
 mod topology;
 mod watchdog;
 
@@ -83,6 +84,22 @@ enum Command {
         #[arg(long, default_value = "jaccl")]
         backend: String,
     },
+    /// First-time node setup: destroy bridge0, create network services,
+    /// seed config, install and start daemon. Requires sudo for network changes.
+    Setup {
+        /// Port for the daemon (default: 9090).
+        #[arg(long, default_value_t = 9090)]
+        port: u16,
+        /// Enable cluster hub mode (aggregates all nodes).
+        #[arg(long)]
+        cluster: bool,
+        /// Skip bridge0 destruction (if you want to keep Thunderbolt Bridge).
+        #[arg(long)]
+        skip_bridge0: bool,
+        /// Dry run: show what would be done without executing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -151,6 +168,9 @@ async fn main() -> Result<()> {
     // Subcommand dispatch
     if let Some(command) = args.command {
         return match command {
+            Command::Setup { port, cluster, skip_bridge0, dry_run } => {
+                setup::run_setup(port, cluster, skip_bridge0, dry_run).await
+            }
             Command::Daemon { action } => cli::run_daemon(action, args.port).await,
             Command::Topology {
                 hosts,
