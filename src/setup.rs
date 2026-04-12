@@ -63,7 +63,124 @@ pub async fn run_setup(port: u16, cluster: bool, skip_bridge0: bool, dry_run: bo
         }
     }
 
-    // ── Step 3: Install binary ──────────────────────────────────────────
+    // ── Step 3: SSH key setup ─────────────────────────────────────────
+    let ssh_key = home.join(".ssh/id_ed25519");
+    if ssh_key.exists() {
+        step("ssh", "SSH key already exists");
+    } else {
+        step("ssh", "Generating ed25519 SSH key (no passphrase)");
+        if !dry_run {
+            let ssh_dir = home.join(".ssh");
+            std::fs::create_dir_all(&ssh_dir).ok();
+            let keygen = Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-f", ssh_key.to_str().unwrap_or("")])
+                .output();
+            if keygen.map_or(false, |o| o.status.success()) {
+                println!("  Generated {}", ssh_key.display());
+            } else {
+                eprintln!("  ⚠ ssh-keygen failed");
+            }
+        }
+    }
+
+    // Distribute SSH key to other cluster nodes (if NodeMap has nodes)
+    let nm = asmi_core::config::NodeMap::load();
+    let pub_key_path = home.join(".ssh/id_ed25519.pub");
+    let remote_nodes: Vec<&str> = nm.nodes.iter()
+        .filter(|n| n.as_str() != hostname)
+        .map(|s| s.as_str())
+        .collect();
+
+    if remote_nodes.is_empty() || !pub_key_path.exists() {
+        if !remote_nodes.is_empty() {
+            step("ssh", "No public key to distribute — skipping key push");
+        }
+    } else {
+        step("ssh", &format!("Distributing key to {} nodes", remote_nodes.len()));
+        if !dry_run {
+            let pub_key = std::fs::read_to_string(&pub_key_path).unwrap_or_default();
+            for node in &remote_nodes {
+                // Check if key is already in authorized_keys via SSH
+                let check = Command::new("ssh")
+                    .args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes", node,
+                           &format!("grep -qF '{}' ~/.ssh/authorized_keys 2>/dev/null && echo exists || echo missing",
+                                    pub_key.trim())])
+                    .output();
+
+                let needs_push = check.as_ref()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "missing")
+                    .unwrap_or(true);
+
+                if needs_push {
+                    // Try ssh-copy-id first (handles authorized_keys creation + permissions)
+                    let copy = Command::new("ssh-copy-id")
+                        .args(["-i", pub_key_path.to_str().unwrap_or(""),
+                               &format!("ma@{}", node)])
+                        .output();
+                    if copy.map_or(false, |o| o.status.success()) {
+                        println!("  {} — key installed", node);
+                    } else {
+                        println!("  {} — ssh-copy-id failed (may need manual setup)", node);
+                    }
+                } else {
+                    println!("  {} — key already present", node);
+                }
+            }
+        }
+    }
+
+    // ── Step 4: Scoped passwordless sudo ────────────────────────────────
+    let sudoers_path = "/etc/sudoers.d/r1o-asmi";
+    let sudoers_exists = std::path::Path::new(sudoers_path).exists();
+    if sudoers_exists {
+        step("sudo", "Scoped sudoers already configured");
+    } else {
+        let user = std::env::var("USER").unwrap_or_else(|_| "ma".to_string());
+        step("sudo", &format!("Installing scoped NOPASSWD rules for {}", user));
+        if !dry_run {
+            // Write to temp file, validate with visudo, then install
+            let rules = format!(
+                "# r1o/asmi — scoped passwordless sudo for cluster operations\n\
+                 {} ALL=(ALL) NOPASSWD: /usr/libexec/PlistBuddy\n\
+                 {} ALL=(ALL) NOPASSWD: /usr/sbin/networksetup\n\
+                 {} ALL=(ALL) NOPASSWD: /usr/bin/killall configd\n\
+                 {} ALL=(ALL) NOPASSWD: /usr/sbin/ipconfig\n\
+                 {} ALL=(ALL) NOPASSWD: /usr/bin/powermetrics\n\
+                 {} ALL=(ALL) NOPASSWD: /usr/sbin/systemsetup\n",
+                user, user, user, user, user, user
+            );
+            let tmp = "/tmp/.r1o-sudoers-staging";
+            if std::fs::write(tmp, &rules).is_ok() {
+                // Validate syntax
+                let valid = Command::new("sudo")
+                    .args(["visudo", "-cf", tmp])
+                    .output()
+                    .map_or(false, |o| o.status.success());
+
+                if valid {
+                    let install = Command::new("sudo")
+                        .args(["cp", tmp, sudoers_path])
+                        .output()
+                        .map_or(false, |o| o.status.success());
+                    let chmod = Command::new("sudo")
+                        .args(["chmod", "440", sudoers_path])
+                        .output()
+                        .map_or(false, |o| o.status.success());
+
+                    if install && chmod {
+                        println!("  Installed {} (6 scoped rules)", sudoers_path);
+                    } else {
+                        eprintln!("  ⚠ Failed to install sudoers file");
+                    }
+                } else {
+                    eprintln!("  ⚠ Sudoers syntax validation failed — skipping");
+                }
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
+    }
+
+    // ── Step 5: Install binary ───────────────────────────────────────
     let cargo_bin = home.join(".cargo/bin/asmi");
     let current_exe = std::env::current_exe().unwrap_or_default();
     if current_exe == cargo_bin {
@@ -194,9 +311,13 @@ pub async fn run_setup(port: u16, cluster: bool, skip_bridge0: bool, dry_run: bo
         println!("Setup complete. asmi is running on port {}.", port);
         if !bridge0_members.is_empty() && !skip_bridge0 {
             println!("  Thunderbolt Bridge removed — RDMA interfaces freed.");
-            println!("  Note: RDMA itself must be enabled from Recovery OS:");
-            println!("    Hold Power → Options → Terminal → rdma_ctl enable → reboot");
         }
+        println!();
+        println!("Remaining manual step (one-time, requires physical access):");
+        println!("  Hold Power → Options → Terminal → rdma_ctl enable → reboot");
+        println!();
+        println!("After RDMA is enabled, distributed inference works immediately:");
+        println!("  mlx.launch --hostfile /path/to/hostfile.json your_script.py");
     }
 
     Ok(())
