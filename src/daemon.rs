@@ -1241,7 +1241,25 @@ async fn autoresearch_gate_handler(
         (snap.ram_total_bytes.saturating_sub(snap.ram_app_bytes)) as f64 / 1_073_741_824.0;
 
     let power_state = snap.power_source.clone();
-    let on_ac = matches!(power_state.as_deref(), Some("AC"));
+    // Desktop-class Macs (Mac Studio, Mac Pro, Mac mini) don't expose battery
+    // state via IOReport, so `power_source` stays None. Treat those hosts as
+    // always-AC — a desktop Mac physically cannot run on battery. Laptops
+    // (MacBook Pro/Air) always get a real reading.
+    let is_desktop_chassis = match snap.model_name.as_deref() {
+        Some(m) => {
+            let lower = m.to_ascii_lowercase();
+            lower.contains("mac studio")
+                || lower.contains("mac pro")
+                || lower.contains("mac mini")
+                || lower.contains("imac")
+        }
+        None => false,
+    };
+    let on_ac = match power_state.as_deref() {
+        Some("AC") => true,
+        Some(_) => false,
+        None => is_desktop_chassis,
+    };
 
     // Ghost procs: MLX-framework processes whose PID is NOT tracked by any
     // ServeManager.  These leak GPU memory and invalidate benchmarks.
@@ -1321,6 +1339,37 @@ async fn autoresearch_reset_handler(
         errors.push(format!("pkill mlx.launch: {e}"));
     }
 
+    // 3b. Wait up to 30 s for those pkilled procs to actually vanish before
+    // flushing caches. pkill returns immediately; the OS takes time to reap.
+    // If we proceed too early, the next benchmark inherits a node with MLX
+    // still holding Metal buffers and we get phantom OOMs on the next iter.
+    let proc_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut procs_alive_at_deadline = 0u32;
+    loop {
+        let snap = state.snapshot.read().await;
+        let alive = snap
+            .as_ref()
+            .map(|s| {
+                s.processes
+                    .iter()
+                    .filter(|p| is_model_server_framework(p.framework))
+                    .count() as u32
+            })
+            .unwrap_or(0);
+        drop(snap);
+        if alive == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= proc_deadline {
+            procs_alive_at_deadline = alive;
+            errors.push(format!(
+                "mlx proc reap timeout: {alive} still alive after 30 s"
+            ));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
     // 4. Flush file cache.
     if let Err(e) = Command::new("purge").output().await {
         errors.push(format!("purge: {e}"));
@@ -1354,6 +1403,7 @@ async fn autoresearch_reset_handler(
         "reset": true,
         "hostname": state.hostname,
         "stopped_ports": stopped_ports,
+        "mlx_procs_alive": procs_alive_at_deadline,
         "duration_ms": duration_ms,
         "errors": errors,
         "ts": chrono::Utc::now().timestamp(),
