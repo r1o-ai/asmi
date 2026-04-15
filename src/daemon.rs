@@ -1211,6 +1211,155 @@ async fn serve_stop_handler(
     Ok(Json(serde_json::json!({"ok": true, "port": port})))
 }
 
+// ---------------------------------------------------------------------------
+// Autoresearch benchmark endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /autoresearch/gate → benchmark-readiness check.
+///
+/// Returns a JSON object with thermal, memory, power, ghost-process, and RDMA
+/// status. The `ready` field is true only when ALL conditions are met:
+/// non-throttled thermals, >20 GB available RAM, AC power, zero ghost MLX
+/// procs, and no snapshot errors.
+async fn autoresearch_gate_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let snap = state.snapshot.read().await;
+    let snap = snap.as_ref().ok_or_else(|| {
+        ApiError::NotFound(format!("no snapshot yet (hostname: {})", state.hostname))
+    })?;
+
+    let cpu_temp_c = snap.cpu_temp_c;
+    let gpu_temp_c = snap.gpu_temp_c;
+
+    // macOS throttles around 95 C. NodeSnapshot doesn't carry a direct throttle
+    // flag yet, so we infer from temperature.
+    let cpu_throttled = cpu_temp_c.map(|t| t >= 95.0).unwrap_or(false);
+    let gpu_throttled = gpu_temp_c.map(|t| t >= 95.0).unwrap_or(false);
+
+    let mem_available_gb =
+        (snap.ram_total_bytes.saturating_sub(snap.ram_app_bytes)) as f64 / 1_073_741_824.0;
+
+    let power_state = snap.power_source.clone();
+    let on_ac = matches!(power_state.as_deref(), Some("AC"));
+
+    // Ghost procs: MLX-framework processes whose PID is NOT tracked by any
+    // ServeManager.  These leak GPU memory and invalidate benchmarks.
+    let managed_pids: std::collections::HashSet<u32> = {
+        let managers = state.serve_managers.read().await;
+        let mut pids = std::collections::HashSet::with_capacity(managers.len());
+        for mgr in managers.values() {
+            if let Some(pid) = mgr.status().await.pid {
+                pids.insert(pid);
+            }
+        }
+        pids
+    };
+    let ghost_procs = snap
+        .processes
+        .iter()
+        .filter(|p| is_model_server_framework(p.framework) && !managed_pids.contains(&p.pid))
+        .count() as u32;
+
+    let rdma_peers_up = snap
+        .rdma
+        .as_ref()
+        .map(|r| r.active_count() as u32)
+        .unwrap_or(0);
+
+    let ready =
+        !cpu_throttled && !gpu_throttled && mem_available_gb > 20.0 && on_ac && ghost_procs == 0;
+
+    Ok(Json(serde_json::json!({
+        "hostname": state.hostname,
+        "ready": ready,
+        "cpu_temp_c": cpu_temp_c,
+        "gpu_temp_c": gpu_temp_c,
+        "cpu_throttled": cpu_throttled,
+        "gpu_throttled": gpu_throttled,
+        "mem_available_gb": mem_available_gb,
+        "power_state": power_state,
+        "on_ac": on_ac,
+        "ghost_procs": ghost_procs,
+        "rdma_peers_up": rdma_peers_up,
+        "ts": chrono::Utc::now().timestamp(),
+    })))
+}
+
+/// POST /autoresearch/reset → cold-start every benchmark-relevant resource.
+///
+/// Stops all serve managers, kills ghost MLX procs, flushes the file cache,
+/// and waits up to 60 s for thermal recovery (< 70 C).
+async fn autoresearch_reset_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use tokio::process::Command;
+
+    let start = std::time::Instant::now();
+    let mut errors: Vec<String> = Vec::new();
+
+    // 1. Stop all managed serve sessions.
+    let mgr_ports: Vec<u16> = state.serve_managers.read().await.keys().copied().collect();
+    let mut stopped_ports: Vec<u16> = Vec::new();
+    for &port in &mgr_ports {
+        let managers = state.serve_managers.read().await;
+        if let Some(mgr) = managers.get(&port) {
+            mgr.stop().await;
+            stopped_ports.push(port);
+        }
+    }
+
+    // 2. Stop peer heartbeat and share manager.
+    state.peer_heartbeat.stop().await;
+    state.share_manager.emergency_stop().await;
+
+    // 3. Kill any ghost MLX processes.
+    if let Err(e) = Command::new("pkill").arg("-f").arg("mlx_lm").output().await {
+        errors.push(format!("pkill mlx_lm: {e}"));
+    }
+    if let Err(e) = Command::new("pkill").arg("-f").arg("mlx.launch").output().await {
+        errors.push(format!("pkill mlx.launch: {e}"));
+    }
+
+    // 4. Flush file cache.
+    if let Err(e) = Command::new("purge").output().await {
+        errors.push(format!("purge: {e}"));
+    }
+
+    // 5. Wait for thermal recovery (both < 70 C), bounded to 60 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let snap = state.snapshot.read().await;
+        if let Some(snap) = snap.as_ref() {
+            let cpu_ok = snap.cpu_temp_c.map(|t| t < 70.0).unwrap_or(true);
+            let gpu_ok = snap.gpu_temp_c.map(|t| t < 70.0).unwrap_or(true);
+            if cpu_ok && gpu_ok {
+                break;
+            }
+        } else {
+            // No snapshot available — nothing to wait on.
+            break;
+        }
+        drop(snap);
+        if std::time::Instant::now() >= deadline {
+            errors.push("thermal recovery timeout (60 s)".into());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    Ok(Json(serde_json::json!({
+        "reset": true,
+        "hostname": state.hostname,
+        "stopped_ports": stopped_ports,
+        "duration_ms": duration_ms,
+        "errors": errors,
+        "ts": chrono::Utc::now().timestamp(),
+    })))
+}
+
 /// POST /serve/reload → reload the current model on a port.
 async fn serve_reload_handler(
     State(state): State<AppState>,
@@ -1305,9 +1454,9 @@ async fn serve_distributed_join_handler(
     tokio::fs::write(&ibv_tmp, &req.ibv_devices).await
         .map_err(|e| ApiError::Internal(format!("write ibv devices: {e}")))?;
 
-    // Build command: python3 -m mlx_lm.server --model <path> --port <port> --host 0.0.0.0
+    // Build command: python3 -m mlx_lm server --model <path> --port <port> --host 0.0.0.0
     let mut cmd = Command::new(&py);
-    cmd.arg("-m").arg("mlx_lm.server")
+    cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(&model_path)
         .arg("--port").arg(req.port.to_string())
         .arg("--host").arg("0.0.0.0");
@@ -2273,6 +2422,15 @@ async fn bridge0_restore_handler(
     })).into_response()
 }
 
+/// POST /rdma/setup → run full RDMA autosetup (bridge0, IPs, routes, peers, hostfile).
+async fn rdma_setup_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let report = crate::rdma_autosetup::autosetup(&state.node_map).await;
+    Ok(Json(
+        serde_json::to_value(&report)
+            .map_err(|e| ApiError::Internal(format!("serialize: {e}")))?,
+    ))
+}
+
 /// GET /rdma/mesh → query all cluster nodes, aggregate mesh health.
 ///
 /// Reads node list from NodeMap (seeded from ~/.r1o/cluster.json).
@@ -2689,6 +2847,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/egpu", get(egpu_handler))
         .route("/rdma/check", get(rdma_check_handler))
         .route("/rdma/mesh", get(rdma_mesh_handler))
+        .route("/rdma/setup", post(rdma_setup_handler))
         .route("/bridge0/destroy", post(bridge0_destroy_handler))
         .route("/bridge0/restore", post(bridge0_restore_handler))
         .route("/prep", post(prep_handler))
@@ -2696,5 +2855,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ane/compute", get(crate::ane::status_handler))
         .route("/ane/eval", post(crate::ane::eval_handler))
         .route("/ane/probe", get(crate::ane::probe_handler))
+        // Autoresearch benchmark validation
+        .route("/autoresearch/gate", get(autoresearch_gate_handler))
+        .route("/autoresearch/reset", post(autoresearch_reset_handler))
         .with_state(state)
 }
