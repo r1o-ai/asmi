@@ -93,10 +93,10 @@ pub fn resolve_python() -> &'static str {
 
 pub use aggregator::ClusterState;
 pub use collector::{
-    collect_node_metrics, diff_netstat_samples, local_hardware_identity, parse_cpu_clusters,
-    parse_footprint, parse_iostat, parse_netstat_ib, parse_powermetrics_text, parse_process_tree,
-    parse_ps_mlx, parse_vmstat_and_memsize, NetstatSample, PowerMetricsResult, CMD_NETSTAT_IB,
-    CMD_PS_TREE,
+    collect_node_metrics, diff_netstat_samples, local_hardware_identity, native_memory_stats,
+    parse_cpu_clusters, parse_footprint, parse_iostat, parse_netstat_ib, parse_powermetrics_text,
+    parse_process_tree, parse_ps_mlx, parse_vmstat_and_memsize, NetstatSample, PowerMetricsResult,
+    CMD_NETSTAT_IB, CMD_PS_TREE,
 };
 pub use config::{ClusterConfig, DiscoveryMethod, NodeMap};
 pub use monitor::ClusterMonitor;

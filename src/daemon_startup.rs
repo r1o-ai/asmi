@@ -3,7 +3,7 @@ use asmi_core::ClusterConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{ane::AneState, bin_name, daemon, serve, watchdog};
+use crate::{ane::AneState, bin_name, daemon, rdma_autosetup, serve, watchdog};
 
 /// Run asmi as an HTTP daemon serving local node metrics.
 pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_dir: Vec<String>, _experimental_ane: bool, experimental_egpu: bool) -> Result<()> {
@@ -85,14 +85,45 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
         tracing::warn!("IOReport unavailable — ANE power from powermetrics only");
     }
 
+    // Optional cluster hub — create BEFORE the local poll loop so we can
+    // inject hub's own snapshot into cluster_state on every tick.
+    let cluster_state: Option<Arc<tokio::sync::RwLock<asmi_core::ClusterState>>> = if cluster_hub {
+        let node_map = asmi_core::NodeMap::load();
+        if node_map.nodes.is_empty() {
+            tracing::warn!("--cluster requested but NodeMap is empty; run `asmi` first to discover nodes");
+            None
+        } else {
+            let remote_nodes: Vec<String> = node_map.nodes.iter()
+                .filter(|n| n.as_str() != hostname.as_str())
+                .cloned()
+                .collect();
+            tracing::info!(
+                all_nodes = ?node_map.nodes,
+                remote_nodes = ?remote_nodes,
+                "cluster hub: polling {} remote nodes (excluded self: {})",
+                remote_nodes.len(), hostname
+            );
+            let cfg = ClusterConfig::default()
+                .with_seeds(remote_nodes)
+                .with_poll_interval(Duration::from_secs(interval));
+            let mut monitor = asmi_core::ClusterMonitor::new(cfg, node_map);
+            let state = monitor.state();
+            monitor.start();
+            std::mem::forget(monitor);
+            Some(state)
+        }
+    } else {
+        None
+    };
+
     // Background polling loop — collect local metrics every N seconds
     {
         let snapshot = Arc::clone(&snapshot);
+        let cluster_state_ref = cluster_state.clone();
         let config = config.clone();
         let hostname = hostname.clone();
         let metrics_tx = metrics_tx.clone();
         let serve_managers = Arc::clone(&serve_managers);
-        // Wrap in Mutex so we can mutate inside the async move block
         let energy_sub = std::sync::Mutex::new(energy_sub);
         tokio::spawn(async move {
             loop {
@@ -104,11 +135,9 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
                 if let Ok(mut sub_guard) = energy_sub.lock() {
                     if let Some(ref mut sub) = *sub_guard {
                         let sample = sub.sample();
-                        // IOReport ANE is authoritative — powermetrics needs sudo for ANE
                         if snap.ane_watts == 0.0 && sample.ane_mw > 0.0 {
                             snap.ane_watts = sample.ane_mw;
                         }
-                        // Also backfill CPU/GPU if powermetrics failed (rare)
                         if snap.cpu_watts == 0.0 && sample.cpu_mw > 0.0 {
                             snap.cpu_watts = sample.cpu_mw;
                         }
@@ -120,8 +149,6 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
                 }
 
                 // Enrich processes with model names from serve managers.
-                // ps aux parsing misses models for engines that don't use --model
-                // (e.g. mlx_vlm loads via uvicorn, no --model flag on the CLI).
                 for proc in &mut snap.processes {
                     if proc.model.is_none() {
                         if let Some(port) = proc.port {
@@ -154,41 +181,17 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
                 if let Ok(json) = serde_json::to_string(&snap) {
                     let _ = metrics_tx.send(json);
                 }
+
+                // Inject hub's snapshot into cluster_state so /cluster includes it
+                if let Some(ref cs) = cluster_state_ref {
+                    cs.write().await.update_node(snap.clone());
+                }
+
                 *snapshot.write().await = Some(snap);
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
         });
     }
-
-    // Optional cluster hub
-    let cluster_state: Option<Arc<tokio::sync::RwLock<asmi_core::ClusterState>>> = if cluster_hub {
-        let node_map = asmi_core::NodeMap::load();
-        if node_map.nodes.is_empty() {
-            tracing::warn!("--cluster requested but NodeMap is empty; run `asmi` first to discover nodes");
-            None
-        } else {
-            let remote_nodes: Vec<String> = node_map.nodes.iter()
-                .filter(|n| n.as_str() != hostname.as_str())
-                .cloned()
-                .collect();
-            tracing::info!(
-                all_nodes = ?node_map.nodes,
-                remote_nodes = ?remote_nodes,
-                "cluster hub: polling {} remote nodes (excluded self: {})",
-                remote_nodes.len(), hostname
-            );
-            let cfg = ClusterConfig::default()
-                .with_seeds(remote_nodes)
-                .with_poll_interval(Duration::from_secs(interval));
-            let mut monitor = asmi_core::ClusterMonitor::new(cfg, node_map);
-            let state = monitor.state();
-            monitor.start();
-            std::mem::forget(monitor);
-            Some(state)
-        }
-    } else {
-        None
-    };
 
     // Probe runtime versions once at startup
     let runtime = Arc::new(daemon::probe_runtime().await);
@@ -321,10 +324,23 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     wd.start().await;
     tracing::info!("process watchdog started (5s interval)");
 
+    let node_map = Arc::new(tokio::sync::RwLock::new(asmi_core::NodeMap::load()));
+
+    // RDMA auto-setup: bridge0 destroy, IP assignment, route fix, peer verify, hostfile
+    {
+        let report = rdma_autosetup::autosetup(&node_map).await;
+        let peers = report.peers.verified_links.len();
+        if peers > 0 {
+            eprintln!("  RDMA: {peers} peers verified, hostfile: {}", report.hostfile.as_deref().unwrap_or("none"));
+        } else {
+            eprintln!("  RDMA: no peers found (check cables + config)");
+        }
+    }
+
     let app_state = daemon::AppState {
         snapshot,
         cluster_state,
-        node_map: Arc::new(tokio::sync::RwLock::new(asmi_core::NodeMap::load())),
+        node_map,
         hostname: hostname.clone(),
         started_at,
         metrics_tx: metrics_tx.clone(),

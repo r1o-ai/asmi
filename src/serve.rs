@@ -1066,7 +1066,7 @@ async fn do_share_load_inner(
         "0.0.0.0".to_string(),
     ];
     let final_program = py;
-    let mut final_args = vec!["-m".to_string(), "mlx_lm.server".to_string()];
+    let mut final_args = vec!["-m".to_string(), "mlx_lm".to_string(), "server".to_string()];
     final_args.extend(model_args);
 
     // Truncate log for fresh output
@@ -1298,7 +1298,7 @@ async fn do_jaccl_orchestrate(
     let log_stderr = log_file.try_clone()?;
 
     let mut cmd = Command::new(&py);
-    cmd.arg("-m").arg("mlx_lm.server")
+    cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(model_path)
         .arg("--port").arg(SHARE_PORT.to_string())
         .arg("--host").arg("0.0.0.0")

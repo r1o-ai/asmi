@@ -15,6 +15,120 @@ use regex::Regex;
 use std::sync::{LazyLock, OnceLock};
 use tracing::{debug, info, warn};
 
+// Mach host_statistics64 bindings for native memory collection.
+// Eliminates subprocess dependency for local RAM metrics.
+#[allow(non_camel_case_types)]
+mod mach_memory {
+    use libc::{c_int, c_uint};
+
+    type mach_port_t = c_uint;
+    type host_flavor_t = c_int;
+    type kern_return_t = c_int;
+    type natural_t = c_uint;
+    type mach_msg_type_number_t = natural_t;
+    type integer_t = c_int;
+
+    const HOST_VM_INFO64: host_flavor_t = 4;
+    const HOST_VM_INFO64_COUNT: mach_msg_type_number_t = 38;
+    const KERN_SUCCESS: kern_return_t = 0;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct vm_statistics64 {
+        free_count: natural_t,
+        active_count: natural_t,
+        inactive_count: natural_t,
+        wire_count: natural_t,
+        zero_fill_count: u64,
+        reactivations: u64,
+        pageins: u64,
+        pageouts: u64,
+        faults: u64,
+        cow_faults: u64,
+        lookups: u64,
+        hits: u64,
+        purges: u64,
+        purgeable_count: natural_t,
+        speculative_count: natural_t,
+        decompressions: u64,
+        compressions: u64,
+        swapins: u64,
+        swapouts: u64,
+        compressor_page_count: natural_t,
+        throttled_count: natural_t,
+        external_page_count: natural_t,  // file-backed
+        internal_page_count: natural_t,  // anonymous
+        total_uncompressed_pages_in_compressor: u64,
+    }
+
+    unsafe extern "C" {
+        fn mach_host_self() -> mach_port_t;
+        fn host_statistics64(
+            host_priv: mach_port_t,
+            flavor: host_flavor_t,
+            host_info_out: *mut integer_t,
+            host_info_count: *mut mach_msg_type_number_t,
+        ) -> kern_return_t;
+        static vm_page_size: usize;
+    }
+
+    pub fn query() -> Option<super::MemoryStats> {
+        unsafe {
+            // Total RAM via sysctl
+            let mut memsize: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+            if libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                &mut memsize as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            ) != 0 || memsize == 0
+            {
+                return None;
+            }
+
+            // VM breakdown via Mach host_statistics64
+            let mut stats = vm_statistics64::default();
+            let mut count = HOST_VM_INFO64_COUNT;
+            let kr = host_statistics64(
+                mach_host_self(),
+                HOST_VM_INFO64,
+                &mut stats as *mut vm_statistics64 as *mut integer_t,
+                &mut count,
+            );
+            if kr != KERN_SUCCESS {
+                return None;
+            }
+
+            let ps = vm_page_size as u64;
+            let anonymous = stats.internal_page_count as u64;
+            let file_backed = stats.external_page_count as u64;
+            let wired = stats.wire_count as u64;
+            let compressor = stats.compressor_page_count as u64;
+            let speculative = stats.speculative_count as u64;
+
+            let app_bytes = (anonymous + wired + compressor) * ps;
+            let cached_bytes = (file_backed + speculative) * ps;
+
+            Some(super::MemoryStats {
+                total_bytes: memsize,
+                used_bytes: app_bytes + cached_bytes,
+                app_bytes,
+                cached_bytes,
+            })
+        }
+    }
+}
+
+/// Native memory stats via Mach APIs — no subprocess needed.
+/// Returns None if the Mach calls fail (should never happen on macOS).
+pub fn native_memory_stats() -> Option<MemoryStats> {
+    mach_memory::query()
+}
+
 // ---------------------------------------------------------------------------
 // Static regexes (compiled once, reused across all poll ticks)
 // ---------------------------------------------------------------------------
@@ -306,7 +420,7 @@ async fn collect_via_ssh(
 
     // 2. Parse hostname -s + vm_stat + sysctl
     // The combined command outputs: hostname\n---HOSTNAME---\nvm_stat...\n---MEMSIZE---\nmemsize
-    let (resolved_hostname, mem_stats) = match &mem_res {
+    let (resolved_hostname, mut mem_stats) = match &mem_res {
         Ok(r) if r.has_output() => {
             debug!(hostname, "vm_stat/sysctl OK");
             let (resolved, vmstat_text) = match r.stdout.split_once("---HOSTNAME---\n") {
@@ -316,7 +430,7 @@ async fn collect_via_ssh(
             (resolved, parse_vmstat_and_memsize(&vmstat_text))
         }
         Ok(r) => {
-            debug!(hostname, stderr = r.stderr.as_str(), "vm_stat/sysctl empty/failed");
+            warn!(hostname, stderr = r.stderr.as_str(), "vm_stat/sysctl returned no output");
             (None, MemoryStats::default())
         }
         Err(e) => {
@@ -324,6 +438,23 @@ async fn collect_via_ssh(
             (None, MemoryStats::default())
         }
     };
+
+    // Native fallback: if shell-based memory collection returned 0 on a local
+    // node, use Mach host_statistics64 directly. This bypasses subprocess
+    // issues (launchd env, TCC, sandbox) that can silently break sh -c.
+    if is_local && mem_stats.total_bytes == 0 {
+        if let Some(native) = native_memory_stats() {
+            info!(
+                hostname,
+                total_gb = native.total_bytes / (1024 * 1024 * 1024),
+                app_gb = native.app_bytes / (1024 * 1024 * 1024),
+                "vm_stat shell failed, using native Mach memory stats"
+            );
+            mem_stats = native;
+        } else {
+            warn!(hostname, "both shell and native memory collection failed");
+        }
+    }
 
     // Use SSH-resolved hostname as canonical name to prevent duplicates
     // when the same node is discovered via different networks (LAN vs TB).
@@ -1825,5 +1956,14 @@ mod tests {
         // online=false because both HTTP and SSH failed
         assert!(!snap.online, "unreachable remote should be marked offline");
         assert_eq!(snap.ram_total_bytes, 0, "unreachable host should have 0 RAM");
+    }
+
+    #[test]
+    fn test_native_memory_stats() {
+        let stats = super::native_memory_stats().expect("Mach memory query should work on macOS");
+        assert!(stats.total_bytes > 0, "total RAM should be > 0");
+        assert!(stats.app_bytes > 0, "app memory should be > 0");
+        let total_gib = stats.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!(total_gib >= 8.0 && total_gib <= 2048.0, "total RAM {total_gib:.1} GiB out of range");
     }
 }
