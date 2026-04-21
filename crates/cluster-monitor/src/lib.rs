@@ -108,11 +108,11 @@ pub use ssh::{SshResult, local_run, ssh_run};
 pub use types::{
     ClusterAggregates, ClusterEvent, ClusterType, CoreInfo, CpuClusterInfo, DiskDeviceIo,
     DiskIoStats, DistributedBackend, EngineConfig, EventSink, GpuLockSeverity, GpuLockStatus,
-    InterfaceStats, LoadRequest, MetricsHistory, MlxServerInfo, ModelServerMetadata, MonitorError,
-    NetworkStats, NodeSnapshot, PeerHeartbeatStatus, PeerStatus, PortState, ProcessFramework,
-    ProcessInfo, ProcessTreeNode, RdmaDevice, RdmaLink, RdmaStatus, ScanResult, ServeBackend,
-    ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus, TaskEnergy, UnmanagedProcess,
-    WatchdogReport, WatchdogVerdict, WatchedProcess,
+    InterfaceStats, LaunchdInfo, LaunchdState, LoadRequest, MetricsHistory, MlxServerInfo,
+    ModelServerMetadata, MonitorError, NetworkStats, NodeSnapshot, PeerHeartbeatStatus, PeerStatus,
+    PortState, ProcessFramework, ProcessInfo, ProcessTreeNode, RdmaDevice, RdmaLink, RdmaStatus,
+    ScanResult, ServeBackend, ServeEngine, ServeState, ServeStatus, ShareRequest, ShareStatus,
+    TaskEnergy, UnmanagedProcess, WatchdogReport, WatchdogVerdict, WatchedProcess,
 };
 pub use models::{LocalModel, ModelConfig, DiscoveredVolume, default_model_dirs, discover_volumes, external_model_dirs, human_size, parse_model_name, scan_models};
 pub use health::{

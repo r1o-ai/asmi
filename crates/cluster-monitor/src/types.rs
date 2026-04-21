@@ -845,6 +845,34 @@ impl ServeEngine {
     }
 }
 
+/// State of a launchd-managed agent, as reported by asmi's `launchd` module.
+///
+/// These correspond to `launchctl print` / `launchctl print-disabled` output:
+/// - `Running` — top-level `state = running`
+/// - `Waiting` — registered but not currently running (e.g. event-gated)
+/// - `Disabled` — user or asmi has run `launchctl disable`; process is booted out
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchdState {
+    Running,
+    Waiting,
+    Disabled,
+}
+
+/// Information about a launchd agent that manages (or managed) a PID on disk.
+///
+/// Populated for any model-serving process that is backed by a `com.*.plist`
+/// in `~/Library/LaunchAgents`. The web UI and TUI render this to show a
+/// "KeepAlive" badge and offer a one-click disable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchdInfo {
+    pub label: String,
+    pub keep_alive: Option<bool>,
+    pub run_at_load: Option<bool>,
+    pub state: LaunchdState,
+    pub program: Option<String>,
+}
+
 /// Read-only snapshot of the serve manager state, returned by status endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServeStatus {
@@ -857,6 +885,11 @@ pub struct ServeStatus {
     pub port_verified: bool,
     pub elapsed_ms: u64,
     pub error: Option<String>,
+    /// launchd agent backing this PID (if any). `None` when the process is not
+    /// launchd-managed or the agent couldn't be resolved. `#[serde(default)]`
+    /// keeps older clients compatible.
+    #[serde(default)]
+    pub launchd: Option<LaunchdInfo>,
 }
 
 /// A model process detected on the node that was NOT launched by asmi.
@@ -868,6 +901,8 @@ pub struct UnmanagedProcess {
     pub engine: String,
     pub models: Vec<String>,
     pub source: &'static str,
+    #[serde(default)]
+    pub launchd: Option<LaunchdInfo>,
 }
 
 /// Request body for POST /serve/load.
