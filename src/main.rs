@@ -2,6 +2,7 @@ mod ane;
 mod cli;
 mod daemon;
 mod daemon_startup;
+mod launchd;
 mod rdma_autosetup;
 mod serve;
 mod setup;
