@@ -341,11 +341,13 @@ struct ManagedProcess {
     pid: Option<u32>,
     load_started: Option<std::time::Instant>,
     error: Option<String>,
+    stopped_at: Option<std::time::Instant>,
 }
 
 /// Kill the existing child process (SIGTERM → 5s → SIGKILL).
 async fn kill_child(s: &mut ManagedProcess) {
     if let Some(ref mut child) = s.child {
+        // Managed child — SIGTERM then SIGKILL
         if let Some(pid) = s.pid {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
@@ -357,6 +359,22 @@ async fn kill_child(s: &mut ManagedProcess) {
             Err(_) => {
                 let _ = child.kill().await;
             }
+        }
+    } else if let Some(pid) = s.pid {
+        // Adopted external process — no child handle, kill by PID
+        tracing::info!(pid, "killing adopted process by PID");
+        let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM);
+        // Wait up to 5s for graceful exit, then SIGKILL
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if nix::sys::signal::kill(nix_pid, None).is_err() {
+                break; // process gone
+            }
+        }
+        if nix::sys::signal::kill(nix_pid, None).is_ok() {
+            tracing::warn!(pid, "SIGTERM didn't work, sending SIGKILL");
+            let _ = nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGKILL);
         }
     }
     s.child = None;
@@ -404,6 +422,7 @@ impl<R: ReadinessCheck> ProcessManager<R> {
         s.state = ServeState::Idle;
         s.model = None;
         s.error = None;
+        s.stopped_at = Some(std::time::Instant::now());
         persist_state(&s).await;
     }
 
@@ -446,6 +465,7 @@ impl ServeManager {
                 pid: None,
                 load_started: None,
                 error: None,
+                stopped_at: None,
             })),
             readiness: Arc::new(HttpHealth {
                 port,
@@ -602,12 +622,19 @@ impl ServeManager {
         if s.child.is_some() || s.state == ServeState::Loading {
             return;
         }
+        // Don't re-adopt if we intentionally stopped within the last 10s
+        if let Some(stopped) = s.stopped_at {
+            if stopped.elapsed() < std::time::Duration::from_secs(10) {
+                return;
+            }
+        }
         s.pid = Some(pid);
         s.engine = engine;
         s.model = model.clone();
         s.backend = ServeBackend::Single;
         s.state = if model.is_some() { ServeState::Ready } else { ServeState::Bare };
         s.load_started = Some(std::time::Instant::now());
+        s.stopped_at = None;
         tracing::info!(pid, model = model.as_deref().unwrap_or("none"), "adopted external process");
     }
 }
@@ -903,6 +930,7 @@ impl ShareManager {
                 pid: None,
                 load_started: None,
                 error: None,
+                stopped_at: None,
             })),
             readiness: Arc::new(LogMonitor {
                 log_path: SHARE_LOG_PATH.to_string(),

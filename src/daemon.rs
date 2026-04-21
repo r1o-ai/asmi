@@ -1087,9 +1087,11 @@ async fn adopt_unmanaged(
                 }
             }
 
-            // No manager for this port — create one dynamically and adopt
+            // No manager for this port — create an empty one and adopt the external process.
+            // Use new() not restore() — restore() spawns a bare server which would
+            // conflict with the already-running external process on this port.
             tracing::info!(port, pid = proc.pid, "auto-adopting server on new port");
-            let new_mgr = crate::serve::ServeManager::restore(port, engine).await;
+            let new_mgr = crate::serve::ServeManager::new(port, engine);
             new_mgr.adopt_external(proc.pid, model, engine).await;
             {
                 let mut managers = state.serve_managers.write().await;
