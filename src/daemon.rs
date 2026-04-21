@@ -1108,12 +1108,14 @@ async fn adopt_unmanaged(
         } else {
             Vec::new()
         };
+        let launchd = crate::launchd::describe_pid(proc.pid).await;
         orphans.push(asmi_core::UnmanagedProcess {
             pid: proc.pid,
             port: proc.port,
             engine: proc.framework.to_string(),
             models,
             source: "external",
+            launchd,
         });
     }
     orphans.sort_by_key(|u| u.pid);
@@ -1211,6 +1213,74 @@ async fn serve_stop_handler(
     drop(managers);
     state.peer_heartbeat.stop().await;
     Ok(Json(serde_json::json!({"ok": true, "port": port})))
+}
+
+// ---------------------------------------------------------------------------
+// launchd agent actions — disable/enable a managed plist by label.
+// Protected labels (com.asmi.*, com.r1o.watchdog) are rejected at the guard.
+// ---------------------------------------------------------------------------
+
+/// Request body for `/launchd/disable` and `/launchd/enable`.
+#[derive(Deserialize)]
+struct LaunchdAction {
+    label: String,
+}
+
+/// Map a `LaunchdError` to an axum `Response` with the right status code.
+fn launchd_err_response(e: crate::launchd::LaunchdError) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match e {
+        crate::launchd::LaunchdError::Protected(label) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": format!("protected label: {label}")})),
+        )
+            .into_response(),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": other.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /launchd/disable — `launchctl disable` + `bootout` for the given label.
+///
+/// Body: `{"label": "com.foo.bar"}`
+/// - 200 `{"ok": true}` on success
+/// - 403 `{"error": "protected label: …"}` for asmi / watchdog
+/// - 500 `{"error": "…"}` for any other launchctl failure
+async fn launchd_disable_handler(
+    State(_state): State<AppState>,
+    Json(body): Json<LaunchdAction>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::launchd::disable(&body.label).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"ok": true})),
+        )
+            .into_response(),
+        Err(e) => launchd_err_response(e),
+    }
+}
+
+/// POST /launchd/enable — `launchctl enable` + bootstrap the plist.
+///
+/// Mirror of `launchd_disable_handler`; same response contract.
+async fn launchd_enable_handler(
+    State(_state): State<AppState>,
+    Json(body): Json<LaunchdAction>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match crate::launchd::enable(&body.label).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"ok": true})),
+        )
+            .into_response(),
+        Err(e) => launchd_err_response(e),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2883,6 +2953,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
         .route("/serve/reload", post(serve_reload_handler))
+        .route("/launchd/disable", post(launchd_disable_handler))
+        .route("/launchd/enable", post(launchd_enable_handler))
         .route("/serve/share", post(serve_share_handler))
         .route("/serve/share/status", get(serve_share_status_handler))
         .route("/serve/share/stop", post(serve_share_stop_handler))

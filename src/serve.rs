@@ -601,16 +601,29 @@ impl ServeManager {
         } else {
             false
         };
+        let pid = s.pid;
+        let state = s.state;
+        let model = s.model.clone();
+        let engine = s.engine;
+        let backend = s.backend;
+        let error = s.error.clone();
+        // Release the read lock before the (potentially slow) launchctl probe.
+        drop(s);
+        let launchd = match pid {
+            Some(p) => crate::launchd::describe_pid(p).await,
+            None => None,
+        };
         ServeStatus {
-            state: s.state,
-            model: s.model.clone(),
-            engine: s.engine,
-            backend: s.backend,
+            state,
+            model,
+            engine,
+            backend,
             port,
-            pid: s.pid,
+            pid,
             port_verified,
             elapsed_ms: elapsed,
-            error: s.error.clone(),
+            error,
+            launchd,
         }
     }
 
