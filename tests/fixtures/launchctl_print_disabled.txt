@@ -1,0 +1,29 @@
+gui/501/com.test.fixture1 = {
+	active count = 0
+	path = /Users/ma/Library/LaunchAgents/com.test.fixture1.plist
+	type = LaunchAgent
+	state = not running
+	disabled on keys = ["com.test.fixture1"]
+
+	program = /usr/bin/yes
+	arguments = {
+		/usr/bin/yes
+	}
+
+	stdout path = /tmp/yesfix.log
+	stderr path = /tmp/yesfix.log
+
+	domain = gui/501 [100023]
+	asid = 100023
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 0
+	last exit reason = 0
+
+	spawn type = interactive (4)
+	jetsam priority = 40
+	cpumon = default
+	job state = not running
+
+	properties = keepalive | inferred program
+}
