@@ -24,7 +24,7 @@ cargo install --path .
 
 ```bash
 # Download the latest release for your architecture
-curl -L https://github.com/<OWNER>/apple-smi/releases/latest/download/asmi-arm64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/r1o-ai/asmi/releases/latest/download/asmi-arm64-apple-darwin.tar.gz | tar xz
 # Re-sign after download (macOS requirement for binaries from other machines)
 codesign -f -s - asmi
 # Move to a directory in your PATH
