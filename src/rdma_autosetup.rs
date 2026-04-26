@@ -940,3 +940,72 @@ async fn write_hostfile(peers: &PeerResult, local_ips: &[InterfaceIp]) -> Result
     tracing::info!("wrote JACCL hostfile: {} ({} hosts)", path.display(), hosts.len());
     Ok(path.display().to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    /// Live-cluster invariant: across all rdma-capable nodes, no two interfaces
+    /// should have been assigned the same link-local IP by /rdma/setup.
+    /// This is the bug filed at https://github.com/r1o-ai/asmi/issues/1 — the
+    /// deterministic 169.254.{iface_index}.1 fallback produces collisions when
+    /// two nodes have an interface at the same index (extremely common with TB5
+    /// since en4 + en5 are the standard TB5 ports on M3 Ultra).
+    #[tokio::test]
+    async fn no_ip_collisions_across_cluster() {
+        if std::env::var("ASMI_LIVE_CLUSTER_TEST").is_err() {
+            eprintln!(
+                "skipping no_ip_collisions_across_cluster — set ASMI_LIVE_CLUSTER_TEST=1 to run"
+            );
+            return;
+        }
+
+        let nodes = ["hub", "m3u1", "m3u3"];
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("reqwest client");
+
+        let mut all_ips: Vec<(String, String)> = Vec::new();
+        for node in nodes {
+            let url = if node == "hub" {
+                "http://localhost:9090/rdma/setup".to_string()
+            } else {
+                format!("http://{node}:9090/rdma/setup")
+            };
+            let resp: serde_json::Value = client
+                .post(&url)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("POST {url} failed: {e}"))
+                .json()
+                .await
+                .unwrap_or_else(|e| panic!("parse {url} body: {e}"));
+
+            for ip_entry in resp["ips"].as_array().expect("ips array") {
+                let ip = ip_entry["ip"].as_str().expect("ip string").to_string();
+                all_ips.push((node.to_string(), ip));
+            }
+        }
+
+        // Group by IP, fail if any IP appears with multiple distinct nodes.
+        let mut by_ip: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (node, ip) in &all_ips {
+            by_ip.entry(ip.clone()).or_default().push(node.clone());
+        }
+
+        let collisions: Vec<_> = by_ip
+            .iter()
+            .filter(|(_, nodes)| {
+                let unique: std::collections::HashSet<_> = nodes.iter().collect();
+                unique.len() > 1
+            })
+            .collect();
+
+        assert!(
+            collisions.is_empty(),
+            "IP collisions detected across cluster (asmi#1): {:#?}\n\nFull IP list: {:#?}",
+            collisions,
+            all_ips
+        );
+    }
+}
