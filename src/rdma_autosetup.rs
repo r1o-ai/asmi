@@ -447,29 +447,185 @@ async fn ensure_tb5_ips() -> Result<Vec<InterfaceIp>> {
             continue;
         }
 
-        // Fallback: assign deterministic IP based on interface index
-        let octet = iface.index;
-        let ip = format!("169.254.{octet}.1");
-        let name5 = iface.name.clone();
-        let ip2 = ip.clone();
-        let assign = tokio::task::spawn_blocking(move || {
-            Command::new("sudo")
-                .args(["ifconfig", &name5, "inet", &ip2, "netmask", "255.255.0.0"])
-                .output()
-        })
-        .await;
-
-        if assign.is_ok() {
-            tracing::info!("{}: manually assigned {ip}", iface.name);
+        // Fallback path. Prefer Apple's mlx.distributed_config auto-setup
+        // (cross-node deconflict). If unavailable, fall back to the legacy
+        // deterministic-index assignment, which has known collision bugs
+        // on 3+ node clusters (r1o-ai/asmi#1).
+        if let Some(ip) = autosetup_iface_ip_via_mlx(&iface.name).await {
+            tracing::info!("{}: mlx.distributed_config assigned {ip}", iface.name);
             results.push(InterfaceIp {
                 iface: iface.name.clone(),
                 ip,
-                source: "manual".into(),
+                source: "mlx_distributed_config".into(),
             });
+            continue;
+        }
+
+        if let Some(entry) = legacy_assign_ips(iface).await {
+            results.push(entry);
         }
     }
 
     Ok(results)
+}
+
+/// Attempt to read the IP that `mlx.distributed_config --auto-setup` assigned
+/// to the local node for the given interface. The tool writes a hostfile with
+/// one entry per host; we match the local hostname to that entry's IPs.
+///
+/// Returns `None` if the tool isn't installed, fails, or no IP matches the
+/// requested interface — caller should fall back to `legacy_assign_ips`.
+async fn autosetup_iface_ip_via_mlx(iface_name: &str) -> Option<String> {
+    // Build the hostlist from ~/.r1o/cluster.json (canonical for the cluster).
+    let hosts = read_cluster_hostnames().await?;
+    if hosts.len() < 2 {
+        // Single-node — no cross-node deconfliction required, let legacy IPv4LL handle it.
+        return None;
+    }
+
+    let hostfile = match crate::mlx_distributed_config::auto_setup(&hosts, "jaccl-ring").await {
+        Ok(hf) => hf,
+        Err(crate::mlx_distributed_config::ConfigError::BinaryNotFound) => {
+            tracing::warn!(
+                "mlx.distributed_config not installed; falling back to legacy autosetup. \
+                 This path has known IP-collision bugs (see r1o-ai/asmi#1)."
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!("mlx.distributed_config failed: {e}; falling back");
+            return None;
+        }
+    };
+
+    // Stash the hostfile for /jaccl/config to read later.
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".r1o/hostfiles/asmi-auto.json");
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Ok(body) = serde_json::to_string_pretty(&hostfile) {
+            let _ = tokio::fs::write(&path, body).await;
+        }
+    }
+
+    // Match the local entry by hostname (asmi runs on each node — local hostname
+    // identifies *which* host record applies here).
+    let local_hostname = local_hostname_short();
+    let local_entry = hostfile.hosts.iter().find(|h| {
+        let ssh = h.ssh.trim_end_matches(".local");
+        ssh.eq_ignore_ascii_case(&local_hostname) || ssh.starts_with(&local_hostname)
+    })?;
+
+    // Pick an IP from the entry. The hostfile order corresponds to the cable
+    // pair order, but we can't reliably map iface_name → cable index without
+    // re-introducing the very bug we're fixing. As a pragmatic step, assign
+    // the first unused IP from the local entry to the requested interface,
+    // and rely on `mlx.distributed_config` having already set it on disk.
+    //
+    // If the IP is already assigned to *some* TB5 interface on this node, the
+    // tool already did the work — just report it.
+    for ip in &local_entry.ips {
+        if let Some(found_iface) = find_iface_with_ip(ip).await {
+            if found_iface == iface_name {
+                // This iface already has the assigned IP — adopt as-is.
+                return Some(ip.clone());
+            }
+        }
+    }
+
+    // None of the assigned IPs landed on this interface — let the legacy path
+    // try to assign one. This can happen when mlx.distributed_config was run
+    // earlier on a different cable layout.
+    None
+}
+
+/// Read canonical cluster hostnames from `~/.r1o/cluster.json`.
+async fn read_cluster_hostnames() -> Option<Vec<String>> {
+    let path = dirs::home_dir()?.join(".r1o").join("cluster.json");
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let nodes = json.get("nodes")?.as_array()?;
+    let hostnames: Vec<String> = nodes
+        .iter()
+        .filter_map(|n| n.get("hostname")?.as_str().map(String::from))
+        .collect();
+    if hostnames.is_empty() { None } else { Some(hostnames) }
+}
+
+/// Short hostname (no `.local`, lowercase) for matching against hostfile `ssh` fields.
+fn local_hostname_short() -> String {
+    Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_lowercase())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Find which local interface (if any) currently has the given IP assigned.
+async fn find_iface_with_ip(target_ip: &str) -> Option<String> {
+    let target = target_ip.to_string();
+    tokio::task::spawn_blocking(move || {
+        let output = Command::new("ifconfig").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut current_iface: Option<String> = None;
+        for line in text.lines() {
+            if !line.starts_with(char::is_whitespace) {
+                if let Some(name) = line.split(':').next() {
+                    current_iface = Some(name.trim().to_string());
+                }
+            } else if line.trim_start().starts_with("inet ") {
+                if let Some(ip) = line.split_whitespace().nth(1) {
+                    if ip == target {
+                        return current_iface.clone();
+                    }
+                }
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Legacy fallback: assign `169.254.{iface_index}.1` to a single interface.
+///
+/// **Warning:** This path is the source of r1o-ai/asmi#1 — two nodes with
+/// `enX` at the same local index get the same IP. Only used when
+/// `mlx.distributed_config` is unavailable.
+async fn legacy_assign_ips(iface: &TbInterface) -> Option<InterfaceIp> {
+    let octet = iface.index;
+    let ip = format!("169.254.{octet}.1");
+    let name = iface.name.clone();
+    let ip2 = ip.clone();
+    let assign = tokio::task::spawn_blocking(move || {
+        Command::new("sudo")
+            .args(["ifconfig", &name, "inet", &ip2, "netmask", "255.255.0.0"])
+            .output()
+    })
+    .await;
+
+    if assign.is_ok() {
+        tracing::info!("{}: legacy-assigned {ip} (collision-prone fallback)", iface.name);
+        Some(InterfaceIp {
+            iface: iface.name.clone(),
+            ip,
+            source: "legacy_fallback".into(),
+        })
+    } else {
+        None
+    }
 }
 
 struct TbInterface {
