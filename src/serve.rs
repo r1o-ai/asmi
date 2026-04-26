@@ -125,8 +125,13 @@ pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     let hf = hostfile
         .map(PathBuf::from)
         .unwrap_or_else(default_hostfile);
-    if hf.exists() && (backend == "jaccl" || backend == "auto") {
-        ServeBackend::Jaccl
+    if hf.exists() {
+        match backend {
+            "jaccl" | "auto" => ServeBackend::Jaccl,
+            "jaccl-ring" => ServeBackend::JacclRing,
+            "ring" => ServeBackend::Ring,
+            _ => ServeBackend::Single,
+        }
     } else {
         ServeBackend::Single
     }
@@ -252,6 +257,65 @@ async fn poll_health(
     }
 }
 
+/// 1-token inference smoke probe.
+///
+/// Fires a `POST /v1/chat/completions` with `max_tokens=1` against the local
+/// MLX server. Returns `Ok(true)` only when the server returns a valid choice
+/// — not just a 200 on `/v1/models`. This catches the "server bound the port
+/// but the underlying model_path is broken" failure mode mlx_lm.server exhibits
+/// (lazy-load: HTTP listener up before weights finish or fail).
+///
+/// `Ok(false)` means we got a structurally-invalid response (no
+/// `choices[0].message`); `Err` means transport/parse failure.
+async fn smoke_probe_inference(
+    port: u16,
+    model_path: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+
+    let url = format!("http://localhost:{port}/v1/chat/completions");
+    let body = serde_json::json!({
+        "model": model_path,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("smoke probe POST: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "smoke probe non-2xx: {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+
+    let parsed: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("smoke probe parse: {e}"))?;
+
+    Ok(parsed["choices"][0]["message"].is_object())
+}
+
+/// Wall-clock time in ms since the UNIX epoch.
+fn now_unix_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
 /// Log-file readiness monitor (for share manager).
 #[derive(Clone)]
 pub struct LogMonitor {
@@ -342,6 +406,11 @@ struct ManagedProcess {
     load_started: Option<std::time::Instant>,
     error: Option<String>,
     stopped_at: Option<std::time::Instant>,
+    /// Outcome of the 1-token inference smoke probe (Phase 4).
+    /// `None` until first attempted; `Some(true)` once verified.
+    verified_inference: Option<bool>,
+    /// Wall-clock time the smoke probe last succeeded.
+    verified_at_ms: Option<u64>,
 }
 
 /// Kill the existing child process (SIGTERM → 5s → SIGKILL).
@@ -466,6 +535,8 @@ impl ServeManager {
                 load_started: None,
                 error: None,
                 stopped_at: None,
+                verified_inference: None,
+                verified_at_ms: None,
             })),
             readiness: Arc::new(HttpHealth {
                 port,
@@ -607,6 +678,8 @@ impl ServeManager {
         let engine = s.engine;
         let backend = s.backend;
         let error = s.error.clone();
+        let verified_inference = s.verified_inference;
+        let verified_at_ms = s.verified_at_ms;
         // Release the read lock before the (potentially slow) launchctl probe.
         drop(s);
         let launchd = match pid {
@@ -624,6 +697,8 @@ impl ServeManager {
             elapsed_ms: elapsed,
             error,
             launchd,
+            verified_inference,
+            verified_at_ms,
         }
     }
 
@@ -702,12 +777,32 @@ async fn do_serve_load_inner(
         }
     }
 
-    // Check port free
+    // Kill any stale occupant on this port (orphaned child, previous crash, etc.)
     if tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_ok()
     {
-        anyhow::bail!("port {} already in use by another process", port);
+        tracing::warn!(port, "port occupied — killing stale process before load");
+        let output = tokio::process::Command::new("/usr/sbin/lsof")
+            .args(["-ti", &format!(":{port}")])
+            .output()
+            .await;
+        if let Ok(out) = output {
+            let pids = String::from_utf8_lossy(&out.stdout);
+            for pid_str in pids.split_whitespace() {
+                let _ = tokio::process::Command::new("/bin/kill")
+                    .args(["-TERM", pid_str.trim()])
+                    .output()
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            anyhow::bail!("port {} still in use after SIGTERM — manual cleanup needed", port);
+        }
     }
 
     // Resolve backend (bare always single)
@@ -753,6 +848,18 @@ async fn do_serve_load_inner(
         }
         cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
 
+        // Read max_position_embeddings from the model's config.json for --max-tokens.
+        if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
+            let max_tok = req.model_path.as_ref().and_then(|p| {
+                let cfg_path = std::path::Path::new(p).join("config.json");
+                let data = std::fs::read_to_string(&cfg_path).ok()?;
+                let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+                v["max_position_embeddings"].as_u64()
+                    .or_else(|| v["text_config"]["max_position_embeddings"].as_u64())
+            }).unwrap_or(8192);
+            cmd_args.extend(["--max-tokens".into(), max_tok.to_string()]);
+        }
+
         // Optimization passthrough (mlx_lm only — these flags are mlx_lm.server-specific)
         if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
             if let Some(ref draft) = req.draft_model {
@@ -782,28 +889,26 @@ async fn do_serve_load_inner(
         }
     }
 
-    // JACCL distributed wrapper (only for engines with model_flag and non-bare)
+    // Distributed wrapper (JACCL, JACCL-Ring, or Ring via mlx.launch)
     let (final_program, final_args) = if !is_bare
-        && backend == ServeBackend::Jaccl
+        && matches!(backend, ServeBackend::Jaccl | ServeBackend::JacclRing | ServeBackend::Ring)
         && cfg.model_flag.is_some()
     {
         let hf = req
             .hostfile
             .clone()
             .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
-        let jaccl_py = resolve_python().to_string();
-        let mut jaccl_args = vec![
-            "-m".to_string(),
-            "mlx.launch".to_string(),
+        let mlx_launch = resolve_mlx_launch();
+        let mut launch_args = vec![
             "--hostfile".to_string(),
             hf,
             "--backend".to_string(),
-            "jaccl".to_string(),
+            backend.to_string(),
             "--".to_string(),
             program,
         ];
-        jaccl_args.extend(cmd_args);
-        (jaccl_py, jaccl_args)
+        launch_args.extend(cmd_args);
+        (mlx_launch, launch_args)
     } else {
         (program, cmd_args)
     };
@@ -825,9 +930,13 @@ async fn do_serve_load_inner(
         "spawning MLX server"
     );
 
-    let mut child = Command::new(&final_program)
-        .args(&final_args)
-        .env("MLX_METAL_FAST_SYNCH", "1")
+    let mut cmd = Command::new(&final_program);
+    cmd.args(&final_args)
+        .env("MLX_METAL_FAST_SYNCH", "1");
+    if !matches!(backend, ServeBackend::Single) {
+        cmd.env("MLX_DISTRIBUTED_BACKEND", backend.to_string());
+    }
+    let mut child = cmd
         .stdout(log_file)
         .stderr(log_stderr)
         .kill_on_drop(false) // we manage lifetime ourselves
@@ -857,13 +966,61 @@ async fn do_serve_load_inner(
             if is_bare {
                 s.model = None;
                 s.state = ServeState::Bare;
+                s.verified_inference = None;
+                s.verified_at_ms = None;
                 tracing::info!(pid = child_pid, port, %engine, "bare server ready");
+                persist_state(&s).await;
             } else {
                 s.model = req.model_path.clone();
-                s.state = ServeState::Ready;
-                tracing::info!(model = ?req.model_path, pid = child_pid, port, "server ready");
+                // Stay in `Loading` until the smoke probe confirms inference
+                // actually works. mlx_lm.server's HTTP listener binds before
+                // weights finish loading, so a 200 on /v1/models can still
+                // hide a broken model. Phase 4 of the JACCL plan.
+                s.state = ServeState::Loading;
+                drop(s);
+
+                let probe_timeout = std::time::Duration::from_secs(WARMUP_TIMEOUT_MODEL_SECS);
+                let probe_model = req
+                    .model_path
+                    .clone()
+                    .unwrap_or_else(|| "default".into());
+                let probe_result =
+                    smoke_probe_inference(port, &probe_model, probe_timeout).await;
+
+                let mut s = inner.write().await;
+                match probe_result {
+                    Ok(true) => {
+                        s.state = ServeState::Ready;
+                        s.verified_inference = Some(true);
+                        s.verified_at_ms = now_unix_ms();
+                        s.error = None;
+                        tracing::info!(
+                            model = ?req.model_path, pid = child_pid, port,
+                            "server ready (inference smoke probe verified)"
+                        );
+                    }
+                    Ok(false) => {
+                        s.state = ServeState::Error;
+                        s.verified_inference = Some(false);
+                        s.error = Some(format!(
+                            "inference smoke probe failed — server bound to {port} but \
+                             /v1/chat/completions did not return a valid response"
+                        ));
+                        tracing::error!(
+                            port, %engine,
+                            "smoke probe failed — flipping to Error (was Loading)"
+                        );
+                    }
+                    Err(e) => {
+                        s.state = ServeState::Error;
+                        s.verified_inference = Some(false);
+                        s.error = Some(format!("inference smoke probe error: {e}"));
+                        tracing::error!(error = %e, port, "smoke probe errored");
+                    }
+                }
+                persist_state(&s).await;
+                return Ok(());
             }
-            persist_state(&s).await;
 
             // For lazy-load engines (model_flag: None with model_path), fire a warmup
             // request to pre-load the model via /chat/completions. This is fire-and-forget:
@@ -944,6 +1101,8 @@ impl ShareManager {
                 load_started: None,
                 error: None,
                 stopped_at: None,
+                verified_inference: None,
+                verified_at_ms: None,
             })),
             readiness: Arc::new(LogMonitor {
                 log_path: SHARE_LOG_PATH.to_string(),

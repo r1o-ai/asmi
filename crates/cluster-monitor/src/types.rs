@@ -778,6 +778,8 @@ pub enum ServeBackend {
     #[default]
     Single,
     Jaccl,
+    JacclRing,
+    Ring,
 }
 
 
@@ -786,6 +788,8 @@ impl fmt::Display for ServeBackend {
         match self {
             Self::Single => write!(f, "single"),
             Self::Jaccl => write!(f, "jaccl"),
+            Self::JacclRing => write!(f, "jaccl-ring"),
+            Self::Ring => write!(f, "ring"),
         }
     }
 }
@@ -890,6 +894,15 @@ pub struct ServeStatus {
     /// keeps older clients compatible.
     #[serde(default)]
     pub launchd: Option<LaunchdInfo>,
+    /// Whether the server has answered a 1-token inference smoke probe.
+    /// `Some(true)` = real inference confirmed end-to-end.
+    /// `Some(false)` = probe attempted but failed (model load broken, weight bug, etc.).
+    /// `None` = probe never attempted (e.g. bare server, or process adopted from outside).
+    #[serde(default)]
+    pub verified_inference: Option<bool>,
+    /// Wall-clock time (ms since UNIX epoch) when the smoke probe last succeeded.
+    #[serde(default)]
+    pub verified_at_ms: Option<u64>,
 }
 
 /// A model process detected on the node that was NOT launched by asmi.
