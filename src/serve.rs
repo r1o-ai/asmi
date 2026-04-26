@@ -931,9 +931,13 @@ async fn do_serve_load_inner(
     );
 
     let mut cmd = Command::new(&final_program);
-    cmd.args(&final_args)
-        .env("MLX_METAL_FAST_SYNCH", "1");
-    if !matches!(backend, ServeBackend::Single) {
+    cmd.args(&final_args);
+    // MLX_METAL_FAST_SYNCH=1 has a known non-deterministic GPU-lock bug
+    // when used with JACCL backends (mlx#3142). Only set it for single-node
+    // serves; leave the env unset for Jaccl/JacclRing/Ring.
+    if matches!(backend, ServeBackend::Single) {
+        cmd.env("MLX_METAL_FAST_SYNCH", "1");
+    } else {
         cmd.env("MLX_DISTRIBUTED_BACKEND", backend.to_string());
     }
     let mut child = cmd
@@ -1284,9 +1288,14 @@ async fn do_share_load_inner(
         "spawning distributed mlx_lm.server"
     );
 
-    let mut child = Command::new(&final_program)
-        .args(&final_args)
-        .env("MLX_METAL_FAST_SYNCH", "1")
+    let mut cmd = Command::new(&final_program);
+    cmd.args(&final_args);
+    // mlx#3142: MLX_METAL_FAST_SYNCH=1 deadlocks the GPU on JACCL/Ring.
+    // Only set it for true single-node serves.
+    if matches!(backend, ServeBackend::Single) {
+        cmd.env("MLX_METAL_FAST_SYNCH", "1");
+    }
+    let mut child = cmd
         .stdout(log_file)
         .stderr(log_stderr)
         .kill_on_drop(false)
@@ -1497,6 +1506,8 @@ async fn do_jaccl_orchestrate(
         .open(SHARE_LOG_PATH)?;
     let log_stderr = log_file.try_clone()?;
 
+    // mlx#3142: MLX_METAL_FAST_SYNCH=1 deadlocks the GPU on JACCL/Ring.
+    // This codepath is exclusively distributed (jaccl or ring); leave the env unset.
     let mut cmd = Command::new(&py);
     cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(model_path)
@@ -1504,7 +1515,6 @@ async fn do_jaccl_orchestrate(
         .arg("--host").arg("0.0.0.0")
         .env("MLX_RANK", "0")
         .env("MLX_WORLD_SIZE", world_size.to_string())
-        .env("MLX_METAL_FAST_SYNCH", "1")
         .stdout(log_file)
         .stderr(log_stderr)
         .kill_on_drop(false);
