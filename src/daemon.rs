@@ -1090,10 +1090,15 @@ async fn network_fix_handler() -> Result<Json<serde_json::Value>, ApiError> {
 // Serve lifecycle endpoints (replaces mlx_daemon.py on port 19079)
 // ---------------------------------------------------------------------------
 
-/// Query params for serve endpoints — optional ?port= (defaults to 19080).
+/// Query params for serve endpoints.
+/// - `port`: address a specific server slot directly (overrides auto-pick).
+/// - `engine`: when auto-picking, restrict to slots running this engine
+///   ("mlx_lm", "mlx_vlm", "vllm_mlx", "mlx_lm_share"). Lets clients say
+///   "give me the VLM proxy" without knowing the port.
 #[derive(Deserialize)]
 struct ServeQuery {
     port: Option<u16>,
+    engine: Option<String>,
 }
 
 /// Default MLX server port (backwards compatible).
@@ -1349,6 +1354,83 @@ fn launchd_err_response(e: crate::launchd::LaunchdError) -> axum::response::Resp
             Json(serde_json::json!({"error": other.to_string()})),
         )
             .into_response(),
+    }
+}
+
+/// Query for `/launchd/list` and `/launchd/describe`.
+#[derive(Deserialize, Default)]
+struct LaunchdListQuery {
+    /// Comma-separated label prefixes to include. When omitted, defaults to
+    /// `DEFAULT_SCANNER_PREFIXES` (`com.r1o.`, `com.mlx.`, `com.asmi.`).
+    /// Example: `?prefix=com.r1o.,com.litellm.`
+    prefix: Option<String>,
+    /// Single label to describe (used by `/launchd/describe`).
+    label: Option<String>,
+}
+
+/// GET /launchd/list — Enumerate launchd agents matching the prefix filter.
+///
+/// Returns `[{label, state, keep_alive, run_at_load, program, protected}]`.
+/// `protected` is added per-entry (not part of `LaunchdInfo` itself) so the
+/// UI can grey out disable/enable buttons for `com.asmi.*` etc.
+async fn launchd_list_handler(
+    State(_state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<LaunchdListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owned: Vec<String>;
+    let prefixes: Vec<&str> = match q.prefix.as_deref() {
+        Some(s) => {
+            owned = s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            owned.iter().map(|s| s.as_str()).collect()
+        }
+        None => crate::launchd::DEFAULT_SCANNER_PREFIXES.to_vec(),
+    };
+
+    let agents = crate::launchd::list_with_prefixes(&prefixes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("launchctl list failed: {e}")))?;
+
+    let enriched: Vec<serde_json::Value> = agents
+        .into_iter()
+        .map(|info| {
+            let protected = crate::launchd::is_protected(&info.label);
+            // Re-shape: include `protected` alongside the LaunchdInfo fields.
+            let mut v = serde_json::to_value(&info).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("protected".to_string(), serde_json::Value::Bool(protected));
+            }
+            v
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "agents": enriched,
+        "prefixes": prefixes,
+    })))
+}
+
+/// GET /launchd/describe?label=com.foo.bar — Describe a single label.
+///
+/// 404 when the agent is not found in `launchctl print` AND not in
+/// `print-disabled`. Useful for the stop-flow keepalive check.
+async fn launchd_describe_handler(
+    State(_state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<LaunchdListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let label = q
+        .label
+        .ok_or_else(|| ApiError::BadRequest("missing ?label= query param".to_string()))?;
+    let info = crate::launchd::describe_label(&label).await;
+    match info {
+        Some(info) => {
+            let protected = crate::launchd::is_protected(&info.label);
+            let mut v = serde_json::to_value(&info).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("protected".to_string(), serde_json::Value::Bool(protected));
+            }
+            Ok(Json(v))
+        }
+        None => Err(ApiError::NotFound(format!("no launchd agent named: {label}"))),
     }
 }
 
@@ -3037,6 +3119,98 @@ async fn prep_handler(
 
 // ── OpenAI-compatible proxy ─────────────────────────────────────────────────
 
+/// Pure form of the proxy-port selection rule. No async, no locks, no I/O.
+///
+/// Selection contract:
+/// 1. `explicit` (from `?port=`) wins unconditionally — the caller is asserting
+///    which slot they want, even Loading/Bare ones (used for early `/v1/models`
+///    probes during deploy).
+/// 2. Otherwise the first `state == Ready` status wins.
+/// 3. When `engine_filter` is `Some(...)`, only Ready statuses whose engine
+///    `Display`-formats to the same string qualify (`"mlx_lm"`, `"mlx_vlm"`, …).
+/// 4. `None` means "no eligible slot" — caller renders OpenAI-shaped 503.
+///
+/// Exposed as `pub(crate)` so the in-file `#[cfg(test)]` module can call it
+/// directly. Integration tests cannot reach this — apple-smi is binary-only,
+/// no `lib.rs`.
+pub(crate) fn pick_port_pure(
+    statuses: &[asmi_core::ServeStatus],
+    explicit: Option<u16>,
+    engine_filter: Option<&str>,
+) -> Option<u16> {
+    if let Some(p) = explicit {
+        return Some(p);
+    }
+    for st in statuses {
+        if st.state != asmi_core::ServeState::Ready {
+            continue;
+        }
+        if let Some(want) = engine_filter {
+            if st.engine.to_string() != want {
+                continue;
+            }
+        }
+        return Some(st.port);
+    }
+    None
+}
+
+/// Pick the model-server port to proxy a /v1/* request to.
+///
+/// Wraps `pick_port_pure` with the live `serve_managers` snapshot. Tracing is
+/// kept here (not in the pure helper) so the logic remains side-effect free.
+async fn pick_proxy_port(
+    state: &AppState,
+    explicit: Option<u16>,
+    engine_filter: Option<&str>,
+) -> Option<u16> {
+    if let Some(p) = explicit {
+        tracing::debug!(port = p, "pick_proxy_port: explicit override");
+        return Some(p);
+    }
+    let managers = state.serve_managers.read().await;
+    let mut statuses = Vec::with_capacity(managers.len());
+    let mut considered: Vec<(u16, String, String)> = Vec::with_capacity(managers.len());
+    for mgr in managers.values() {
+        let st = mgr.status().await;
+        considered.push((st.port, st.engine.to_string(), format!("{:?}", st.state)));
+        statuses.push(st);
+    }
+    let picked = pick_port_pure(&statuses, None, engine_filter);
+    match picked {
+        Some(port) => {
+            tracing::info!(
+                port,
+                engine_filter = engine_filter.unwrap_or("none"),
+                "pick_proxy_port: selected"
+            );
+        }
+        None => {
+            tracing::warn!(
+                engine_filter = engine_filter.unwrap_or("none"),
+                considered = ?considered,
+                "pick_proxy_port: no eligible Ready slot"
+            );
+        }
+    }
+    picked
+}
+
+/// OpenAI-shaped 503 used when no eligible server is loaded. Matching the
+/// shape `{"error":{"message":..,"type":..}}` keeps OpenAI clients happy.
+fn no_model_loaded_response(detail: &str) -> axum::response::Response {
+    use axum::body::Body;
+    let body = format!(
+        r#"{{"error":{{"message":"No model loaded.{}","type":"server_error"}}}}"#,
+        if detail.is_empty() { String::new() } else { format!(" {detail}") }
+    );
+    axum::response::Response::builder()
+        .status(503)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 /// POST /v1/chat/completions — Proxy to the active model server.
 /// Streams SSE back with `delta.reasoning` renamed to `delta.reasoning_content`
 /// so AI SDK's OpenAI provider handles thinking natively.
@@ -3048,27 +3222,14 @@ async fn v1_chat_completions_proxy(
     use axum::body::Body;
     use futures::StreamExt;
 
-    let port = if let Some(p) = q.port {
-        p
-    } else {
-        let managers = state.serve_managers.read().await;
-        let mut found_port: Option<u16> = None;
-        for mgr in managers.values() {
-            let st = mgr.status().await;
-            if st.state == asmi_core::ServeState::Ready {
-                found_port = Some(st.port);
-                break;
-            }
-        }
-        match found_port {
-            Some(p) => p,
-            None => {
-                return Ok(axum::response::Response::builder()
-                    .status(503)
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"error":{"message":"No model loaded. Deploy from Topology or use /serve/load.","type":"server_error"}}"#))
-                    .unwrap());
-            }
+    let port = match pick_proxy_port(&state, q.port, q.engine.as_deref()).await {
+        Some(p) => p,
+        None => {
+            let hint = match q.engine.as_deref() {
+                Some(e) => format!("No Ready server matches engine={e}. Deploy from Topology or use /serve/load."),
+                None => "Deploy from Topology or use /serve/load.".to_string(),
+            };
+            return Ok(no_model_loaded_response(&hint));
         }
     };
 
@@ -3128,21 +3289,26 @@ async fn v1_chat_completions_proxy(
 }
 
 /// GET /v1/models — Proxy to the active model server, inject context_length from config.json.
+///
+/// Port selection mirrors `v1_chat_completions_proxy`: explicit `?port=`
+/// wins, otherwise auto-pick the first Ready slot, optionally constrained
+/// by `?engine=`. Returns an OpenAI-shaped 503 when nothing qualifies — no
+/// more silent passthrough of upstream connection errors from an empty slot.
 async fn v1_models_proxy(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ServeQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let port = if let Some(p) = q.port {
-        p
-    } else {
-        let managers = state.serve_managers.read().await;
-        let mut p = 19080u16;
-        for mgr in managers.values() {
-            let st = mgr.status().await;
-            p = st.port;
-            break;
+) -> Result<axum::response::Response, ApiError> {
+    use axum::body::Body;
+
+    let port = match pick_proxy_port(&state, q.port, q.engine.as_deref()).await {
+        Some(p) => p,
+        None => {
+            let hint = match q.engine.as_deref() {
+                Some(e) => format!("No Ready server matches engine={e}."),
+                None => String::new(),
+            };
+            return Ok(no_model_loaded_response(&hint));
         }
-        p
     };
 
     let res = reqwest::Client::new()
@@ -3177,7 +3343,13 @@ async fn v1_models_proxy(
         }
     }
 
-    Ok(Json(data))
+    let body = serde_json::to_vec(&data)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize models response: {e}")))?;
+    Ok(axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap())
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -3206,6 +3378,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
         .route("/serve/reload", post(serve_reload_handler))
+        .route("/launchd/list", get(launchd_list_handler))
+        .route("/launchd/describe", get(launchd_describe_handler))
         .route("/launchd/disable", post(launchd_disable_handler))
         .route("/launchd/enable", post(launchd_enable_handler))
         .route("/serve/share", post(serve_share_handler))
@@ -3245,4 +3419,72 @@ pub fn build_router(state: AppState) -> Router {
         .route("/models/download/{job_id}", get(crate::downloads::snapshot_handler))
         .route("/models/download/{job_id}/progress", get(crate::downloads::progress_sse_handler))
         .with_state(state)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod pick_proxy_port_tests {
+    //! Selection contract for `pick_port_pure`.
+    //!
+    //! Lives as a unit test inside `daemon.rs` because apple-smi is a
+    //! binary-only crate — there is no `lib.rs` for `tests/*.rs` integration
+    //! tests to import from. Same-module unit tests can reach `pub(crate)`.
+
+    use super::pick_port_pure;
+    use asmi_core::{ServeBackend, ServeEngine, ServeState, ServeStatus};
+
+    fn fake_status(port: u16, engine: ServeEngine, state: ServeState) -> ServeStatus {
+        ServeStatus {
+            state,
+            model: if state == ServeState::Ready {
+                Some("/Users/ma/Models/X".to_string())
+            } else {
+                None
+            },
+            engine,
+            backend: ServeBackend::Single,
+            port,
+            pid: Some(1),
+            port_verified: true,
+            elapsed_ms: 0,
+            error: None,
+            launchd: None,
+            verified_inference: None,
+            verified_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn explicit_port_wins_even_if_not_ready() {
+        let statuses = vec![fake_status(19084, ServeEngine::MlxVlm, ServeState::Bare)];
+        assert_eq!(pick_port_pure(&statuses, Some(19084), None), Some(19084));
+    }
+
+    #[test]
+    fn auto_pick_skips_non_ready() {
+        let statuses = vec![
+            fake_status(19084, ServeEngine::MlxVlm, ServeState::Bare),
+            fake_status(19080, ServeEngine::MlxLm, ServeState::Ready),
+        ];
+        assert_eq!(pick_port_pure(&statuses, None, None), Some(19080));
+    }
+
+    #[test]
+    fn engine_filter_narrows_choice() {
+        let statuses = vec![
+            fake_status(19080, ServeEngine::MlxLm, ServeState::Ready),
+            fake_status(19084, ServeEngine::MlxVlm, ServeState::Ready),
+        ];
+        assert_eq!(
+            pick_port_pure(&statuses, None, Some("mlx_vlm")),
+            Some(19084)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_nothing_qualifies() {
+        let statuses = vec![fake_status(19084, ServeEngine::MlxVlm, ServeState::Bare)];
+        assert_eq!(pick_port_pure(&statuses, None, Some("mlx_lm")), None);
+    }
 }

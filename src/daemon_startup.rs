@@ -389,6 +389,11 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
     eprintln!("  GET  /watchdog          Full watchdog report");
     eprintln!("  GET  /watchdog/peers    RDMA peer heartbeat status");
     eprintln!("  GET  /watchdog/gpu-lock GPU Lock detection status");
+    eprintln!("  GET  /hf/search         HuggingFace model search proxy");
+    eprintln!("  POST /models/download   Start huggingface-cli download (returns job_id)");
+    eprintln!("  GET  /models/download/{{id}}          Download job snapshot");
+    eprintln!("  GET  /models/download/{{id}}/progress SSE progress stream");
+    eprintln!("  GET  /models/downloads  All in-flight + recent download jobs");
     let ports_str: Vec<String> = serve::managed_ports().iter().map(|(p, e)| format!("{p}({e})")).collect();
     eprintln!("  Managed ports: {}", ports_str.join(", "));
     if cluster_hub {
