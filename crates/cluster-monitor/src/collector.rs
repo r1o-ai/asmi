@@ -225,7 +225,7 @@ fn parse_hw_identity(text: &str) -> (Option<String>, Option<String>, Option<Stri
 /// Also captures mlx.launch (distributed launcher), mlx_lm.share, mlx_audio.
 /// JACCL detection: --backend jaccl in args, or ps -E showing MLX_JACCL env vars.
 const CMD_PS_MLX: &str =
-    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch|mlx_audio' | grep -v grep";
+    "ps aux | grep -E 'mlx_lm[. ](server|share)|mlx_vlm[. ]server|vllm_mlx|mlx[. ]launch|mlx_audio' | grep -v grep";
 
 /// RDMA status + ifconfig in one command to minimize SSH connections.
 const CMD_RDMA_NET: &str =
@@ -235,7 +235,7 @@ const CMD_RDMA_NET: &str =
 /// Only `mlx.launch --backend jaccl` is a reliable signal — env vars
 /// can persist from previous runs and cause false positives on single-node.
 const CMD_JACCL_ENV: &str =
-    "ps aux | grep 'mlx\\.launch.*--backend' | grep -v grep | head -5";
+    "ps aux | grep 'mlx[. ]launch.*--backend' | grep -v grep | head -5";
 
 /// Top CPU-consuming processes (sorted by CPU% descending, top 8).
 const CMD_PS_TOP: &str =
