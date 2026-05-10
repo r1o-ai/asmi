@@ -358,7 +358,7 @@ pub async fn run_serve(port: u16, interval: u64, cluster_hub: bool, cli_models_d
 
     let app = daemon::build_router(app_state);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("127.0.0.1:{port}");
     tracing::info!(%addr, "HTTP server listening");
     let base = format!("http://{hostname}:{port}");
     let name = bin_name();

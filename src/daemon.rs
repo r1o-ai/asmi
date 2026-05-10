@@ -1581,7 +1581,7 @@ async fn serve_distributed_join_handler(
     cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(&model_path)
         .arg("--port").arg(req.port.to_string())
-        .arg("--host").arg("0.0.0.0");
+        .arg("--host").arg("127.0.0.1");
 
     // Set distributed env vars (backend-specific)
     cmd.env("MLX_RANK", req.rank.to_string())

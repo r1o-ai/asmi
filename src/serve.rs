@@ -733,7 +733,7 @@ async fn do_serve_load_inner(
             "uvicorn".into(),
             uvicorn_app.into(),
             "--host".into(),
-            "0.0.0.0".into(),
+            "127.0.0.1".into(),
             "--port".into(),
             port.to_string(),
             "--workers".into(),
@@ -751,7 +751,7 @@ async fn do_serve_load_inner(
             cmd_args.push(flag.into());
             cmd_args.push(model_path.clone());
         }
-        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
+        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "127.0.0.1".into()]);
 
         // Optimization passthrough (mlx_lm only — these flags are mlx_lm.server-specific)
         if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
@@ -1104,7 +1104,7 @@ async fn do_share_load_inner(
         "--port".to_string(),
         SHARE_PORT.to_string(),
         "--host".to_string(),
-        "0.0.0.0".to_string(),
+        "127.0.0.1".to_string(),
     ];
     let final_program = py;
     let mut final_args = vec!["-m".to_string(), "mlx_lm".to_string(), "server".to_string()];
@@ -1342,7 +1342,7 @@ async fn do_jaccl_orchestrate(
     cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(model_path)
         .arg("--port").arg(SHARE_PORT.to_string())
-        .arg("--host").arg("0.0.0.0")
+        .arg("--host").arg("127.0.0.1")
         .env("MLX_RANK", "0")
         .env("MLX_WORLD_SIZE", world_size.to_string())
         .env("MLX_METAL_FAST_SYNCH", "1")
