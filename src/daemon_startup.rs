@@ -292,7 +292,9 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
             nm.nodes.clone()
         };
         if !topo_nodes.is_empty() {
+            let port = port;
             tokio::spawn(async move {
+                let mut last_hash: u64 = 0;
                 loop {
                     let nodes = topo_nodes.clone();
                     let result = tokio::task::spawn_blocking(move || {
@@ -300,6 +302,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                     }).await;
                     match result {
                         Ok(Ok(report)) => {
+                            let new_hash = crate::daemon::topology_hash(&report);
                             tracing::info!(
                                 nodes = report.nodes.len(),
                                 links = report.links.len(),
@@ -307,6 +310,12 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                                 "topology scan complete"
                             );
                             *topo_cache.write().await = Some((report, std::time::Instant::now()));
+                            if new_hash != last_hash && last_hash != 0 {
+                                tracing::info!("TB5 topology changed — triggering hostfile regen");
+                                let client = reqwest::Client::new();
+                                let _ = client.post(format!("http://127.0.0.1:{port}/config/sync")).send().await;
+                            }
+                            last_hash = new_hash;
                         }
                         Ok(Err(e)) => {
                             tracing::warn!(error = %e, "topology scan failed");
@@ -344,6 +353,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
     {
         let nm = Arc::clone(&node_map);
         tokio::spawn(async move {
+// Startup path: no caller override — use NodeMap default.
             let report = rdma_autosetup::autosetup(&nm, None).await;
             let peers = report.peers.verified_links.len();
             if peers > 0 {
@@ -359,6 +369,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         cluster_state,
         node_map,
         hostname: hostname.clone(),
+        port,
         started_at,
         metrics_tx: metrics_tx.clone(),
         model_cache,

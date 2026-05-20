@@ -33,6 +33,7 @@ pub struct AppState {
     pub cluster_state: Option<Arc<RwLock<asmi_core::ClusterState>>>,
     pub node_map: Arc<RwLock<asmi_core::NodeMap>>,
     pub hostname: String,
+    pub port: u16,
     pub started_at: std::time::Instant,
     pub metrics_tx: tokio::sync::broadcast::Sender<String>,
     pub model_cache: Arc<RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>>,
@@ -424,6 +425,60 @@ async fn jaccl_generate_handler(
     })))
 }
 
+/// POST /config/sync → trigger config.db sync + JACCL hostfile regen.
+/// Called by web routes after cluster.json mutations for instant propagation.
+async fn config_sync_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let result = trigger_config_sync(&state).await;
+    Json(result)
+}
+
+/// Bust caches + regenerate JACCL hostfile. Callable from handlers and internal loops.
+pub async fn trigger_config_sync(state: &AppState) -> serde_json::Value {
+    {
+        let mut tb = state.thunderbolt_cache.write().await;
+        *tb = None;
+    }
+    {
+        let mut topo = state.topology_cache.write().await;
+        *topo = None;
+    }
+
+    let hostfile_path = std::env::var("HOME")
+        .map(|h| format!("{h}/.r1o/hostfiles/auto.json"))
+        .unwrap_or_else(|_| "/tmp/auto.json".into());
+    let body = serde_json::json!({ "write": true, "path": hostfile_path });
+    let client = reqwest::Client::new();
+    let regen = client.post(format!("http://127.0.0.1:{}/jaccl/config", state.port))
+        .json(&body).send().await;
+    let regen_ok = regen.is_ok();
+
+    tracing::info!(hostfile_regen = regen_ok, "config/sync triggered");
+    serde_json::json!({ "ok": true, "hostfile_regen": regen_ok })
+}
+
+/// Hash a TopologyReport's links into a stable u64 for change detection.
+/// Sorted (node_a, device_a, node_b, device_b) tuples → FNV-1a.
+pub fn topology_hash(report: &crate::topology::TopologyReport) -> u64 {
+    let mut links: Vec<String> = report.links.iter().map(|l| {
+        let mut pair = [
+            format!("{}:{}", l.node_a, l.device_a),
+            format!("{}:{}", l.node_b, l.device_b),
+        ];
+        pair.sort();
+        pair.join("<>")
+    }).collect();
+    links.sort();
+    let joined = links.join("|");
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in joined.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// GET /models → cached local model file listing (now includes external volumes)
 /// Each model is annotated with live serving info if it's currently loaded.
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -615,8 +670,8 @@ async fn cluster_models_handler(State(state): State<AppState>) -> Json<serde_jso
 
             // Remote node: try .local mDNS first, then Tailscale hostname
             let urls = vec![
-                format!("http://{}.local:9090/models", node),
-                format!("http://{}:9090/models", node),
+                format!("http://{}.local:{}/models", node, state.port),
+                format!("http://{}:{}/models", node, state.port),
             ];
             for url in &urls {
                 if let Ok(resp) = client.get(url).send().await {
@@ -1236,7 +1291,7 @@ async fn serve_load_handler(
         if !peers.is_empty() {
             state
                 .peer_heartbeat
-                .start(peers, 9090, state.serve_managers.clone(), state.share_manager.clone())
+                .start(peers, state.port, state.serve_managers.clone(), state.share_manager.clone())
                 .await;
         }
     } else {
@@ -1977,7 +2032,7 @@ async fn serve_share_handler(
         if !peers.is_empty() {
             state
                 .peer_heartbeat
-                .start(peers, 9090, state.serve_managers.clone(), state.share_manager.clone())
+                .start(peers, state.port, state.serve_managers.clone(), state.share_manager.clone())
                 .await;
         }
     }
@@ -3275,13 +3330,14 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         .unwrap_or_default();
 
     // Query remote nodes over local network (.local mDNS)
+    let port = state.port;
     let futures: Vec<_> = remote_nodes
         .iter()
         .map(|&name| {
             let client = client.clone();
             let name = name.to_string();
-            let skip_offline = known_offline.contains(&name);
-            let url = format!("http://{}.local:9090/rdma/check", name);
+let skip_offline = known_offline.contains(&name);
+            let url = format!("http://{}.local:{}/rdma/check", name, port);
             async move {
                 if skip_offline {
                     return (name, None);
@@ -3814,6 +3870,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ane/eval", post(crate::ane::eval_handler))
         .route("/ane/probe", get(crate::ane::probe_handler))
         // Autoresearch benchmark validation
+        .route("/config/sync", post(config_sync_handler))
         .route("/autoresearch/gate", get(autoresearch_gate_handler))
         .route("/autoresearch/reset", post(autoresearch_reset_handler))
         .with_state(state)
