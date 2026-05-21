@@ -169,6 +169,85 @@ async fn cluster_handler(State(state): State<AppState>) -> Result<Json<serde_jso
     }
 }
 
+/// GET /cluster/full → unified endpoint aggregating nodes, topology, serving, and roles.
+/// Single-call entry point for TUI, iOS, and omp clients.
+async fn cluster_full_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // 1. Nodes — from cluster_state (same as /cluster)
+    let nodes_json = match &state.cluster_state {
+        Some(cs) => {
+            let s = cs.read().await;
+            let snapshots: Vec<&asmi_core::NodeSnapshot> = s.snapshots.values().collect();
+            serde_json::to_value(&snapshots).unwrap_or(serde_json::json!([]))
+        }
+        None => serde_json::json!([]),
+    };
+
+    // 2. Topology — from cached topology scan
+    let topo_json = {
+        let cache = state.topology_cache.read().await;
+        cache.as_ref().map(|(report, scanned_at)| {
+            serde_json::json!({
+                "links": report.links,
+                "nodes": report.nodes,
+                "missing_links": report.missing_links,
+                "jaccl_ready": report.jaccl_ready,
+                "jaccl_ready_subsets": report.jaccl_ready_subsets,
+                "mesh_complete": report.mesh_complete,
+                "scan_age_seconds": scanned_at.elapsed().as_secs(),
+            })
+        })
+    };
+
+    // 3. Serving — from managed servers + detected processes
+    let serving_entries = collect_serving_map(&state).await;
+    let serving_json: Vec<serde_json::Value> = serving_entries.iter().map(|(names, info)| {
+        serde_json::json!({
+            "model": names.first().unwrap_or(&String::new()),
+            "port": info.port,
+            "engine": info.engine,
+            "pid": info.pid,
+            "managed": info.managed,
+        })
+    }).collect();
+
+    // 4. Roles — from ~/.r1o/cluster.json
+    let roles_json = read_cluster_roles();
+
+    Json(serde_json::json!({
+        "nodes": nodes_json,
+        "topology": topo_json,
+        "serving": serving_json,
+        "roles": roles_json,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// Read node roles from ~/.r1o/cluster.json.
+fn read_cluster_roles() -> serde_json::Value {
+    let path = dirs::home_dir()
+        .map(|h| h.join(".r1o/cluster.json"))
+        .unwrap_or_default();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return serde_json::json!({});
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return serde_json::json!({});
+    };
+    // Extract hostname → role mapping
+    let mut roles = serde_json::Map::new();
+    if let Some(nodes) = config.get("nodes").and_then(|n| n.as_array()) {
+        for node in nodes {
+            if let (Some(hostname), Some(role)) = (
+                node.get("hostname").and_then(|h| h.as_str()),
+                node.get("role").and_then(|r| r.as_str()),
+            ) {
+                roles.insert(hostname.to_string(), serde_json::json!(role));
+            }
+        }
+    }
+    serde_json::Value::Object(roles)
+}
+
 /// GET /nodes → list of known node hostnames
 async fn nodes_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     match &state.cluster_state {
@@ -3817,6 +3896,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logs", get(logs_handler))
         .route("/runtime", get(runtime_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/cluster/full", get(cluster_full_handler))
         .route("/cluster/models", get(cluster_models_handler))
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))
