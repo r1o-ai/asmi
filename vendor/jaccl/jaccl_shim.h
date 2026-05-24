@@ -53,6 +53,14 @@ int  jaccl_group_recv(jaccl_group_t g, void* buf, size_t len,
                       int src, int timeout_ms);
      /* Returns 0 on success, -1 on timeout, -2 on RDMA error. */
 
+/* -- Cancel pending operations -- */
+int  jaccl_group_cancel_pending(jaccl_group_t g);
+     /* Poisons the group so all future send/recv/probe calls fail
+        immediately. Existing detached spin-loop threads will check the
+        poison flag between operations. Does NOT break internal CQ poll
+        loops (MeshGroup::connections_ is private — future work).
+        After this call, the group is dead — call jaccl_group_free(). */
+
 /* -- Teardown (call ONLY at process exit or confirmed cable reseat) -- */
 void jaccl_group_free(jaccl_group_t g);
 

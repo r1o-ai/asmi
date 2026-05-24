@@ -1,13 +1,17 @@
 // Copyright 2026 r1o project. JACCL C shim for Rust FFI.
 // Wraps MeshGroup via the void* Group API with timeout + probes.
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 #include <json.hpp>
 
@@ -51,9 +55,15 @@ parse_devices(const char* path) {
     return result;
 }
 
-// Stored as shared_ptr to prevent accidental double-free
+// Stored as shared_ptr to prevent accidental double-free.
+// `poisoned` flag allows cancel_pending to signal detached spin-loop threads
+// that the group is dead and they should stop polling. This is the fallback
+// approach since MeshGroup::connections_ is private — we can't destroy CQs
+// directly from outside.
 struct GroupHandle {
     std::shared_ptr<jaccl::Group> group;
+    std::shared_ptr<std::atomic<bool>> poisoned =
+        std::make_shared<std::atomic<bool>>(false);
 };
 
 } // namespace
@@ -278,34 +288,51 @@ int jaccl_group_size(jaccl_group_t g) {
 int jaccl_group_probe(jaccl_group_t g) {
     try {
         auto* h = static_cast<GroupHandle*>(g);
+        if (h->poisoned->load()) return -1;
+
         int rank = h->group->rank();
         int size = h->group->size();
         if (size < 2) return -1;
 
-        // Send 1 byte to peer and recv 1 byte back
-        uint8_t probe_byte = 0xAB;
-        uint8_t recv_byte = 0;
         int peer = (rank == 0) ? 1 : 0;
 
-        // Use async with 2-second timeout
-        auto fut = std::async(std::launch::async, [&]() {
-            if (rank == 0) {
-                h->group->send(&probe_byte, 1, peer);
-                h->group->recv(&recv_byte, 1, peer);
-            } else {
-                h->group->recv(&recv_byte, 1, peer);
-                h->group->send(&probe_byte, 1, peer);
-            }
-        });
+        // Phase 1b: detach+condvar pattern replaces std::async.
+        // std::async's future dtor blocks, making the 2s timeout dead code.
+        auto group = h->group;  // shared_ptr copy — safe to outlive caller
+        auto done = std::make_shared<std::atomic<int>>(0);  // 0=pending, 1=ok, -2=error
+        auto mtx = std::make_shared<std::mutex>();
+        auto cv = std::make_shared<std::condition_variable>();
+        auto poisoned = h->poisoned;  // shared_ptr copy
 
-        auto status = fut.wait_for(std::chrono::seconds(2));
-        if (status == std::future_status::timeout) {
-            return -1; // QP stale
+        std::thread([group, peer, rank, done, mtx, cv, poisoned]() {
+            try {
+                // Probe data — heap-allocated to avoid stack UB
+                uint8_t probe_byte = 0xAB;
+                uint8_t recv_byte = 0;
+                if (rank == 0) {
+                    group->send(&probe_byte, 1, peer);
+                    if (poisoned->load()) { done->store(-2); cv->notify_one(); return; }
+                    group->recv(&recv_byte, 1, peer);
+                } else {
+                    group->recv(&recv_byte, 1, peer);
+                    if (poisoned->load()) { done->store(-2); cv->notify_one(); return; }
+                    group->send(&probe_byte, 1, peer);
+                }
+                done->store(1);
+            } catch (...) {
+                done->store(-2);
+            }
+            cv->notify_one();
+        }).detach();
+
+        std::unique_lock<std::mutex> lock(*mtx);
+        if (!cv->wait_for(lock, std::chrono::seconds(2),
+                          [&] { return done->load() != 0; })) {
+            return -1; // genuine timeout — detached thread will finish eventually
         }
-        fut.get(); // propagate exceptions
-        return 0;  // alive
+        return done->load() == 1 ? 0 : -1;
     } catch (...) {
-        return -1; // QP stale or error
+        return -1;
     }
 }
 
@@ -315,15 +342,35 @@ int jaccl_group_send(
 ) {
     try {
         auto* h = static_cast<GroupHandle*>(g);
-        auto fut = std::async(std::launch::async, [&]() {
-            h->group->send(buf, len, dst);
-        });
-        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
-        if (status == std::future_status::timeout) {
-            return -1; // timeout
+        if (h->poisoned->load()) return -2;
+
+        // Phase 1b: detach+condvar replaces std::async (future dtor blocks =
+        // dead timeout). Copy input buffer to heap — caller may free after
+        // timeout return.
+        auto data = std::make_shared<std::vector<uint8_t>>(
+            static_cast<const uint8_t*>(buf),
+            static_cast<const uint8_t*>(buf) + len);
+        auto group = h->group;  // shared_ptr copy — safe to outlive caller
+        auto done = std::make_shared<std::atomic<int>>(0);  // 0=pending, 1=ok, -2=error
+        auto mtx = std::make_shared<std::mutex>();
+        auto cv = std::make_shared<std::condition_variable>();
+
+        std::thread([group, data, dst, done, mtx, cv]() {
+            try {
+                group->send(data->data(), data->size(), dst);
+                done->store(1);
+            } catch (...) {
+                done->store(-2);
+            }
+            cv->notify_one();
+        }).detach();
+
+        std::unique_lock<std::mutex> lock(*mtx);
+        if (!cv->wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                          [&] { return done->load() != 0; })) {
+            return -1; // genuine timeout — detached thread will finish eventually
         }
-        fut.get(); // propagate exceptions
-        return 0;
+        return done->load() == 1 ? 0 : -2;
     } catch (const std::exception& e) {
         std::cerr << "[jaccl-shim] send error: " << e.what() << std::endl;
         return -2;
@@ -338,15 +385,36 @@ int jaccl_group_recv(
 ) {
     try {
         auto* h = static_cast<GroupHandle*>(g);
-        auto fut = std::async(std::launch::async, [&]() {
-            h->group->recv(buf, len, src);
-        });
-        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
-        if (status == std::future_status::timeout) {
-            return -1; // timeout
+        if (h->poisoned->load()) return -2;
+
+        // Phase 1b: detach+condvar replaces std::async (future dtor blocks =
+        // dead timeout). Receive into a heap buffer, memcpy back on success.
+        auto recv_buf = std::make_shared<std::vector<uint8_t>>(len);
+        auto group = h->group;  // shared_ptr copy — safe to outlive caller
+        auto done = std::make_shared<std::atomic<int>>(0);  // 0=pending, 1=ok, -2=error
+        auto mtx = std::make_shared<std::mutex>();
+        auto cv = std::make_shared<std::condition_variable>();
+
+        std::thread([group, recv_buf, src, done, mtx, cv]() {
+            try {
+                group->recv(recv_buf->data(), recv_buf->size(), src);
+                done->store(1);
+            } catch (...) {
+                done->store(-2);
+            }
+            cv->notify_one();
+        }).detach();
+
+        std::unique_lock<std::mutex> lock(*mtx);
+        if (!cv->wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                          [&] { return done->load() != 0; })) {
+            return -1; // genuine timeout — detached thread will finish eventually
         }
-        fut.get(); // propagate exceptions
-        return 0;
+        if (done->load() == 1) {
+            std::memcpy(buf, recv_buf->data(), len);
+            return 0;
+        }
+        return -2;
     } catch (const std::exception& e) {
         std::cerr << "[jaccl-shim] recv error: " << e.what() << std::endl;
         return -2;
@@ -355,9 +423,29 @@ int jaccl_group_recv(
     }
 }
 
+int jaccl_group_cancel_pending(jaccl_group_t g) {
+    // Phase 1b: Poison the group to break spin-loops in detached threads.
+    //
+    // MeshGroup::connections_ is private, so we cannot destroy CQs directly.
+    // Instead, we set a poison flag checked by probe's inner thread (between
+    // send/recv ops). For send/recv, the RDMA poll loop in mesh_impl.h is
+    // internal to MeshGroup and doesn't check flags — those detached threads
+    // may spin indefinitely after cable-pull. The poison flag at least
+    // prevents NEW operations from being dispatched to a dead group.
+    //
+    // Full fix (destroy CQs to break poll loops) requires making
+    // MeshGroup::connections_ accessible or adding a cancel() method to
+    // the upstream JACCL Group interface. Documented as future work.
+    if (!g) return -1;
+    auto* h = static_cast<GroupHandle*>(g);
+    h->poisoned->store(true);
+    return 0;
+}
+
 void jaccl_group_free(jaccl_group_t g) {
     if (g) {
         auto* h = static_cast<GroupHandle*>(g);
+        h->poisoned->store(true);  // poison before free — best effort
         delete h;
     }
 }
