@@ -1,0 +1,256 @@
+// Copyright 2026 r1o project. JACCL C shim for Rust FFI.
+// Wraps MeshGroup via the void* Group API with timeout + probes.
+
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <sstream>
+
+#include <json.hpp>
+
+#include "jaccl/jaccl.h"
+#include "jaccl/jaccl_shim.h"
+#include "jaccl/rdma.h"
+
+using json = nlohmann::json;
+
+namespace {
+
+// Duplicate of parse_devices_json from jaccl.cpp (lives in anon namespace there)
+std::vector<std::vector<std::vector<std::string>>>
+parse_devices(const char* path) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+        throw std::runtime_error(
+            std::string("[jaccl-shim] Cannot open devices file: ") + path);
+    }
+    json devices = json::parse(f);
+    if (!devices.is_array()) {
+        throw std::runtime_error("[jaccl-shim] Device file must be a JSON array");
+    }
+    std::vector<std::vector<std::vector<std::string>>> result(devices.size());
+    for (size_t rank = 0; rank < devices.size(); rank++) {
+        auto conn = devices[rank];
+        result[rank].resize(conn.size());
+        for (size_t dst = 0; dst < conn.size(); dst++) {
+            auto names = conn[dst];
+            if (names.is_string()) {
+                result[rank][dst].push_back(names);
+            } else if (names.is_array()) {
+                for (auto& n : names) {
+                    result[rank][dst].push_back(n);
+                }
+            }
+            // null entries are fine — they map to empty vectors
+        }
+    }
+    return result;
+}
+
+// Stored as shared_ptr to prevent accidental double-free
+struct GroupHandle {
+    std::shared_ptr<jaccl::Group> group;
+};
+
+} // namespace
+
+extern "C" {
+
+bool jaccl_is_available(void) {
+    try {
+        return jaccl::is_available();
+    } catch (...) {
+        return false;
+    }
+}
+
+int jaccl_pd_budget_probe(const char* device_name) {
+    try {
+        auto& ibv = jaccl::ibv();
+        if (!ibv.is_available()) return -1;
+
+        int num_devices = 0;
+        ibv_device** devices = ibv.get_device_list(&num_devices);
+        if (!devices) return -1;
+
+        ibv_context* ctx = nullptr;
+        for (int i = 0; i < num_devices; i++) {
+            if (std::strcmp(ibv.get_device_name(devices[i]), device_name) == 0) {
+                ctx = ibv.open_device(devices[i]);
+                break;
+            }
+        }
+        ibv.free_device_list(devices);
+        if (!ctx) return -1;
+
+        // Try to allocate a PD — if it succeeds, we still have budget
+        ibv_pd* pd = ibv.alloc_pd(ctx);
+        if (!pd) {
+            ibv.close_device(ctx);
+            return 0; // PD exhausted
+        }
+        ibv.dealloc_pd(pd);
+        ibv.close_device(ctx);
+        return 1; // At least 1 PD available (we don't know exact count)
+    } catch (...) {
+        return -1;
+    }
+}
+
+jaccl_group_t jaccl_init_mesh(
+    int rank,
+    int world_size,
+    const char* coordinator_ip,
+    int coordinator_port,
+    const char* devices_json_path,
+    int timeout_ms
+) {
+    try {
+        // Build coordinator string "ip:port"
+        std::ostringstream coord;
+        coord << coordinator_ip << ":" << coordinator_port;
+
+        // Parse devices JSON
+        auto devices = parse_devices(devices_json_path);
+
+        // Build Config
+        jaccl::Config cfg;
+        cfg.set_rank(rank)
+           .set_coordinator(coord.str())
+           .set_devices(std::move(devices));
+
+        // Init with timeout via async
+        auto fut = std::async(std::launch::async, [&]() {
+            return jaccl::init(cfg, /*strict=*/true);
+        });
+
+        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
+        if (status == std::future_status::timeout) {
+            std::cerr << "[jaccl-shim] init timed out after "
+                      << timeout_ms << "ms" << std::endl;
+            return nullptr;
+        }
+
+        auto group = fut.get();
+        if (!group) return nullptr;
+
+        auto* handle = new GroupHandle{std::move(group)};
+        return static_cast<jaccl_group_t>(handle);
+    } catch (const std::exception& e) {
+        std::cerr << "[jaccl-shim] init failed: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        std::cerr << "[jaccl-shim] init failed: unknown error" << std::endl;
+        return nullptr;
+    }
+}
+
+int jaccl_group_rank(jaccl_group_t g) {
+    try {
+        auto* h = static_cast<GroupHandle*>(g);
+        return h->group->rank();
+    } catch (...) {
+        return -1;
+    }
+}
+
+int jaccl_group_size(jaccl_group_t g) {
+    try {
+        auto* h = static_cast<GroupHandle*>(g);
+        return h->group->size();
+    } catch (...) {
+        return -1;
+    }
+}
+
+int jaccl_group_probe(jaccl_group_t g) {
+    try {
+        auto* h = static_cast<GroupHandle*>(g);
+        int rank = h->group->rank();
+        int size = h->group->size();
+        if (size < 2) return -1;
+
+        // Send 1 byte to peer and recv 1 byte back
+        uint8_t probe_byte = 0xAB;
+        uint8_t recv_byte = 0;
+        int peer = (rank == 0) ? 1 : 0;
+
+        // Use async with 2-second timeout
+        auto fut = std::async(std::launch::async, [&]() {
+            if (rank == 0) {
+                h->group->send(&probe_byte, 1, peer);
+                h->group->recv(&recv_byte, 1, peer);
+            } else {
+                h->group->recv(&recv_byte, 1, peer);
+                h->group->send(&probe_byte, 1, peer);
+            }
+        });
+
+        auto status = fut.wait_for(std::chrono::seconds(2));
+        if (status == std::future_status::timeout) {
+            return -1; // QP stale
+        }
+        fut.get(); // propagate exceptions
+        return 0;  // alive
+    } catch (...) {
+        return -1; // QP stale or error
+    }
+}
+
+int jaccl_group_send(
+    jaccl_group_t g, const void* buf, size_t len,
+    int dst, int timeout_ms
+) {
+    try {
+        auto* h = static_cast<GroupHandle*>(g);
+        auto fut = std::async(std::launch::async, [&]() {
+            h->group->send(buf, len, dst);
+        });
+        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
+        if (status == std::future_status::timeout) {
+            return -1; // timeout
+        }
+        fut.get(); // propagate exceptions
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[jaccl-shim] send error: " << e.what() << std::endl;
+        return -2;
+    } catch (...) {
+        return -2;
+    }
+}
+
+int jaccl_group_recv(
+    jaccl_group_t g, void* buf, size_t len,
+    int src, int timeout_ms
+) {
+    try {
+        auto* h = static_cast<GroupHandle*>(g);
+        auto fut = std::async(std::launch::async, [&]() {
+            h->group->recv(buf, len, src);
+        });
+        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
+        if (status == std::future_status::timeout) {
+            return -1; // timeout
+        }
+        fut.get(); // propagate exceptions
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[jaccl-shim] recv error: " << e.what() << std::endl;
+        return -2;
+    } catch (...) {
+        return -2;
+    }
+}
+
+void jaccl_group_free(jaccl_group_t g) {
+    if (g) {
+        auto* h = static_cast<GroupHandle*>(g);
+        delete h;
+    }
+}
+
+} // extern "C"
