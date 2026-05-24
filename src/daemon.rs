@@ -2572,22 +2572,70 @@ async fn rdma_setup_handler(
 
 /// GET /rdma/health → per-device PD budget and port state.
 ///
-/// Shells out to `asmi-pd-probe` (a small C binary using libibverbs) to get
-/// per-RDMA-device health: port state, max PD/QP/MR limits, and whether a PD
-/// can still be allocated. This is the data the web UI's networking section
-/// uses to show PD exhaustion warnings.
+/// When compiled with `--features jaccl`, uses the native JACCL FFI to probe
+/// PD budget directly (no shell-out). Otherwise falls back to `asmi-pd-probe`
+/// binary or `ibv_devinfo` text parsing.
 ///
-/// Fallback: if r1o-pd-probe is not installed, runs ibv_devinfo and parses text.
+/// This is the data the web UI's networking section uses to show PD exhaustion
+/// warnings.
 async fn rdma_health_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // ── Native FFI path (jaccl feature) ──────────────────────────────
+    #[cfg(feature = "jaccl")]
+    {
+        use asmi_core::jaccl_ffi;
+
+        let jaccl_available = jaccl_ffi::available();
+
+        if jaccl_available {
+            // Discover devices via ibv_devinfo (names only) then probe each
+            // natively. We still need device names from ibv_devinfo but avoid
+            // the heavier asmi-pd-probe binary.
+            use tokio::process::Command;
+
+            let devinfo = Command::new("ibv_devinfo")
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+
+            let mut devices = Vec::new();
+            for line in devinfo.lines() {
+                let trimmed = line.trim();
+                if let Some(name) = trimmed.strip_prefix("hca_id:") {
+                    let name = name.trim().to_string();
+                    let pd_status = jaccl_ffi::pd_probe(&name);
+                    devices.push(serde_json::json!({
+                        "name": name,
+                        "pd_available": pd_status == 1,
+                        "pd_probe_raw": pd_status,
+                    }));
+                }
+            }
+
+            return Json(serde_json::json!({
+                "hostname": state.hostname,
+                "probe": "jaccl-native-ffi",
+                "jaccl_available": true,
+                "rdma": { "devices": devices },
+            }));
+        }
+
+        // JACCL compiled in but libibverbs not loadable — fall through
+        // to shell-out path below.
+    }
+
+    // ── Shell-out path (no jaccl feature, or libibverbs not available) ──
     use tokio::process::Command;
 
-    // Primary: r1o-pd-probe returns structured JSON
+    // Primary: asmi-pd-probe returns structured JSON
     if let Ok(output) = Command::new("asmi-pd-probe").output().await {
         if output.status.success() {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
                 return Json(serde_json::json!({
                     "hostname": state.hostname,
-                    "probe": "r1o-pd-probe",
+                    "probe": "asmi-pd-probe",
                     "rdma": json,
                 }));
             }

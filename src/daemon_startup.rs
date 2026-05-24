@@ -337,7 +337,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
     {
         let nm = Arc::clone(&node_map);
         tokio::spawn(async move {
-            let report = rdma_autosetup::autosetup(&nm).await;
+            let report = rdma_autosetup::autosetup(&nm, None).await;
             let peers = report.peers.verified_links.len();
             if peers > 0 {
                 eprintln!("  RDMA: {peers} peers verified, hostfile: {}", report.hostfile.as_deref().unwrap_or("none"));

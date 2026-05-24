@@ -51,3 +51,4 @@ objc2-io-surface = { version = "0.3", optional = true, features = ["IOSurfaceRef
 [features]
 default = []
 ane = ["dep:ane-runtime", "dep:objc2-io-surface"]
+jaccl = ["asmi-core/jaccl"]
