@@ -364,6 +364,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         watchdog: wd,
         ane: AneState::new(_experimental_ane),
         egpu_cache,
+        jaccl_groups: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = daemon::build_router(app_state);

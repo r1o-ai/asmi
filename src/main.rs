@@ -7,6 +7,7 @@ mod rdma_autosetup;
 mod serve;
 mod setup;
 mod topology;
+mod transfer;
 mod watchdog;
 
 use anyhow::Result;

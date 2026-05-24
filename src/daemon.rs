@@ -45,6 +45,8 @@ pub struct AppState {
     pub watchdog: Arc<crate::watchdog::Watchdog>,
     pub ane: crate::ane::AneState,
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
+    /// JACCL transfer group cache — keyed by "peer:model_dir".
+    pub jaccl_groups: Arc<std::sync::Mutex<HashMap<String, crate::transfer::TransferGroupHandle>>>,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -3120,6 +3122,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/bridge0/destroy", post(bridge0_destroy_handler))
         .route("/bridge0/restore", post(bridge0_restore_handler))
         .route("/prep", post(prep_handler))
+        // Native RDMA file transfer (gated by --features jaccl)
+        .route("/transfer", post(crate::transfer::transfer_handler))
+        .route("/transfer/accept", post(crate::transfer::transfer_accept_handler))
         // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
         .route("/ane/compute", get(crate::ane::status_handler))
         .route("/ane/eval", post(crate::ane::eval_handler))
