@@ -166,21 +166,25 @@ jaccl_group_t jaccl_init_mesh_auto(
 
         if (active_device.empty()) return nullptr;
 
-        // Build device_names: self="" for own rank, active_device for all peers
-        std::vector<std::string> device_names(world_size);
+        // Build device_names on the heap — shared ownership so the async
+        // lambda outlives this stack frame on timeout (Bug 1 fix, Phase 1).
+        auto device_names = std::make_shared<std::vector<std::string>>(world_size);
         for (int i = 0; i < world_size; i++) {
-            device_names[i] = (i == rank) ? "" : active_device;
+            (*device_names)[i] = (i == rank) ? "" : active_device;
         }
 
-        // Build coordinator string
-        std::ostringstream coord;
-        coord << coordinator_ip << ":" << coordinator_port;
+        // Build coordinator string on the heap (same reason)
+        auto coord_str = std::make_shared<std::string>(
+            std::string(coordinator_ip) + ":" + std::to_string(coordinator_port));
 
-        // Construct MeshGroup directly (bypasses Config + devices JSON)
-        auto fut = std::async(std::launch::async, [&]() -> std::shared_ptr<jaccl::Group> {
-            return std::make_shared<jaccl::MeshGroup>(
-                rank, device_names, coord.str());
-        });
+        // Construct MeshGroup directly (bypasses Config + devices JSON).
+        // Capture by value (shared_ptr copies) — NOT [&] — so the lambda
+        // owns the data even if this function returns on timeout.
+        auto fut = std::async(std::launch::async,
+            [rank, device_names, coord_str]() -> std::shared_ptr<jaccl::Group> {
+                return std::make_shared<jaccl::MeshGroup>(
+                    rank, *device_names, *coord_str);
+            });
 
         auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
         if (status == std::future_status::timeout) {
@@ -212,22 +216,24 @@ jaccl_group_t jaccl_init_mesh(
     int timeout_ms
 ) {
     try {
-        // Build coordinator string "ip:port"
-        std::ostringstream coord;
-        coord << coordinator_ip << ":" << coordinator_port;
+        // Build coordinator string on the heap — shared ownership so the
+        // async lambda outlives this stack frame on timeout (Bug 1 fix, Phase 1).
+        auto coord_str = std::make_shared<std::string>(
+            std::string(coordinator_ip) + ":" + std::to_string(coordinator_port));
 
         // Parse devices JSON
         auto devices = parse_devices(devices_json_path);
 
-        // Build Config
-        jaccl::Config cfg;
-        cfg.set_rank(rank)
-           .set_coordinator(coord.str())
+        // Build Config on the heap (same reason — [&] capture is UB on timeout)
+        auto cfg = std::make_shared<jaccl::Config>();
+        cfg->set_rank(rank)
+           .set_coordinator(*coord_str)
            .set_devices(std::move(devices));
 
-        // Init with timeout via async
-        auto fut = std::async(std::launch::async, [&]() {
-            return jaccl::init(cfg, /*strict=*/true);
+        // Init with timeout via async.
+        // Capture by value (shared_ptr copies) — NOT [&].
+        auto fut = std::async(std::launch::async, [cfg]() {
+            return jaccl::init(*cfg, /*strict=*/true);
         });
 
         auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
