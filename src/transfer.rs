@@ -543,9 +543,10 @@ async fn transfer_pipeline(
         return;
     }
 
-    // 5b. Brief yield — let the worker thread pick up the command and open
-    //     the TCP listener before rank 1 tries to connect.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // 5b. Yield — let the worker thread pick up the command and open
+    //     the TCP listener before rank 1 tries to connect. 500ms is
+    //     generous; the worker only needs to dequeue + enter jaccl_init_mesh.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 5c. Notify peer to connect (coordinator listener is already up).
     let peer_req = TransferAcceptRequest {
@@ -649,7 +650,23 @@ async fn accept_worker(
     peer_device: Option<String>,
     coordinator_device: Option<String>,
 ) {
-    // Init group via worker channel
+    // Validate coordinator-supplied device name against local ibverbs
+    let validated_local = match peer_device {
+        Some(ref dev) => {
+            let d = dev.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                asmi_core::jaccl_ffi::pd_probe(&d)
+            }).await.unwrap_or(-1);
+            if probe > 0 {
+                Some(dev.clone())
+            } else {
+                tracing::warn!(%dev, probe, "coordinator-supplied device not valid locally, using auto");
+                None
+            }
+        }
+        None => None,
+    };
+
     let peer_key = format!("accept:{model_dir}");
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -658,7 +675,7 @@ async fn accept_worker(
         rank: 1,
         coordinator_ip: coordinator_ip.to_string(),
         coordinator_port: Some(coordinator_port),
-        local_device: peer_device,
+        local_device: validated_local,
         peer_device: coordinator_device,
         reply: reply_tx,
     }) {
