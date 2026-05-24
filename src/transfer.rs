@@ -285,7 +285,7 @@ async fn transfer_pipeline(
     // ── 1. Preflight: PD probe ──────────────────────────────────────────
     let _ = tx.send(SseEvent::stage("preflight").to_sse_line()).await;
 
-    let pd_ok = tokio::task::spawn_blocking(|| jaccl_ffi::pd_probe("mlx5_0"))
+    let pd_ok = tokio::task::spawn_blocking(|| jaccl_ffi::pd_probe_any_active())
         .await
         .unwrap_or(-1);
 
@@ -340,10 +340,17 @@ async fn transfer_pipeline(
         rank: 1,
         size: 2,
     };
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .no_proxy()
         .build()
-        .unwrap_or_default();
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(SseEvent::error(&format!("HTTP client build failed: {e}")).to_sse_line()).await;
+            return;
+        }
+    };
 
     let peer_url = format!("http://{}:9090/transfer/accept", peer_ip);
     let peer_resp = client.post(&peer_url).json(&peer_req).send().await;
@@ -356,7 +363,7 @@ async fn transfer_pipeline(
             return;
         }
         Err(e) => {
-            let _ = tx.send(SseEvent::error(&format!("peer unreachable: {e}")).to_sse_line()).await;
+            let _ = tx.send(SseEvent::error(&format!("peer unreachable: {e:#}")).to_sse_line()).await;
             return;
         }
     }
@@ -417,18 +424,11 @@ fn coordinator_worker(
 ) -> Result<(u64, TransferGroupHandle), String> {
     use asmi_core::jaccl_ffi;
 
-    let devices_path = std::env::temp_dir()
-        .join("asmi-transfer-devices.json")
-        .to_string_lossy()
-        .to_string();
-    let _ = std::fs::write(&devices_path, "{}");
-
-    let group = jaccl_ffi::JacclGroup::new(
+    let group = jaccl_ffi::JacclGroup::new_auto(
         0,                  // rank 0 = coordinator
         2,                  // world_size
         local_ip,
         coordinator_port,
-        &devices_path,
         30_000,             // 30s handshake timeout
     ).ok_or_else(|| "JACCL group init failed (handshake timeout or device error)".to_string())?;
 
@@ -464,18 +464,11 @@ fn accept_worker(
 ) {
     use asmi_core::jaccl_ffi;
 
-    let devices_path = std::env::temp_dir()
-        .join("asmi-transfer-accept-devices.json")
-        .to_string_lossy()
-        .to_string();
-    let _ = std::fs::write(&devices_path, "{}");
-
-    let group = match jaccl_ffi::JacclGroup::new(
+    let group = match jaccl_ffi::JacclGroup::new_auto(
         1,                  // rank 1 = peer
         2,                  // world_size
         coordinator_ip,
         coordinator_port,
-        &devices_path,
         30_000,             // 30s timeout
     ) {
         Some(g) => g,

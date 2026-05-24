@@ -17,6 +17,15 @@ use std::ptr;
 unsafe extern "C" {
     fn jaccl_is_available() -> bool;
     fn jaccl_pd_budget_probe(device_name: *const c_char) -> c_int;
+    fn jaccl_pd_probe_any_active() -> c_int;
+
+    fn jaccl_init_mesh_auto(
+        rank: c_int,
+        world_size: c_int,
+        coordinator_ip: *const c_char,
+        coordinator_port: c_int,
+        timeout_ms: c_int,
+    ) -> *mut c_void;
 
     fn jaccl_init_mesh(
         rank: c_int,
@@ -61,16 +70,17 @@ pub fn available() -> bool {
 }
 
 /// Probe the PD budget for a named RDMA device.
-///
-/// Returns:
-/// -  `1` — at least one PD can still be allocated
-/// -  `0` — PD exhausted
-/// - `-1` — error (device not found, libibverbs unavailable, etc.)
 pub fn pd_probe(device_name: &str) -> i32 {
     let Ok(c_name) = CString::new(device_name) else {
         return -1;
     };
     unsafe { jaccl_pd_budget_probe(c_name.as_ptr()) }
+}
+
+/// Probe PD budget on any available RDMA device.
+/// Returns 1 (ok), 0 (all exhausted), -1 (no devices).
+pub fn pd_probe_any_active() -> i32 {
+    unsafe { jaccl_pd_probe_any_active() }
 }
 
 /// Transfer error codes returned by send/recv.
@@ -149,6 +159,29 @@ impl JacclGroup {
             )
         };
 
+        if handle.is_null() {
+            None
+        } else {
+            Some(JacclGroup {
+                handle,
+                _not_send_sync: PhantomData,
+            })
+        }
+    }
+
+    /// Auto-discover RDMA devices and init a MeshGroup.
+    /// No devices JSON file needed — finds the first active device automatically.
+    pub fn new_auto(
+        rank: i32,
+        world_size: i32,
+        coordinator_ip: &str,
+        coordinator_port: i32,
+        timeout_ms: i32,
+    ) -> Option<Self> {
+        let c_ip = CString::new(coordinator_ip).ok()?;
+        let handle = unsafe {
+            jaccl_init_mesh_auto(rank, world_size, c_ip.as_ptr(), coordinator_port, timeout_ms)
+        };
         if handle.is_null() {
             None
         } else {

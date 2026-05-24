@@ -14,8 +14,9 @@ typedef void* jaccl_group_t;
 /* -- Availability + PD health -- */
 bool jaccl_is_available(void);
 int  jaccl_pd_budget_probe(const char* device_name);
-     /* Returns remaining PD slots, or -1 on error.
-        Allocates+immediately-deallocates one PD to test. */
+int  jaccl_pd_probe_any_active(void);
+     /* Probe PD budget on the first available RDMA device.
+        Returns 1 (ok), 0 (exhausted), -1 (no devices). */
 
 /* -- Group lifecycle -- */
 jaccl_group_t jaccl_init_mesh(
@@ -26,7 +27,16 @@ jaccl_group_t jaccl_init_mesh(
     const char* devices_json_path,
     int timeout_ms             /* wallclock timeout for QP handshake */
 );
-/* Returns NULL on failure. Caller must check. */
+
+jaccl_group_t jaccl_init_mesh_auto(
+    int rank,
+    int world_size,
+    const char* coordinator_ip,
+    int coordinator_port,
+    int timeout_ms
+);
+/* Auto-discovers RDMA devices — no devices JSON file needed.
+   Finds first active device per peer slot. Returns NULL on failure. */
 
 int  jaccl_group_rank(jaccl_group_t g);
 int  jaccl_group_size(jaccl_group_t g);

@@ -14,6 +14,7 @@
 #include "jaccl/jaccl.h"
 #include "jaccl/jaccl_shim.h"
 #include "jaccl/rdma.h"
+#include "jaccl/mesh.h"
 
 using json = nlohmann::json;
 
@@ -97,6 +98,108 @@ int jaccl_pd_budget_probe(const char* device_name) {
         return 1; // At least 1 PD available (we don't know exact count)
     } catch (...) {
         return -1;
+    }
+}
+
+int jaccl_pd_probe_any_active(void) {
+    try {
+        auto& ibv = jaccl::ibv();
+        if (!ibv.is_available()) return -1;
+
+        int num_devices = 0;
+        ibv_device** devices = ibv.get_device_list(&num_devices);
+        if (!devices || num_devices == 0) return -1;
+
+        int result = -1;
+        for (int i = 0; i < num_devices; i++) {
+            ibv_context* ctx = ibv.open_device(devices[i]);
+            if (!ctx) continue;
+
+            ibv_pd* pd = ibv.alloc_pd(ctx);
+            if (pd) {
+                ibv.dealloc_pd(pd);
+                ibv.close_device(ctx);
+                ibv.free_device_list(devices);
+                return 1; // at least one device has PD budget
+            }
+            ibv.close_device(ctx);
+            result = 0; // opened a device but PD exhausted — keep trying others
+        }
+        ibv.free_device_list(devices);
+        return result;
+    } catch (...) {
+        return -1;
+    }
+}
+
+jaccl_group_t jaccl_init_mesh_auto(
+    int rank,
+    int world_size,
+    const char* coordinator_ip,
+    int coordinator_port,
+    int timeout_ms
+) {
+    try {
+        auto& ibv = jaccl::ibv();
+        if (!ibv.is_available()) return nullptr;
+
+        // Discover first available RDMA device
+        int num_devices = 0;
+        ibv_device** devices = ibv.get_device_list(&num_devices);
+        if (!devices || num_devices == 0) return nullptr;
+
+        std::string active_device;
+        for (int i = 0; i < num_devices; i++) {
+            ibv_context* ctx = ibv.open_device(devices[i]);
+            if (!ctx) continue;
+            // Check if PD can be allocated (device is usable)
+            ibv_pd* pd = ibv.alloc_pd(ctx);
+            if (pd) {
+                active_device = ibv.get_device_name(devices[i]);
+                ibv.dealloc_pd(pd);
+                ibv.close_device(ctx);
+                break;
+            }
+            ibv.close_device(ctx);
+        }
+        ibv.free_device_list(devices);
+
+        if (active_device.empty()) return nullptr;
+
+        // Build device_names: self="" for own rank, active_device for all peers
+        std::vector<std::string> device_names(world_size);
+        for (int i = 0; i < world_size; i++) {
+            device_names[i] = (i == rank) ? "" : active_device;
+        }
+
+        // Build coordinator string
+        std::ostringstream coord;
+        coord << coordinator_ip << ":" << coordinator_port;
+
+        // Construct MeshGroup directly (bypasses Config + devices JSON)
+        auto fut = std::async(std::launch::async, [&]() -> std::shared_ptr<jaccl::Group> {
+            return std::make_shared<jaccl::MeshGroup>(
+                rank, device_names, coord.str());
+        });
+
+        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
+        if (status == std::future_status::timeout) {
+            std::cerr << "[jaccl-shim] init_auto timed out after "
+                      << timeout_ms << "ms" << std::endl;
+            return nullptr;
+        }
+
+        auto group = fut.get();
+        if (!group) return nullptr;
+
+        auto* handle = new GroupHandle;
+        handle->group = group;
+        return static_cast<jaccl_group_t>(handle);
+    } catch (const std::exception& e) {
+        std::cerr << "[jaccl-shim] init_auto failed: " << e.what() << std::endl;
+        return nullptr;
+    } catch (...) {
+        return nullptr;
     }
 }
 
