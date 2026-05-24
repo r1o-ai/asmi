@@ -187,27 +187,54 @@ jaccl_group_t jaccl_init_mesh_auto(
         auto coord_str = std::make_shared<std::string>(
             std::string(coordinator_ip) + ":" + std::to_string(coordinator_port));
 
-        // Construct MeshGroup directly (bypasses Config + devices JSON).
-        // Capture by value (shared_ptr copies) — NOT [&] — so the lambda
-        // owns the data even if this function returns on timeout.
-        auto fut = std::async(std::launch::async,
-            [rank, device_names, coord_str]() -> std::shared_ptr<jaccl::Group> {
-                return std::make_shared<jaccl::MeshGroup>(
-                    rank, *device_names, *coord_str);
-            });
+        // Phase 2: std::thread::detach replaces std::async.
+        // std::async's future dtor blocks on timeout → function hangs.
+        // With detach, timeout returns nullptr immediately. The detached
+        // thread owns all data via shared_ptr — when MeshGroup ctor
+        // finishes (success or failure), shared_ptrs drop → RAII cleans
+        // up PDs. No PD leak.
+        auto group_out = std::make_shared<std::shared_ptr<jaccl::Group>>(nullptr);
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto mtx = std::make_shared<std::mutex>();
+        auto cv = std::make_shared<std::condition_variable>();
 
-        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
-        if (status == std::future_status::timeout) {
-            std::cerr << "[jaccl-shim] init_auto timed out after "
-                      << timeout_ms << "ms" << std::endl;
-            return nullptr;
+        std::thread([rank, device_names, coord_str, group_out, done, mtx, cv]() {
+            try {
+                auto g = std::make_shared<jaccl::MeshGroup>(
+                    rank, *device_names, *coord_str);
+                {
+                    std::lock_guard<std::mutex> lock(*mtx);
+                    *group_out = g;
+                    done->store(true);
+                }
+                cv->notify_one();
+            } catch (const std::exception& e) {
+                std::cerr << "[jaccl-shim] init_auto thread failed: "
+                          << e.what() << std::endl;
+                done->store(true);
+                cv->notify_one();
+            } catch (...) {
+                done->store(true);
+                cv->notify_one();
+            }
+        }).detach();
+
+        {
+            std::unique_lock<std::mutex> lock(*mtx);
+            if (!cv->wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                              [&] { return done->load(); })) {
+                // Timeout — thread still running but will clean up via RAII
+                // when shared_ptrs drop. PDs recovered.
+                std::cerr << "[jaccl-shim] init_auto timed out after "
+                          << timeout_ms << "ms" << std::endl;
+                return nullptr;
+            }
         }
 
-        auto group = fut.get();
-        if (!group) return nullptr;
+        if (!*group_out) return nullptr;
 
         auto* handle = new GroupHandle;
-        handle->group = group;
+        handle->group = *group_out;
         return static_cast<jaccl_group_t>(handle);
     } catch (const std::exception& e) {
         std::cerr << "[jaccl-shim] init_auto failed: " << e.what() << std::endl;
@@ -240,23 +267,47 @@ jaccl_group_t jaccl_init_mesh(
            .set_coordinator(*coord_str)
            .set_devices(std::move(devices));
 
-        // Init with timeout via async.
-        // Capture by value (shared_ptr copies) — NOT [&].
-        auto fut = std::async(std::launch::async, [cfg]() {
-            return jaccl::init(*cfg, /*strict=*/true);
-        });
+        // Phase 2: std::thread::detach replaces std::async (same pattern
+        // as init_auto). Detached thread owns cfg via shared_ptr — RAII
+        // cleans up PDs on timeout.
+        auto group_out = std::make_shared<std::shared_ptr<jaccl::Group>>(nullptr);
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        auto mtx = std::make_shared<std::mutex>();
+        auto cv = std::make_shared<std::condition_variable>();
 
-        auto status = fut.wait_for(std::chrono::milliseconds(timeout_ms));
-        if (status == std::future_status::timeout) {
-            std::cerr << "[jaccl-shim] init timed out after "
-                      << timeout_ms << "ms" << std::endl;
-            return nullptr;
+        std::thread([cfg, group_out, done, mtx, cv]() {
+            try {
+                auto g = jaccl::init(*cfg, /*strict=*/true);
+                {
+                    std::lock_guard<std::mutex> lock(*mtx);
+                    *group_out = std::move(g);
+                    done->store(true);
+                }
+                cv->notify_one();
+            } catch (const std::exception& e) {
+                std::cerr << "[jaccl-shim] init thread failed: "
+                          << e.what() << std::endl;
+                done->store(true);
+                cv->notify_one();
+            } catch (...) {
+                done->store(true);
+                cv->notify_one();
+            }
+        }).detach();
+
+        {
+            std::unique_lock<std::mutex> lock(*mtx);
+            if (!cv->wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                              [&] { return done->load(); })) {
+                std::cerr << "[jaccl-shim] init timed out after "
+                          << timeout_ms << "ms" << std::endl;
+                return nullptr;
+            }
         }
 
-        auto group = fut.get();
-        if (!group) return nullptr;
+        if (!*group_out) return nullptr;
 
-        auto* handle = new GroupHandle{std::move(group)};
+        auto* handle = new GroupHandle{*group_out};
         return static_cast<jaccl_group_t>(handle);
     } catch (const std::exception& e) {
         std::cerr << "[jaccl-shim] init failed: " << e.what() << std::endl;
