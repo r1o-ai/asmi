@@ -1,0 +1,483 @@
+{
+  "Version": "1.94.1-t00000000-g00000000",
+  "TUN": true,
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "AuthURL": "",
+  "TailscaleIPs": [
+    "100.64.1.1",
+    "fd7a:115c:a1e0::6401:101"
+  ],
+  "Self": {
+    "ID": "nAAAAAAAAAAAAAAAAA",
+    "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1",
+    "HostName": "m3u2",
+    "DNSName": "m3u2.tail1234ab.ts.net.",
+    "OS": "macOS",
+    "UserID": 100000000000001,
+    "TailscaleIPs": [
+      "100.64.1.1",
+      "fd7a:115c:a1e0::6401:101"
+    ],
+    "AllowedIPs": [
+      "100.64.1.1/32",
+      "fd7a:115c:a1e0::6401:101/128"
+    ],
+    "Addrs": [
+      "10.0.0.1:41641"
+    ],
+    "CurAddr": "",
+    "Relay": "lax",
+    "PeerRelay": "",
+    "RxBytes": 0,
+    "TxBytes": 0,
+    "Created": "2025-01-01T00:00:00.000000000Z",
+    "LastWrite": "0001-01-01T00:00:00Z",
+    "LastSeen": "0001-01-01T00:00:00Z",
+    "LastHandshake": "0001-01-01T00:00:00Z",
+    "Online": true,
+    "ExitNode": false,
+    "ExitNodeOption": false,
+    "Active": false,
+    "PeerAPIURL": [
+      "http://100.64.1.1:46036"
+    ],
+    "TaildropTarget": 0,
+    "NoFileSharingReason": "",
+    "Capabilities": [
+      "funnel",
+      "https",
+      "https://tailscale.com/cap/file-sharing",
+      "https://tailscale.com/cap/ssh",
+      "https://tailscale.com/cap/tailnet-lock"
+    ],
+    "CapMap": {
+      "funnel": null,
+      "https": null,
+      "https://tailscale.com/cap/file-sharing": null,
+      "https://tailscale.com/cap/ssh": null,
+      "https://tailscale.com/cap/tailnet-lock": null
+    },
+    "InNetworkMap": true,
+    "InMagicSock": false,
+    "InEngine": false,
+    "KeyExpiry": "2026-12-31T00:00:00Z"
+  },
+  "Health": [],
+  "MagicDNSSuffix": "tail1234ab.ts.net",
+  "CurrentTailnet": {
+    "Name": "user-a@github",
+    "MagicDNSSuffix": "tail1234ab.ts.net",
+    "MagicDNSEnabled": true
+  },
+  "CertDomains": [
+    "m3u2.tail1234ab.ts.net"
+  ],
+  "Peer": {
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2": {
+      "ID": "nBBBBBBBBBBBBBBBBB",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2",
+      "HostName": "node-a",
+      "DNSName": "node-a.tail1234ab.ts.net.",
+      "OS": "macOS",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.2",
+        "fd7a:115c:a1e0::6401:102"
+      ],
+      "AllowedIPs": [
+        "100.64.1.2/32",
+        "fd7a:115c:a1e0::6401:102/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T01:00:00.000000000Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-06-01T00:00:00.000Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.2:41000"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3": {
+      "ID": "nCCCCCCCCCCCCCCCCC",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3",
+      "HostName": "linux-node-a",
+      "DNSName": "linux-node-a.tail1234ab.ts.net.",
+      "OS": "linux",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.3",
+        "fd7a:115c:a1e0::6401:103"
+      ],
+      "AllowedIPs": [
+        "100.64.1.3/32",
+        "fd7a:115c:a1e0::6401:103/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T02:00:00.000000000Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-06-01T00:00:00.000Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.3:41000"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4": {
+      "ID": "nDDDDDDDDDDDDDDDDD",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4",
+      "HostName": "m4m1",
+      "DNSName": "m4m1.tail1234ab.ts.net.",
+      "OS": "macOS",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.4",
+        "fd7a:115c:a1e0::6401:104"
+      ],
+      "AllowedIPs": [
+        "100.64.1.4/32",
+        "fd7a:115c:a1e0::6401:104/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "10.0.0.4:41641",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 1000000,
+      "TxBytes": 500000,
+      "Created": "2025-01-01T03:00:00.000000000Z",
+      "LastWrite": "2026-02-21T00:00:00.000000000Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T00:00:00.000000000Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.64.1.4:41000"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5": {
+      "ID": "nEEEEEEEEEEEEEEEEE",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5",
+      "HostName": "k3s-m3u1",
+      "DNSName": "k3s-m3u1.tail1234ab.ts.net.",
+      "OS": "linux",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.5",
+        "fd7a:115c:a1e0::6401:105"
+      ],
+      "AllowedIPs": [
+        "100.64.1.5/32",
+        "fd7a:115c:a1e0::6401:105/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T04:00:00.000000000Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-06-01T00:00:00.000Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.5:41000"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6": {
+      "ID": "nFFFFFFFFFFFFFFFFF",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6",
+      "HostName": "windows-node-b",
+      "DNSName": "windows-node-b.tail1234ab.ts.net.",
+      "OS": "windows",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.6",
+        "fd7a:115c:a1e0::6401:106"
+      ],
+      "AllowedIPs": [
+        "100.64.1.6/32",
+        "fd7a:115c:a1e0::6401:106/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T05:00:00.000000000Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-06-01T00:00:00.000Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.6:41000"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa7": {
+      "ID": "nGGGGGGGGGGGGGGGGG",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa7",
+      "HostName": "m3u1",
+      "DNSName": "m3u1.tail1234ab.ts.net.",
+      "OS": "macOS",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.7",
+        "fd7a:115c:a1e0::6401:107"
+      ],
+      "AllowedIPs": [
+        "100.64.1.7/32",
+        "fd7a:115c:a1e0::6401:107/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "10.0.0.7:41641",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 1000000,
+      "TxBytes": 500000,
+      "Created": "2025-01-01T06:00:00.000000000Z",
+      "LastWrite": "2026-02-21T00:00:00.000000000Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T00:00:00.000000000Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.64.1.7:41000"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa8": {
+      "ID": "nHHHHHHHHHHHHHHHHH",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa8",
+      "HostName": "MacBookPro",
+      "DNSName": "macbookpro.tail1234ab.ts.net.",
+      "OS": "macOS",
+      "UserID": 100000000000002,
+      "TailscaleIPs": [
+        "100.64.1.8",
+        "fd7a:115c:a1e0::6401:108"
+      ],
+      "AllowedIPs": [
+        "100.64.1.8/32",
+        "fd7a:115c:a1e0::6401:108/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T07:00:00.000000000Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-06-01T00:00:00.000Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.8:41000"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9": {
+      "ID": "nIIIIIIIIIIIIIIIII",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa9",
+      "HostName": "m3u3",
+      "DNSName": "m3u3.tail1234ab.ts.net.",
+      "OS": "macOS",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.9",
+        "fd7a:115c:a1e0::6401:109"
+      ],
+      "AllowedIPs": [
+        "100.64.1.9/32",
+        "fd7a:115c:a1e0::6401:109/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "10.0.0.9:41641",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 5000000,
+      "TxBytes": 2000000,
+      "Created": "2025-01-01T08:00:00.000000000Z",
+      "LastWrite": "2026-02-21T00:00:00.000000000Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "2026-02-21T00:00:00.000000000Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": true,
+      "PeerAPIURL": [
+        "http://100.64.1.9:41000"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10": {
+      "ID": "nJJJJJJJJJJJJJJJJJ",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa10",
+      "HostName": "alienMARIO",
+      "DNSName": "alienmario.tail1234ab.ts.net.",
+      "OS": "windows",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.10",
+        "fd7a:115c:a1e0::6401:10a"
+      ],
+      "AllowedIPs": [
+        "100.64.1.10/32",
+        "fd7a:115c:a1e0::6401:10a/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T09:00:00.000000000Z",
+      "LastWrite": "0001-01-01T00:00:00Z",
+      "LastSeen": "2025-06-01T00:00:00.000Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": false,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.10:41000"
+      ],
+      "TaildropTarget": 5,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    },
+    "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa11": {
+      "ID": "nKKKKKKKKKKKKKKKKK",
+      "PublicKey": "nodekey:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa11",
+      "HostName": "localhost",
+      "DNSName": "iphone-node.tail1234ab.ts.net.",
+      "OS": "iOS",
+      "UserID": 100000000000001,
+      "TailscaleIPs": [
+        "100.64.1.11",
+        "fd7a:115c:a1e0::6401:10b"
+      ],
+      "AllowedIPs": [
+        "100.64.1.11/32",
+        "fd7a:115c:a1e0::6401:10b/128"
+      ],
+      "Addrs": null,
+      "CurAddr": "",
+      "Relay": "lax",
+      "PeerRelay": "",
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "Created": "2025-01-01T10:00:00.000000000Z",
+      "LastWrite": "2026-02-20T00:00:00.000000000Z",
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "LastHandshake": "0001-01-01T00:00:00Z",
+      "Online": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "Active": false,
+      "PeerAPIURL": [
+        "http://100.64.1.11:41000"
+      ],
+      "TaildropTarget": 1,
+      "NoFileSharingReason": "",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": false,
+      "KeyExpiry": "2026-12-31T00:00:00Z"
+    }
+  },
+  "User": {
+    "100000000000001": {
+      "ID": 100000000000001,
+      "LoginName": "user-a@github",
+      "DisplayName": "user-a",
+      "ProfilePicURL": ""
+    },
+    "100000000000002": {
+      "ID": 100000000000002,
+      "LoginName": "user-b@github",
+      "DisplayName": "user-b",
+      "ProfilePicURL": ""
+    }
+  },
+  "ClientVersion": null
+}

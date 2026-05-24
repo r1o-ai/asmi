@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  asmi LaunchDaemon — system domain (system/)
+
+  Install to /Library/LaunchDaemons/com.asmi.daemon.plist  (root:wheel 0644)
+  Bootstrap: sudo launchctl bootstrap system /Library/LaunchDaemons/com.asmi.daemon.plist
+
+  USE THIS when the node boots headless — never signs in at the console.
+  Check with: stat -f '%Su' /dev/console  →  if `root`, use this variant.
+
+  Compared to the LaunchAgent variant:
+  - Label is identical (com.asmi.daemon) so only one variant runs at a time
+  - UserName + GroupName make asmi run as `ma`, not root
+  - EnvironmentVariables set HOME and PATH explicitly (system domain doesn't inherit user env)
+  - WorkingDirectory ensures relative paths and ~/.r1o/ resolution work
+  - Before installing: move the user LaunchAgent aside to prevent conflict
+      mv ~/Library/LaunchAgents/com.asmi.daemon.plist ~/Library/LaunchAgents/com.asmi.daemon.plist.disabled
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.asmi.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ma/.cargo/bin/asmi</string>
+        <string>--serve</string>
+        <string>--port</string>
+        <string>9090</string>
+    </array>
+    <key>UserName</key>
+    <string>ma</string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/ma</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/ma</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/ma/Library/Logs/asmi-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ma/Library/Logs/asmi-daemon.log</string>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+</dict>
+</plist>

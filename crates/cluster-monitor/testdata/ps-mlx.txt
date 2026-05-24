@@ -1,0 +1,5 @@
+runner           62283   0.0 37.8 866456400 202951136   ??  S    12:51AM   1:35.69 /opt/homebrew/Cellar/python@3.14/3.14.2/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python -m mlx_lm.server --model /Users/runner/models/ExampleModel-8bit --port 8003 --host 0.0.0.0
+runner           23397   0.0  0.0 451993888 139712   ??  Ss    9:47PM   0:00.64 /opt/homebrew/Cellar/node/25.4.0/bin/node /Users/runner/.npm/_npx/15c61037b1978c83/node_modules/chrome-devtools-mcp/build/src/telemetry/watchdog/main.js --parent-pid=23396 --app-version=0.17.3 --os-type=2
+runner            2050   0.0  0.0 442226096   2784   ??  S    Thu07PM   1:14.56 /bin/bash /Users/runner/.claude/scripts/node-watchdog.sh
+runner            1889   0.0  0.1 545347728 486144   ??  S    Thu07PM   3:55.46 /Applications/Microsoft Teams.app/Contents/Helpers/Microsoft Teams WebView.app/Contents/MacOS/Microsoft Teams WebView --embedded-browser-webview=1 --noerrdialogs --accept-lang=en-US
+root               585   0.0  0.0 442087232   4848   ??  Ss   Thu07PM   0:04.03 /usr/libexec/watchdogd

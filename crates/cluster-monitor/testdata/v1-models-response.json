@@ -1,0 +1,13 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "mlx-community/Qwen3-32B-4bit",
+      "object": "model",
+      "created": 1706745938,
+      "owned_by": "system",
+      "context_length": 131072,
+      "max_tokens": 16384
+    }
+  ]
+}
