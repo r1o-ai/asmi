@@ -312,14 +312,6 @@ async fn transfer_pipeline(
     // ── 3. Resolve peer IP (mDNS → Tailscale fallback) ──────────────────
     let _ = tx.send(SseEvent::stage("coordinate").to_sse_line()).await;
 
-    let peer_ip = match resolve_peer_ip(&req.peer).await {
-        Some(ip) => ip,
-        None => {
-            let _ = tx.send(SseEvent::error(&format!("cannot resolve peer '{}' — unreachable", req.peer)).to_sse_line()).await;
-            return;
-        }
-    };
-
     // ── 4. Pick a dynamic port ──────────────────────────────────────────
     let coordinator_port = pick_dynamic_port();
 
@@ -340,32 +332,44 @@ async fn transfer_pipeline(
         rank: 1,
         size: 2,
     };
-    let client = match reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .no_proxy()
         .build()
+        .unwrap_or_default();
+
+    // Resolve peer IP via system getent/ping (reqwest async DNS can't do mDNS)
+    let peer_ip = match tokio::process::Command::new("python3")
+        .args(["-c", &format!(
+            "import socket; r=socket.getaddrinfo('{}.local',9090,socket.AF_INET); print(r[0][4][0])",
+            req.peer
+        )])
+        .output().await
     {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(SseEvent::error(&format!("HTTP client build failed: {e}")).to_sse_line()).await;
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => {
+            let _ = tx.send(SseEvent::error(&format!("cannot resolve peer '{}'", req.peer)).to_sse_line()).await;
             return;
         }
     };
-
-    let peer_url = format!("http://{}:9090/transfer/accept", peer_ip);
-    let peer_resp = client.post(&peer_url).json(&peer_req).send().await;
-
-    match peer_resp {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => {
-            let body = r.text().await.unwrap_or_default();
-            let _ = tx.send(SseEvent::error(&format!("peer rejected: {body}")).to_sse_line()).await;
-            return;
+    let peer_urls = vec![
+        format!("http://{}:9090/transfer/accept", peer_ip),
+    ];
+    let mut peer_ok = false;
+    let mut last_err = String::new();
+    for peer_url in &peer_urls {
+        match client.post(peer_url).json(&peer_req).send().await {
+            Ok(r) if r.status().is_success() => { peer_ok = true; break; }
+            Ok(r) => {
+                last_err = r.text().await.unwrap_or_default();
+            }
+            Err(e) => {
+                last_err = format!("{e:#}");
+            }
         }
-        Err(e) => {
-            let _ = tx.send(SseEvent::error(&format!("peer unreachable: {e:#}")).to_sse_line()).await;
-            return;
-        }
+    }
+    if !peer_ok {
+        let _ = tx.send(SseEvent::error(&format!("peer unreachable: {last_err}")).to_sse_line()).await;
+        return;
     }
 
     // ── 7–9. Init + Transfer + Verify ───────────────────────────────────
@@ -795,24 +799,33 @@ fn compute_checksums(model_path: &std::path::Path) -> Result<VerifyManifest, Str
 // Helper functions
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// Resolve a peer hostname to an IP.
-/// Tries mDNS (.local) first, then bare hostname (Tailscale).
+/// Resolve a peer hostname to an IPv4 address.
+/// Prefers IPv4 over IPv6 — link-local IPv6 (fe80::) needs scope IDs
+/// that reqwest doesn't handle. Tries mDNS first, then bare hostname.
 #[cfg(feature = "jaccl")]
 async fn resolve_peer_ip(peer: &str) -> Option<String> {
     use tokio::net::lookup_host;
 
-    // Try mDNS first
+    // Try mDNS first — prefer IPv4
     let mdns = format!("{}.local:9090", peer);
-    if let Ok(mut addrs) = lookup_host(&mdns).await {
-        if let Some(addr) = addrs.next() {
+    if let Ok(addrs) = lookup_host(&mdns).await {
+        let all: Vec<_> = addrs.collect();
+        if let Some(v4) = all.iter().find(|a| a.is_ipv4()) {
+            return Some(v4.ip().to_string());
+        }
+        if let Some(addr) = all.first() {
             return Some(addr.ip().to_string());
         }
     }
 
-    // Fallback: bare hostname (Tailscale / /etc/hosts)
+    // Fallback: bare hostname (Tailscale / /etc/hosts) — prefer IPv4
     let bare = format!("{}:9090", peer);
-    if let Ok(mut addrs) = lookup_host(&bare).await {
-        if let Some(addr) = addrs.next() {
+    if let Ok(addrs) = lookup_host(&bare).await {
+        let all: Vec<_> = addrs.collect();
+        if let Some(v4) = all.iter().find(|a| a.is_ipv4()) {
+            return Some(v4.ip().to_string());
+        }
+        if let Some(addr) = all.first() {
             return Some(addr.ip().to_string());
         }
     }
