@@ -1,0 +1,3 @@
+Vendored from ml-explore/mlx@2165dc08d7b33258260aa849d39f087d50e62962
+Source path: mlx/distributed/jaccl/lib/jaccl/
+Date: 2026-05-23
