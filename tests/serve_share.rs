@@ -460,6 +460,9 @@ async fn test_load_request_json_round_trip_with_all_fields() {
         pipeline: true,
         prompt_cache_size: Some(8),
         prompt_cache_bytes: Some(34359738368),
+        use_mtp: false,
+        cache_type: Some("q8".to_string()),
+        max_tokens: Some(4096),
     };
 
     let json_str = serde_json::to_string(&original).expect("should serialize");
