@@ -280,7 +280,7 @@ async fn test_share_http_nonexistent_model() {
         hostfile: None,
     };
 
-    let start_url = format!("{daemon_base}/serve/share/start");
+    let start_url = format!("{daemon_base}/serve/share");
     let start_resp = client
         .post(&start_url)
         .json(&req)
