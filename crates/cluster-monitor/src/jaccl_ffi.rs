@@ -56,6 +56,7 @@ unsafe extern "C" {
         timeout_ms: c_int,
     ) -> c_int;
 
+    fn jaccl_group_cancel_pending(g: *mut c_void) -> c_int;
     fn jaccl_group_free(g: *mut c_void);
 }
 
@@ -208,6 +209,19 @@ impl JacclGroup {
     /// (e.g. cable reseated). Caller should re-init on `false`.
     pub fn probe(&self) -> bool {
         unsafe { jaccl_group_probe(self.handle) == 0 }
+    }
+
+    /// Poison the group — all future send/recv/probe calls fail immediately.
+    ///
+    /// Does NOT break internal CQ spin-loops (MeshGroup::connections_ is
+    /// private — future work). Call before `drop` when a cable-pull is detected.
+    pub fn cancel_pending(&self) {
+        unsafe { jaccl_group_cancel_pending(self.handle); }
+    }
+
+    /// Raw handle for FFI — used by JacclWorker to avoid lifetime issues.
+    pub fn raw_handle(&self) -> *mut c_void {
+        self.handle
     }
 
     /// Send a buffer to a destination rank.

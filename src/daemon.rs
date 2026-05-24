@@ -45,8 +45,8 @@ pub struct AppState {
     pub watchdog: Arc<crate::watchdog::Watchdog>,
     pub ane: crate::ane::AneState,
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
-    /// JACCL transfer group cache — keyed by "peer:model_dir".
-    pub jaccl_groups: Arc<std::sync::Mutex<HashMap<String, crate::transfer::TransferGroupHandle>>>,
+    /// JACCL worker — dedicated OS thread for all RDMA operations (Phase 3).
+    pub jaccl_worker: Arc<crate::transfer::JacclWorker>,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.

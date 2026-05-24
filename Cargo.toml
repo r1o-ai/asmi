@@ -48,8 +48,9 @@ thiserror = "2"
 ane-runtime = { path = "crates/ane-runtime", optional = true }
 objc2-io-surface = { version = "0.3", optional = true, features = ["IOSurfaceRef"] }
 sha2 = { version = "0.10", optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
 ane = ["dep:ane-runtime", "dep:objc2-io-surface"]
-jaccl = ["asmi-core/jaccl", "dep:sha2"]
+jaccl = ["asmi-core/jaccl", "dep:sha2", "dep:libc"]
