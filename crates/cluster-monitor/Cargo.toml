@@ -34,3 +34,4 @@ tokio = { version = "1", features = ["full"] }
 [features]
 default = []
 ane = ["dep:ane-runtime", "dep:objc2-io-surface", "dep:cc"]
+jaccl = ["dep:cc"]
