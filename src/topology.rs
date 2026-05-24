@@ -58,16 +58,103 @@ fn find_distributed_config() -> Result<String> {
     bail!("mlx.distributed_config not found. Install with: pip install mlx")
 }
 
-/// Discover cluster topology. Tries `mlx.distributed_config` first, falls back
-/// to ARP-based discovery if it fails (e.g., KeyError on freshly-cabled links).
+/// Discover cluster topology. Filters to SSH-reachable hosts first so that
+/// `mlx.distributed_config` doesn't fail due to offline nodes (e.g. marmac).
+/// Falls back to ARP-based discovery if the primary path still fails.
 pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyReport> {
-    match discover_via_mlx(hosts, backend) {
-        Ok(report) => Ok(report),
+    let reachable: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = hosts
+            .iter()
+            .map(|h| {
+                let h = h.clone();
+                s.spawn(move || {
+                    if is_host_reachable(&h) { Some(h) } else { None }
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().unwrap()).collect()
+    });
+
+    for h in hosts {
+        if !reachable.contains(h) {
+            eprintln!("topology: skipping unreachable host {h}");
+        }
+    }
+
+    if reachable.len() < 2 {
+        bail!("need at least 2 reachable hosts for topology, got {}", reachable.len());
+    }
+
+    match discover_via_mlx(&reachable, backend) {
+        Ok(mut report) => {
+            for h in hosts {
+                if !report.nodes.contains(h) {
+                    report.nodes.push(h.clone());
+                }
+            }
+            let missing = compute_missing_links(&report.nodes, &report.links);
+            report.mesh_complete = missing.is_empty();
+            report.missing_links = missing;
+            let n = report.nodes.len();
+            report.jaccl_ready = report.mesh_complete && report.links.len() >= n * (n - 1) / 2;
+            report.jaccl_ready_subsets = find_jaccl_subsets_from_links(&report.nodes, &report.links);
+            Ok(report)
+        }
         Err(e) => {
             eprintln!("mlx.distributed_config failed ({e:#}), falling back to ARP-based discovery");
             discover_via_arp(hosts)
         }
     }
+}
+
+/// Quick SSH reachability check (3s timeout, BatchMode).
+fn is_host_reachable(host: &str) -> bool {
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
+    Command::new("ssh")
+        .args([
+            "-o", "ConnectTimeout=3",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
+            &format!("{user}@{host}"),
+            "true",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Compute missing links (node pairs not directly connected).
+fn compute_missing_links(nodes: &[String], links: &[TopologyLink]) -> Vec<(String, String)> {
+    let connected: HashSet<(String, String)> = links.iter().map(|l| {
+        if l.node_a < l.node_b {
+            (l.node_a.clone(), l.node_b.clone())
+        } else {
+            (l.node_b.clone(), l.node_a.clone())
+        }
+    }).collect();
+    let mut missing = Vec::new();
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            let pair = (nodes[i].clone(), nodes[j].clone());
+            if !connected.contains(&pair) {
+                missing.push(pair);
+            }
+        }
+    }
+    missing
+}
+
+/// Build JACCL-ready subsets from link data (avoids duplicating the connected set logic).
+fn find_jaccl_subsets_from_links(nodes: &[String], links: &[TopologyLink]) -> Vec<Vec<String>> {
+    let connected: HashSet<(String, String)> = links.iter().map(|l| {
+        if l.node_a < l.node_b {
+            (l.node_a.clone(), l.node_b.clone())
+        } else {
+            (l.node_b.clone(), l.node_a.clone())
+        }
+    }).collect();
+    find_jaccl_subsets(nodes, &connected)
 }
 
 /// Primary path: `mlx.distributed_config --dot`.
@@ -159,10 +246,13 @@ fn discover_via_arp(hosts: &[String]) -> Result<TopologyReport> {
                     (remote_host.clone(), host.clone())
                 };
                 if seen_links.insert((a.clone(), b.clone())) {
+                    // Use iface: prefix — these are network interface names (en15),
+                    // NOT ibverbs RDMA device names (rdma_en5). Consumers must
+                    // validate against ibv_devices before using for JACCL init.
                     let (dev_a, dev_b) = if host < remote_host {
-                        (format!("rdma_{local_iface}"), format!("rdma_{remote_iface}"))
+                        (format!("iface:{local_iface}"), format!("iface:{remote_iface}"))
                     } else {
-                        (format!("rdma_{remote_iface}"), format!("rdma_{local_iface}"))
+                        (format!("iface:{remote_iface}"), format!("iface:{local_iface}"))
                     };
                     links.push(TopologyLink {
                         node_a: a,

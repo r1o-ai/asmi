@@ -50,6 +50,12 @@ pub struct TransferAcceptRequest {
     pub rank: i32,
     /// World size (always 2 for point-to-point)
     pub size: i32,
+    /// RDMA device the peer should use (topology-resolved by coordinator)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_device: Option<String>,
+    /// RDMA device the coordinator uses (needed for peer's devices.json matrix)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_device: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -132,6 +138,10 @@ pub enum JacclCmd {
         rank: i32,
         coordinator_ip: String,
         coordinator_port: Option<i32>, // None = pick new port
+        /// Topology-resolved RDMA device on this node (e.g. "rdma_en15").
+        local_device: Option<String>,
+        /// Topology-resolved RDMA device on the peer (e.g. "rdma_en10").
+        peer_device: Option<String>,
         reply: tokio::sync::oneshot::Sender<Result<i32, String>>,
     },
     /// Send data to rank `dst` on the group for `peer`.
@@ -203,14 +213,13 @@ impl JacclWorker {
 
         while let Ok(cmd) = rx.recv() {
             match cmd {
-                JacclCmd::GetOrInitGroup { peer, rank, coordinator_ip, coordinator_port, reply } => {
+                JacclCmd::GetOrInitGroup { peer, rank, coordinator_ip, coordinator_port, local_device, peer_device, reply } => {
                     // Check if we have a cached group that's alive
                     if let Some((group, port)) = groups.get(&peer) {
                         if group.probe() {
                             let _ = reply.send(Ok(*port));
                             continue;
                         }
-                        // Dead group — remove and re-init
                         tracing::info!(%peer, "cached JACCL group is stale, re-initializing");
                     }
                     // Remove stale group (if any)
@@ -221,13 +230,28 @@ impl JacclWorker {
 
                     let port = coordinator_port.unwrap_or_else(pick_dynamic_port);
 
-                    let result = jaccl_ffi::JacclGroup::new_auto(
-                        rank,
-                        2, // world_size always 2 for point-to-point
-                        &coordinator_ip,
-                        port,
-                        30_000, // 30s handshake timeout
-                    );
+                    let result = match (&local_device, &peer_device) {
+                        (Some(local_dev), Some(peer_dev)) => {
+                            match write_devices_json(rank, local_dev, peer_dev) {
+                                Ok(path) => {
+                                    tracing::info!(%peer, %local_dev, %peer_dev, "using topology-resolved RDMA devices");
+                                    let group = jaccl_ffi::JacclGroup::new(
+                                        rank, 2, &coordinator_ip, port, &path, 30_000,
+                                    );
+                                    let _ = std::fs::remove_file(&path);
+                                    group
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%peer, error = %e, "devices.json write failed, falling back to auto");
+                                    jaccl_ffi::JacclGroup::new_auto(rank, 2, &coordinator_ip, port, 30_000)
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::warn!(%peer, "no topology device info, using auto-discover");
+                            jaccl_ffi::JacclGroup::new_auto(rank, 2, &coordinator_ip, port, 30_000)
+                        }
+                    };
 
                     match result {
                         Some(group) => {
@@ -363,8 +387,10 @@ pub async fn transfer_handler(
 
     // Spawn the async pipeline.
     let jaccl_worker = state.jaccl_worker.clone();
+    let topology_cache = state.topology_cache.clone();
+    let hostname = state.hostname.clone();
     tokio::spawn(async move {
-        transfer_pipeline(tx, jaccl_worker, req).await;
+        transfer_pipeline(tx, jaccl_worker, topology_cache, &hostname, req).await;
     });
 
     // Convert the mpsc receiver into an SSE body stream.
@@ -407,6 +433,8 @@ pub async fn transfer_accept_handler(
     let coordinator_ip = req.coordinator_ip.clone();
     let coordinator_port = req.coordinator_port;
     let model_dir = req.model_dir.clone();
+    let peer_device = req.peer_device.clone();
+    let coordinator_device = req.coordinator_device.clone();
 
     // Spawn a task to handle accept (uses JACCL worker channel internally).
     tokio::spawn(async move {
@@ -416,6 +444,8 @@ pub async fn transfer_accept_handler(
             &model_path,
             &model_dir,
             jaccl_worker,
+            peer_device,
+            coordinator_device,
         ).await;
     });
 
@@ -434,6 +464,8 @@ pub async fn transfer_accept_handler(
 async fn transfer_pipeline(
     tx: tokio::sync::mpsc::Sender<String>,
     jaccl_worker: std::sync::Arc<JacclWorker>,
+    topology_cache: TopologyCache,
+    local_hostname: &str,
     req: TransferRequest,
 ) {
     use asmi_core::jaccl_ffi;
@@ -479,47 +511,53 @@ async fn transfer_pipeline(
         }
     };
 
-    // ── 5. Init or reuse group via worker (port pinning) ────────────────
+    // ── 5. Resolve devices + notify peer + init coordinator ───────────
+    //
+    // Ordering is critical: jaccl_init_mesh blocks until all ranks connect.
+    // The coordinator (rank 0) opens a TCP listener; rank 1 connects to it.
+    // If we await init before notifying the peer, we deadlock.
+    //
+    // Flow: pick port → notify peer → start coordinator init → await both.
     let _ = tx.send(SseEvent::stage("init").to_sse_line()).await;
 
+    let devices = resolve_device_for_peer(&topology_cache, local_hostname, &req.peer).await;
+    if let Some((ref ld, ref pd)) = devices {
+        tracing::info!(peer = %req.peer, local_device = %ld, peer_device = %pd, "topology-resolved RDMA devices");
+    }
+
+    let coordinator_port = pick_dynamic_port();
+
+    // 5a. Start coordinator init (non-blocking mpsc send — worker thread
+    //     opens TCP listener while we notify the peer).
     let (init_reply_tx, init_reply_rx) = tokio::sync::oneshot::channel();
     if let Err(e) = jaccl_worker.send(JacclCmd::GetOrInitGroup {
         peer: req.peer.clone(),
-        rank: 0, // coordinator
+        rank: 0,
         coordinator_ip: local_ip.clone(),
-        coordinator_port: None, // worker picks or reuses
+        coordinator_port: Some(coordinator_port),
+        local_device: devices.as_ref().map(|(ld, _)| ld.clone()),
+        peer_device: devices.as_ref().map(|(_, pd)| pd.clone()),
         reply: init_reply_tx,
     }) {
         let _ = tx.send(SseEvent::error(&e).to_sse_line()).await;
         return;
     }
 
-    let coordinator_port = match init_reply_rx.await {
-        Ok(Ok(port)) => port,
-        Ok(Err(e)) => {
-            let _ = tx.send(SseEvent::error(&e).to_sse_line()).await;
-            return;
-        }
-        Err(_) => {
-            let _ = tx.send(SseEvent::error("jaccl worker dropped reply channel").to_sse_line()).await;
-            return;
-        }
-    };
+    // 5b. Brief yield — let the worker thread pick up the command and open
+    //     the TCP listener before rank 1 tries to connect.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // ── 6. Notify peer to accept ────────────────────────────────────────
+    // 5c. Notify peer to connect (coordinator listener is already up).
     let peer_req = TransferAcceptRequest {
         model_dir: req.model_dir.clone(),
         coordinator_ip: local_ip.clone(),
         coordinator_port,
         rank: 1,
         size: 2,
+        peer_device: devices.as_ref().map(|(_, pd)| pd.clone()),
+        coordinator_device: devices.as_ref().map(|(ld, _)| ld.clone()),
     };
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
 
-    // Resolve peer IP via native mDNS (Phase 4)
     let peer_ip = match resolve_peer_mdns(&req.peer) {
         Some(ip) => ip,
         None => {
@@ -527,6 +565,11 @@ async fn transfer_pipeline(
             return;
         }
     };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let peer_url = format!("http://{}:9090/transfer/accept", peer_ip);
     match client.post(&peer_url).json(&peer_req).send().await {
         Ok(r) if r.status().is_success() => {}
@@ -537,6 +580,19 @@ async fn transfer_pipeline(
         }
         Err(e) => {
             let _ = tx.send(SseEvent::error(&format!("peer unreachable: {e:#}")).to_sse_line()).await;
+            return;
+        }
+    }
+
+    // 5d. Await coordinator init result (both sides are handshaking).
+    match init_reply_rx.await {
+        Ok(Ok(_port)) => {}
+        Ok(Err(e)) => {
+            let _ = tx.send(SseEvent::error(&e).to_sse_line()).await;
+            return;
+        }
+        Err(_) => {
+            let _ = tx.send(SseEvent::error("jaccl worker dropped reply channel").to_sse_line()).await;
             return;
         }
     }
@@ -590,6 +646,8 @@ async fn accept_worker(
     model_path: &std::path::Path,
     model_dir: &str,
     jaccl_worker: std::sync::Arc<JacclWorker>,
+    peer_device: Option<String>,
+    coordinator_device: Option<String>,
 ) {
     // Init group via worker channel
     let peer_key = format!("accept:{model_dir}");
@@ -600,6 +658,8 @@ async fn accept_worker(
         rank: 1,
         coordinator_ip: coordinator_ip.to_string(),
         coordinator_port: Some(coordinator_port),
+        local_device: peer_device,
+        peer_device: coordinator_device,
         reply: reply_tx,
     }) {
         tracing::error!("transfer/accept: worker send failed for {model_dir}: {e}");
@@ -955,6 +1015,91 @@ fn compute_checksums(model_path: &std::path::Path) -> Result<VerifyManifest, Str
     }
 
     Ok(VerifyManifest { checksums })
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Topology-aware device resolution
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[cfg(feature = "jaccl")]
+type TopologyCache = std::sync::Arc<tokio::sync::RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>>;
+
+/// Look up the RDMA devices connecting `local_hostname` ↔ `peer` from the
+/// cached topology report. Returns `(local_device, peer_device)`.
+///
+/// Validates that the local device actually exists in ibverbs (the topology
+/// layer may report network interface names that don't match RDMA device names).
+#[cfg(feature = "jaccl")]
+async fn resolve_device_for_peer(
+    topology_cache: &TopologyCache,
+    local_hostname: &str,
+    peer: &str,
+) -> Option<(String, String)> {
+    let cache = topology_cache.read().await;
+    let (report, _) = cache.as_ref()?;
+
+    for link in &report.links {
+        let (local_dev, peer_dev) = if link.node_a == local_hostname && link.node_b == peer {
+            (link.device_a.clone(), link.device_b.clone())
+        } else if link.node_b == local_hostname && link.node_a == peer {
+            (link.device_b.clone(), link.device_a.clone())
+        } else {
+            continue;
+        };
+
+        // Reject ARP-fallback interface names (iface:en15 is NOT an RDMA device)
+        if local_dev.starts_with("iface:") || peer_dev.starts_with("iface:") {
+            tracing::warn!(
+                %local_dev, %peer_dev,
+                "topology has network interface names, not RDMA devices — falling back to auto-discover"
+            );
+            return None;
+        }
+
+        // Validate: check that local device exists via ibverbs PD probe.
+        // Returns -1 if device doesn't exist, 0 if PD exhausted, 1 if OK.
+        let dev_check = local_dev.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            asmi_core::jaccl_ffi::pd_probe(&dev_check)
+        }).await.unwrap_or(-1);
+
+        if probe < 0 {
+            tracing::warn!(
+                %local_dev, %peer_dev,
+                "topology device not found in ibverbs, falling back to auto-discover"
+            );
+            return None;
+        }
+        if probe == 0 {
+            tracing::warn!(%local_dev, "PD exhausted on topology-resolved device");
+            return None;
+        }
+
+        return Some((local_dev, peer_dev));
+    }
+    None
+}
+
+/// Write a 2-node JACCL devices.json to /tmp and return the path.
+///
+/// Format: `devices[rank][dst]` — each rank reads only its own row.
+/// - `devices[0][1]` = device rank 0 uses to reach rank 1 (= local_dev for coordinator)
+/// - `devices[1][0]` = device rank 1 uses to reach rank 0 (= peer_dev for peer)
+#[cfg(feature = "jaccl")]
+fn write_devices_json(rank: i32, local_dev: &str, peer_dev: &str) -> Result<String, String> {
+    // devices[rank][dst]: the device RANK uses to reach DST.
+    // The matrix is a global view — always the same regardless of who writes it.
+    let (rank0_dev, rank1_dev) = if rank == 0 {
+        (local_dev, peer_dev)
+    } else {
+        (peer_dev, local_dev)
+    };
+    let devices = serde_json::json!([[null, rank0_dev], [rank1_dev, null]]);
+
+    let path = format!("/tmp/jaccl-devices-{}.json", std::process::id());
+    std::fs::write(&path, devices.to_string())
+        .map_err(|e| format!("write devices json: {e}"))?;
+    Ok(path)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
