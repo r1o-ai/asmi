@@ -51,6 +51,8 @@ pub mod ssh;
 pub mod types;
 pub mod models;
 pub mod health;
+#[cfg(feature = "jaccl")]
+pub mod jaccl_ffi;
 
 /// Resolve the best python3 binary.
 ///
