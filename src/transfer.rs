@@ -173,6 +173,24 @@ pub enum JacclCmd {
     CancelPending {
         peer: String,
     },
+    /// Bulk send a file — tight loop on the worker thread, no per-chunk channel hops.
+    BulkSendFile {
+        peer: String,
+        file_path: std::path::PathBuf,
+        file_size: u64,
+        dst: i32,
+        progress: std::sync::mpsc::Sender<(u64, u64)>, // (bytes_sent, total)
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
+    /// Bulk receive a file — tight loop on the worker thread.
+    BulkRecvFile {
+        peer: String,
+        file_path: std::path::PathBuf,
+        file_size: u64,
+        src: i32,
+        progress: std::sync::mpsc::Sender<(u64, u64)>,
+        reply: tokio::sync::oneshot::Sender<Result<u64, String>>,
+    },
 }
 
 /// The JACCL worker — owns all groups, runs on a dedicated OS thread.
@@ -306,12 +324,135 @@ impl JacclWorker {
                         group.cancel_pending();
                     }
                 }
+
+                JacclCmd::BulkSendFile { peer, file_path, file_size, dst, progress, reply } => {
+                    match groups.get(&peer) {
+                        Some((group, _)) => {
+                            let result = bulk_send_file(group, &file_path, file_size, dst, &progress);
+                            let _ = reply.send(result);
+                        }
+                        None => {
+                            let _ = reply.send(Err(format!("no JACCL group for peer '{peer}'")));
+                        }
+                    }
+                }
+
+                JacclCmd::BulkRecvFile { peer, file_path, file_size, src, progress, reply } => {
+                    match groups.get(&peer) {
+                        Some((group, _)) => {
+                            let result = bulk_recv_file(group, &file_path, file_size, src, &progress);
+                            let _ = reply.send(result);
+                        }
+                        None => {
+                            let _ = reply.send(Err(format!("no JACCL group for peer '{peer}'")));
+                        }
+                    }
+                }
             }
         }
 
         tracing::info!("jaccl-worker thread exiting, dropping {} groups", groups.len());
         // Groups drop here — RAII cleans up PDs
     }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Bulk file transfer — tight loop on the worker thread, zero channel hops
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 4 MB chunk — large enough to amortize RDMA overhead, small enough for
+/// JACCL's internal pipelining. The old per-channel path used 256 KB.
+#[cfg(feature = "jaccl")]
+const BULK_CHUNK: usize = 4 * 1024 * 1024;
+
+/// Timeout per bulk chunk (5 min — generous for degraded links).
+#[cfg(feature = "jaccl")]
+const BULK_CHUNK_TIMEOUT_MS: i32 = 300_000;
+
+/// Send an entire file over RDMA in a tight loop on the worker thread.
+///
+/// Protocol: send 8-byte LE file size, then stream 4 MB chunks until done.
+/// Progress is reported via a `std::sync::mpsc` channel (not tokio — we're
+/// on a plain OS thread).
+#[cfg(feature = "jaccl")]
+fn bulk_send_file(
+    group: &asmi_core::jaccl_ffi::JacclGroup,
+    path: &std::path::Path,
+    file_size: u64,
+    dst: i32,
+    progress: &std::sync::mpsc::Sender<(u64, u64)>,
+) -> Result<u64, String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut buf = vec![0u8; BULK_CHUNK];
+    let mut sent: u64 = 0;
+
+    // Send file size header (8 bytes)
+    group.send(&file_size.to_le_bytes(), dst, 30_000)
+        .map_err(|e| format!("send file size: {e}"))?;
+
+    while sent < file_size {
+        let to_read = BULK_CHUNK.min((file_size - sent) as usize);
+        file.read_exact(&mut buf[..to_read])
+            .map_err(|e| format!("read {} at offset {sent}: {e}", path.display()))?;
+        group.send(&buf[..to_read], dst, BULK_CHUNK_TIMEOUT_MS)
+            .map_err(|e| format!("send chunk at {sent}: {e}"))?;
+        sent += to_read as u64;
+        let _ = progress.send((sent, file_size));
+    }
+
+    Ok(sent)
+}
+
+/// Receive an entire file over RDMA in a tight loop on the worker thread.
+///
+/// Protocol: recv 8-byte LE file size, then stream 4 MB chunks until done.
+#[cfg(feature = "jaccl")]
+fn bulk_recv_file(
+    group: &asmi_core::jaccl_ffi::JacclGroup,
+    path: &std::path::Path,
+    file_size: u64,
+    src: i32,
+    progress: &std::sync::mpsc::Sender<(u64, u64)>,
+) -> Result<u64, String> {
+    use std::io::Write;
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+
+    let mut file = std::fs::File::create(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut buf = vec![0u8; BULK_CHUNK];
+    let mut received: u64 = 0;
+
+    // Receive file size header (8 bytes)
+    let mut size_buf = [0u8; 8];
+    group.recv(&mut size_buf, src, 30_000)
+        .map_err(|e| format!("recv file size: {e}"))?;
+    let wire_size = u64::from_le_bytes(size_buf);
+
+    if wire_size != file_size {
+        return Err(format!(
+            "file size mismatch: manifest says {file_size}, wire says {wire_size}"
+        ));
+    }
+
+    while received < file_size {
+        let to_recv = BULK_CHUNK.min((file_size - received) as usize);
+        group.recv(&mut buf[..to_recv], src, BULK_CHUNK_TIMEOUT_MS)
+            .map_err(|e| format!("recv chunk at {received}: {e}"))?;
+        file.write_all(&buf[..to_recv])
+            .map_err(|e| format!("write {} at offset {received}: {e}", path.display()))?;
+        received += to_recv as u64;
+        let _ = progress.send((received, file_size));
+    }
+
+    Ok(received)
 }
 
 /// Stub when jaccl is not compiled in.
@@ -502,14 +643,17 @@ async fn transfer_pipeline(
     // ── 3. Resolve peer IP (native mDNS — Phase 4) ──────────────────────
     let _ = tx.send(SseEvent::stage("coordinate").to_sse_line()).await;
 
-    // ── 4. Resolve our own LAN IP (for coordinator) ─────────────────────
-    let local_ip = match resolve_local_lan_ip() {
-        Some(ip) => ip,
-        None => {
-            let _ = tx.send(SseEvent::error("cannot determine local LAN IP").to_sse_line()).await;
-            return;
-        }
-    };
+    // ── 4. Resolve coordinator IP ────────────────────────────────────────
+    // JACCL's TCP side-channel for QP exchange must be reachable over the
+    // same physical link as the RDMA device. Using the LAN IP (10.x) fails
+    // with errno 60 (ETIMEDOUT) because the RDMA interface only speaks
+    // link-local 169.254.x.x. Prefer the TB5 link-local IP of the
+    // interface that connects to the peer; fall back to LAN IP.
+    let local_ip = resolve_tb5_coordinator_ip(&req.peer)
+        .or_else(|| resolve_local_lan_ip())
+        .unwrap_or_else(|| "10.1.10.100".to_string());
+    tracing::info!(peer = %req.peer, coordinator_ip = %local_ip, "resolved coordinator IP");
+    let devices = resolve_device_for_peer(&topology_cache, local_hostname, &req.peer).await;
 
     // ── 5. Resolve devices + notify peer + init coordinator ───────────
     //
@@ -520,7 +664,7 @@ async fn transfer_pipeline(
     // Flow: pick port → notify peer → start coordinator init → await both.
     let _ = tx.send(SseEvent::stage("init").to_sse_line()).await;
 
-    let devices = resolve_device_for_peer(&topology_cache, local_hostname, &req.peer).await;
+    // devices already resolved in step 4 for coordinator IP
     if let Some((ref ld, ref pd)) = devices {
         tracing::info!(peer = %req.peer, local_device = %ld, peer_device = %pd, "topology-resolved RDMA devices");
     }
@@ -725,15 +869,7 @@ async fn accept_worker(
 // Constants
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// 64 MB chunk size for RDMA transfers.
-#[cfg(feature = "jaccl")]
-const CHUNK_SIZE: usize = 64 * 1024 * 1024;
-
-/// Timeout per chunk (60s — large enough for 64 MB even on degraded links).
-#[cfg(feature = "jaccl")]
-const CHUNK_TIMEOUT_MS: i32 = 60_000;
-
-/// Header message timeout (short — just metadata).
+/// Header / small-message timeout (manifests, checksums, length headers).
 #[cfg(feature = "jaccl")]
 const HEADER_TIMEOUT_MS: i32 = 10_000;
 
@@ -813,7 +949,11 @@ async fn worker_recv(
     reply_rx.await.map_err(|_| "worker dropped reply".to_string())?
 }
 
-/// Send all files in `model_path` to rank 1 via worker channel.
+/// Send all files in `model_path` to rank 1 via bulk worker commands.
+///
+/// Manifest exchange still uses the small `worker_send`/`worker_recv` path.
+/// File data goes through `BulkSendFile` — the entire file streams in a
+/// tight loop on the worker thread with zero per-chunk channel hops.
 #[cfg(feature = "jaccl")]
 async fn do_send_via_worker(
     worker: &JacclWorker,
@@ -842,12 +982,13 @@ async fn do_send_via_worker(
         return Err("no files in model directory".into());
     }
 
+    let start = std::time::Instant::now();
     let total_bytes: u64 = entries.iter().map(|e| e.size).sum();
     let manifest = FileManifest { files: entries };
     let manifest_json = serde_json::to_vec(&manifest)
         .map_err(|e| format!("serialize manifest: {e}"))?;
 
-    // Send manifest length (8 bytes) + manifest (padded to 1 MB)
+    // Send manifest length (8 bytes) + manifest (padded to 1 MB) — small, uses channel path
     let manifest_len = manifest_json.len();
     let length_buf = (manifest_len as u64).to_le_bytes();
     worker_send(worker, peer, &length_buf, 1, HEADER_TIMEOUT_MS).await
@@ -859,38 +1000,58 @@ async fn do_send_via_worker(
     worker_send(worker, peer, &header_buf, 1, HEADER_TIMEOUT_MS).await
         .map_err(|e| format!("send manifest: {e}"))?;
 
-    // Send each file in chunks
+    // Send each file via BulkSendFile — tight loop on the worker thread
     let mut bytes_sent: u64 = 0;
 
     for file_entry in &manifest.files {
         let file_path = model_path.join(&file_entry.name);
-        let file_data = std::fs::read(&file_path)
-            .map_err(|e| format!("read {}: {e}", file_entry.name))?;
 
-        let mut offset = 0usize;
-        while offset < file_data.len() {
-            let end = (offset + CHUNK_SIZE).min(file_data.len());
-            let chunk_len = end - offset;
+        // Progress channel: std::sync::mpsc (worker is a plain OS thread)
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-            // Send chunk size (8 bytes) then chunk data
-            let size_buf = (chunk_len as u64).to_le_bytes();
-            worker_send(worker, peer, &size_buf, 1, CHUNK_TIMEOUT_MS).await
-                .map_err(|e| format!("send chunk size for {}: {e}", file_entry.name))?;
-            worker_send(worker, peer, &file_data[offset..end], 1, CHUNK_TIMEOUT_MS).await
-                .map_err(|e| format!("send chunk for {}: {e}", file_entry.name))?;
+        worker.send(JacclCmd::BulkSendFile {
+            peer: peer.to_string(),
+            file_path: file_path.clone(),
+            file_size: file_entry.size,
+            dst: 1,
+            progress: progress_tx,
+            reply: reply_tx,
+        })?;
 
-            offset = end;
-            bytes_sent += chunk_len as u64;
+        // Drain progress channel in a background task to emit SSE events
+        let tx_sse = tx.clone();
+        let file_name = file_entry.name.clone();
+        let total = total_bytes;
+        let base_sent = bytes_sent;
+        let transfer_start = start;
+        tokio::task::spawn_blocking(move || {
+            while let Ok((file_bytes, _file_total)) = progress_rx.recv() {
+                let global_sent = base_sent + file_bytes;
+                let pct = ((global_sent as f64 / total as f64) * 100.0) as u8;
+                let elapsed = transfer_start.elapsed().as_secs();
+                let bps = if elapsed > 0 { global_sent / elapsed } else { 0 };
+                // Best-effort SSE — drop if the channel is full
+                let _ = tx_sse.try_send(SseEvent::progress(pct.min(99), bps).to_sse_line());
+            }
+            tracing::debug!("progress drain done for {file_name}");
+        });
 
-            let pct = ((bytes_sent as f64 / total_bytes as f64) * 100.0) as u8;
-            let _ = tx.send(SseEvent::progress(pct.min(99), 0).to_sse_line()).await;
-        }
+        // Await the worker's reply for this file
+        let file_bytes = reply_rx.await
+            .map_err(|_| format!("worker dropped reply for {}", file_entry.name))?
+            .map_err(|e| format!("bulk send {}: {e}", file_entry.name))?;
+
+        bytes_sent += file_bytes;
     }
 
     Ok(bytes_sent)
 }
 
-/// Receive files from rank 0 into `model_path` via worker channel.
+/// Receive files from rank 0 into `model_path` via bulk worker commands.
+///
+/// Manifest exchange still uses the small `worker_send`/`worker_recv` path.
+/// File data goes through `BulkRecvFile` — tight loop on the worker thread.
 #[cfg(feature = "jaccl")]
 async fn do_recv_via_worker(
     worker: &JacclWorker,
@@ -902,7 +1063,7 @@ async fn do_recv_via_worker(
     std::fs::create_dir_all(model_path)
         .map_err(|e| format!("create model dir: {e}"))?;
 
-    // Receive manifest length (8 bytes)
+    // Receive manifest length (8 bytes) — small, uses channel path
     let length_data = worker_recv(worker, peer, 8, 0, HEADER_TIMEOUT_MS).await
         .map_err(|e| format!("recv manifest length: {e}"))?;
     let manifest_len = u64::from_le_bytes(length_data[..8].try_into().unwrap()) as usize;
@@ -917,32 +1078,46 @@ async fn do_recv_via_worker(
     let total_bytes: u64 = manifest.files.iter().map(|e| e.size).sum();
     let mut bytes_received: u64 = 0;
 
+    let start = std::time::Instant::now();
     for file_entry in &manifest.files {
         let file_path = model_path.join(&file_entry.name);
-        let mut file_data = Vec::with_capacity(file_entry.size as usize);
 
-        let mut remaining = file_entry.size as usize;
-        while remaining > 0 {
-            // Receive chunk size (8 bytes)
-            let size_data = worker_recv(worker, peer, 8, 0, CHUNK_TIMEOUT_MS).await
-                .map_err(|e| format!("recv chunk size for {}: {e}", file_entry.name))?;
-            let chunk_len = u64::from_le_bytes(size_data[..8].try_into().unwrap()) as usize;
+        // Progress channel: std::sync::mpsc (worker is a plain OS thread)
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(u64, u64)>();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-            // Receive chunk data
-            let chunk_data = worker_recv(worker, peer, chunk_len, 0, CHUNK_TIMEOUT_MS).await
-                .map_err(|e| format!("recv chunk for {}: {e}", file_entry.name))?;
+        worker.send(JacclCmd::BulkRecvFile {
+            peer: peer.to_string(),
+            file_path: file_path.clone(),
+            file_size: file_entry.size,
+            src: 0,
+            progress: progress_tx,
+            reply: reply_tx,
+        })?;
 
-            file_data.extend_from_slice(&chunk_data);
-            remaining = remaining.saturating_sub(chunk_len);
-            bytes_received += chunk_len as u64;
+        // Drain progress channel in a background task to emit SSE events
+        let tx_sse = tx.clone();
+        let file_name = file_entry.name.clone();
+        let total = total_bytes;
+        let base_received = bytes_received;
+        let transfer_start = start;
+        tokio::task::spawn_blocking(move || {
+            while let Ok((file_bytes, _file_total)) = progress_rx.recv() {
+                let global_received = base_received + file_bytes;
+                let pct = ((global_received as f64 / total as f64) * 100.0) as u8;
+                let elapsed = transfer_start.elapsed().as_secs();
+                let bps = if elapsed > 0 { global_received / elapsed } else { 0 };
+                let _ = tx_sse.try_send(SseEvent::progress(pct.min(99), bps).to_sse_line());
+            }
+            tracing::debug!("progress drain done for {file_name}");
+        });
 
-            let pct = ((bytes_received as f64 / total_bytes as f64) * 100.0) as u8;
-            let _ = tx.send(SseEvent::progress(pct.min(99), 0).to_sse_line()).await;
-        }
+        // Await the worker's reply for this file
+        let file_bytes = reply_rx.await
+            .map_err(|_| format!("worker dropped reply for {}", file_entry.name))?
+            .map_err(|e| format!("bulk recv {}: {e}", file_entry.name))?;
 
-        // Write file
-        std::fs::write(&file_path, &file_data)
-            .map_err(|e| format!("write {}: {e}", file_entry.name))?;
+        bytes_received += file_bytes;
     }
 
     Ok(bytes_received)
@@ -1154,6 +1329,53 @@ fn resolve_peer_mdns(peer: &str) -> Option<String> {
     };
     unsafe { libc::freeaddrinfo(res); }
     Some(addr.to_string())
+}
+
+/// Resolve the TB5 link-local IP that can reach a peer's TB5 IP.
+/// Scans all local 169.254.x.x addresses and finds one that can
+/// reach any of the peer's 169.254.x.x addresses (via ARP/ping).
+/// Returns the LOCAL IP that has connectivity.
+#[cfg(feature = "jaccl")]
+fn resolve_tb5_coordinator_ip(peer_hostname: &str) -> Option<String> {
+    // Get peer's 169.254 IPs via SSH ifconfig
+    let output = std::process::Command::new("ssh")
+        .args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes", peer_hostname,
+               "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
+        .output()
+        .ok()?;
+    let peer_ips: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| l.starts_with("169.254."))
+        .map(|s| s.to_string())
+        .collect();
+    if peer_ips.is_empty() { return None; }
+
+    // Get our own 169.254 IPs
+    let output = std::process::Command::new("sh")
+        .args(["-c", "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
+        .output()
+        .ok()?;
+    let local_ips: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| l.starts_with("169.254."))
+        .map(|s| s.to_string())
+        .collect();
+
+    // Find a local IP that can ping a peer IP (proves TB5 link connectivity)
+    for local_ip in &local_ips {
+        for peer_ip in &peer_ips {
+            let result = std::process::Command::new("ping")
+                .args(["-c", "1", "-t", "1", "-S", local_ip, peer_ip])
+                .output();
+            if let Ok(out) = result {
+                if out.status.success() {
+                    tracing::info!(%local_ip, %peer_ip, "found TB5 link-local path");
+                    return Some(local_ip.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Resolve this machine's LAN IP (non-loopback, non-link-local).
