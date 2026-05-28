@@ -1328,6 +1328,64 @@ async fn launchd_enable_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Hermes status — read-only proxy to hermes-api on localhost.
+//
+// Phase 3 of the dmg-unified plan lifts this lightweight endpoint into asmi so
+// iOS can probe "is this an asmi-only node or asmi+hermes node?" from a single
+// origin (asmi:9090). Phase 4 (Feature E) will add the write endpoints
+// (POST /hermes/restart, POST /hermes/config) on top of this.
+// ---------------------------------------------------------------------------
+
+/// GET /hermes/status → `{running, pid, port, model, last_request_at}` for the
+/// local hermes-api daemon. Reads `http://localhost:41104/health` (cheap, no
+/// side effects). Returns 404 if hermes-api is unreachable (a normal state
+/// for asmi-only nodes — iOS uses the 404 to route via /serve/status only).
+async fn hermes_status_handler(
+    State(_state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    const HERMES_PORT: u16 = 41104;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(800))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("reqwest build: {e}")))?;
+
+    let url = format!("http://localhost:{HERMES_PORT}/health");
+    let resp = client.get(&url).send().await.map_err(|e| {
+        // Connection refused / timeout — treat as "not running" with NOT_FOUND
+        // so iOS can fall back to /serve/status only.
+        ApiError::NotFound(format!("hermes-api unreachable at {url}: {e}"))
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(ApiError::NotFound(format!(
+            "hermes-api returned {} from /health",
+            resp.status()
+        )));
+    }
+
+    // Pass through hermes-api's /health payload — keys vary across versions
+    // (older: {status, service, hermes_binary}, newer adds {pid, model}).
+    // We wrap it with `running: true` + `port` for iOS's expected envelope.
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(format!("hermes /health not JSON: {e}")))?;
+
+    let payload = serde_json::json!({
+        "running": true,
+        "port": HERMES_PORT,
+        "pid": body.get("pid").cloned().unwrap_or(serde_json::Value::Null),
+        "model": body.get("model").cloned().unwrap_or(serde_json::Value::Null),
+        "last_request_at": body
+            .get("last_request_at")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "raw": body,
+    });
+    Ok(Json(payload))
+}
+
+// ---------------------------------------------------------------------------
 // Autoresearch benchmark endpoints
 // ---------------------------------------------------------------------------
 
@@ -3196,6 +3254,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/reload", post(serve_reload_handler))
         .route("/launchd/disable", post(launchd_disable_handler))
         .route("/launchd/enable", post(launchd_enable_handler))
+        // Phase 3 — read-only Hermes probe (Phase 4 adds /hermes/restart, /hermes/config)
+        .route("/hermes/status", get(hermes_status_handler))
         .route("/serve/share", post(serve_share_handler))
         .route("/serve/share/status", get(serve_share_status_handler))
         .route("/serve/share/stop", post(serve_share_stop_handler))
