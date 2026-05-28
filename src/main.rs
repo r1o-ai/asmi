@@ -1,4 +1,5 @@
 mod ane;
+mod bonjour;
 mod cli;
 mod daemon;
 mod daemon_startup;

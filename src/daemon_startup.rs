@@ -369,6 +369,21 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
 
     let app = daemon::build_router(app_state);
 
+    // Bonjour publisher — make this node discoverable on the LAN as
+    // `r1o-<hostname>._r1o._tcp.local` so iOS / desktop r1o clients can find
+    // us without any manual config. mDNS does NOT propagate over Tailscale,
+    // so tunnel users still need the Tailscale device list fallback.
+    // Best-effort: a failure here logs but does not stop the HTTP server.
+    // The handle is held in a top-level binding so the daemon + refresh task
+    // outlive this function (`axum::serve(...).await` below runs forever).
+    let _bonjour = match crate::bonjour::BonjourPublisher::start(&hostname, port).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "Bonjour publisher failed to start (continuing without mDNS)");
+            None
+        }
+    };
+
     let addr = format!("{bind}:{port}");
     tracing::info!(%addr, "HTTP server listening");
     let base = format!("http://{hostname}:{port}");
