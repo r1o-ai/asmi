@@ -385,18 +385,36 @@ fn ssh_cmd(host: &str, cmd: &str) -> String {
 
 // ── Native topology: HTTP + UUID cross-match ────────────────────────
 
-fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
-    for suffix in ["", ".local"] {
-        let url = format!("http://{}{}:9090/thunderbolt", host, suffix);
-        if let Some(output) = Command::new("curl")
-            .args(["-s", "--connect-timeout", "5", "--max-time", "5", &url])
-            .output()
-            .ok()
-        {
-            if output.status.success() {
-                if let Ok(v) = serde_json::from_slice(&output.stdout) {
-                    return Some(v);
+fn host_candidates(host: &str) -> Vec<String> {
+    let mut candidates = vec![host.to_string(), format!("{host}.local")];
+    for ts_path in ["/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale", "tailscale"] {
+        if let Ok(out) = Command::new(ts_path).args(["ip", "-4", host]).output() {
+            if out.status.success() {
+                let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !ip.is_empty() {
+                    candidates.push(ip);
+                    break;
                 }
+            }
+        }
+    }
+    candidates
+}
+
+fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
+    for candidate in host_candidates(host) {
+        let url = format!("http://{}:9090/thunderbolt", candidate);
+        let output = match Command::new("curl")
+            .args(["-s", "--connect-timeout", "3", "--max-time", "5", &url])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
+            if reported == host {
+                return Some(v);
             }
         }
     }
@@ -404,15 +422,19 @@ fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
 }
 
 fn is_host_reachable_http(host: &str) -> bool {
-    for suffix in ["", ".local"] {
-        let url = format!("http://{}{}:9090/health", host, suffix);
-        let ok = Command::new("curl")
-            .args(["-s", "--connect-timeout", "3", "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}", &url])
+    for candidate in host_candidates(host) {
+        let url = format!("http://{}:9090/health", candidate);
+        let output = match Command::new("curl")
+            .args(["-s", "--connect-timeout", "2", "--max-time", "3", &url])
             .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).starts_with("200"))
-            .unwrap_or(false);
-        if ok { return true; }
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
+            if reported == host { return true; }
+        }
     }
     false
 }
@@ -503,7 +525,8 @@ fn discover_via_native(hosts: &[String]) -> Result<TopologyReport> {
     }
 
     // UUID cross-match: find links where nodeA.peer_domain == nodeB.local_domain
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    // Deduplicate by ordered (nodeA:devA, nodeB:devB) to allow multiple links between same pair.
+    let mut seen: HashSet<(String, String, String, String)> = HashSet::new();
     let mut links: Vec<TopologyLink> = Vec::new();
 
     for (hostname, buses) in &parsed {
@@ -516,12 +539,12 @@ fn discover_via_native(hosts: &[String]) -> Result<TopologyReport> {
                 Some(entry) if &entry.0 != hostname => entry,
                 _ => continue,
             };
-            let pair = if hostname < remote_host {
-                (hostname.clone(), remote_host.clone())
+            let link_key = if hostname < remote_host {
+                (hostname.clone(), bus.interface.clone(), remote_host.clone(), remote_iface.clone())
             } else {
-                (remote_host.clone(), hostname.clone())
+                (remote_host.clone(), remote_iface.clone(), hostname.clone(), bus.interface.clone())
             };
-            if !seen.insert(pair) {
+            if !seen.insert(link_key) {
                 continue;
             }
             let (node_a, dev_a, node_b, dev_b) = if hostname < remote_host {
