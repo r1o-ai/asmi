@@ -1328,12 +1328,19 @@ async fn launchd_enable_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Hermes status — read-only proxy to hermes-api on localhost.
+// Hermes status + lifecycle — proxy to hermes-api on localhost.
 //
-// Phase 3 of the dmg-unified plan lifts this lightweight endpoint into asmi so
-// iOS can probe "is this an asmi-only node or asmi+hermes node?" from a single
-// origin (asmi:9090). Phase 4 (Feature E) will add the write endpoints
-// (POST /hermes/restart, POST /hermes/config) on top of this.
+// Phase 3 of the dmg-unified plan lifts the read-only endpoint into asmi so
+// iOS can probe "is this an asmi-only node or asmi+hermes node?" from a
+// single origin (asmi:9090). Phase 4 (Feature E) adds the write endpoints
+// (POST /hermes/restart, POST /hermes/config) on top of that.
+//
+// Phase 4 design constraint (executed-state finding 2026-05-28): the
+// MLX-side LaunchAgent label is NOT hardcoded. It's read from
+// `~/.r1o/cluster.json` key `mlx_label` (if present); else falls back to
+// scanning `launchctl list | grep -E "com.r1o.(mlx-lm|dflash-retriever|mlx-vlm)"`.
+// This handles the live state where the canonical label is
+// `com.r1o.dflash-retriever` instead of plan-v5's assumed `com.r1o.mlx-lm`.
 // ---------------------------------------------------------------------------
 
 /// GET /hermes/status → `{running, pid, port, model, last_request_at}` for the
@@ -1371,6 +1378,10 @@ async fn hermes_status_handler(
         .await
         .map_err(|e| ApiError::Internal(format!("hermes /health not JSON: {e}")))?;
 
+    // Best-effort label resolution so iOS can see what MLX service is bound
+    // here. Adds a small extra cost (~1ms) but avoids a second round trip.
+    let mlx_label = resolve_mlx_label().await;
+
     let payload = serde_json::json!({
         "running": true,
         "port": HERMES_PORT,
@@ -1380,9 +1391,207 @@ async fn hermes_status_handler(
             .get("last_request_at")
             .cloned()
             .unwrap_or(serde_json::Value::Null),
+        "mlx_label": mlx_label,
         "raw": body,
     });
     Ok(Json(payload))
+}
+
+/// Resolve the MLX-side LaunchAgent label that Phase 4 actions target.
+///
+/// Resolution order:
+/// 1. `~/.r1o/cluster.json` key `mlx_label` (string).
+/// 2. Scan `launchctl list` for the first hit of
+///    `com.r1o.(dflash-retriever|mlx-lm|mlx-vlm)` (running OR registered).
+/// 3. `None` — no label found; lifecycle endpoints will 404.
+///
+/// Phase 0 of the dmg-unified plan discovered that the live label on hub is
+/// `com.r1o.dflash-retriever`, not the plan-assumed `com.r1o.mlx-lm`. This
+/// resolver makes the Phase 4 endpoints work on whatever label is actually
+/// installed.
+async fn resolve_mlx_label() -> Option<String> {
+    // Try cluster.json first.
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".r1o").join("cluster.json");
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(label) = v.get("mlx_label").and_then(|x| x.as_str()) {
+                    if !label.is_empty() {
+                        return Some(label.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to launchctl scan.
+    let output = tokio::process::Command::new("launchctl")
+        .arg("list")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        // launchctl list format: PID\tStatus\tLabel
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let label = parts[2].trim();
+        if matches!(
+            label,
+            "com.r1o.dflash-retriever" | "com.r1o.mlx-lm" | "com.r1o.mlx-vlm"
+        ) {
+            return Some(label.to_string());
+        }
+    }
+    None
+}
+
+/// POST /hermes/restart — disable + enable the `com.ace.hermes-api`
+/// LaunchAgent, then poll `:41104/health` until it responds (or timeout).
+///
+/// Returns 200 with `{ok: true, restart_secs: <float>}` on success, 504 if
+/// hermes-api does not come back within 15s, and 500 for any launchctl error.
+///
+/// Note: this is the HERMES side. The MLX-side service (label dynamically
+/// resolved) is NOT restarted here. Use the existing
+/// `POST /launchd/disable` + `POST /launchd/enable` with the resolved label
+/// directly for that.
+async fn hermes_restart_handler(
+    State(_state): State<AppState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    const HERMES_LABEL: &str = "com.ace.hermes-api";
+    const HERMES_PORT: u16 = 41104;
+    const POLL_TIMEOUT_SECS: u64 = 15;
+
+    // 1. disable
+    if let Err(e) = crate::launchd::disable(HERMES_LABEL).await {
+        return launchd_err_response(e);
+    }
+
+    // 2. enable
+    if let Err(e) = crate::launchd::enable(HERMES_LABEL).await {
+        return launchd_err_response(e);
+    }
+
+    // 3. poll /health every 500ms until reachable or timeout
+    let started = std::time::Instant::now();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("reqwest build: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let url = format!("http://localhost:{HERMES_PORT}/health");
+    let timeout = std::time::Duration::from_secs(POLL_TIMEOUT_SECS);
+    loop {
+        if started.elapsed() > timeout {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": format!("hermes-api did not respond on :{HERMES_PORT} within {POLL_TIMEOUT_SECS}s after enable"),
+                    "elapsed_secs": started.elapsed().as_secs_f32(),
+                })),
+            )
+                .into_response();
+        }
+        if let Ok(r) = client.get(&url).send().await {
+            if r.status().is_success() {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "restart_secs": started.elapsed().as_secs_f32(),
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// POST /hermes/config — proxy `PATCH http://localhost:41104/v1/config` so
+/// iOS / desktop can update Hermes config (e.g. model swap) from a single
+/// origin (asmi:9090) without needing to know hermes-api's port.
+///
+/// Request body is forwarded as-is. Response body is forwarded as-is with
+/// the same status code. Errors at the proxy layer (connect refused,
+/// timeout) return 502 Bad Gateway.
+async fn hermes_config_handler(
+    State(_state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    const HERMES_PORT: u16 = 41104;
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("reqwest build: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let url = format!("http://localhost:{HERMES_PORT}/v1/config");
+    let upstream = match client
+        .patch(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("hermes-api unreachable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = upstream.status();
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("hermes-api read body: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Pass through the upstream status + body. The upstream sends JSON; we
+    // copy the bytes verbatim so any future schema changes don't need code
+    // here.
+    (
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK),
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3256,6 +3465,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/launchd/enable", post(launchd_enable_handler))
         // Phase 3 — read-only Hermes probe (Phase 4 adds /hermes/restart, /hermes/config)
         .route("/hermes/status", get(hermes_status_handler))
+        // Phase 4 — Hermes lifecycle (Feature E)
+        .route("/hermes/restart", post(hermes_restart_handler))
+        .route("/hermes/config", post(hermes_config_handler))
         .route("/serve/share", post(serve_share_handler))
         .route("/serve/share/status", get(serve_share_status_handler))
         .route("/serve/share/stop", post(serve_share_stop_handler))
