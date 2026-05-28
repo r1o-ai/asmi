@@ -1,8 +1,8 @@
 //! Cluster topology discovery for TB5/RDMA mesh.
 //!
-//! Primary: wraps Apple's `mlx.distributed_config --dot`.
-//! Fallback: ARP-based discovery when mlx.distributed_config fails
-//! (e.g., `KeyError: receptacle_1_tag` on freshly-cabled links).
+//! Primary: native HTTP + TB UUID cross-matching via each node's asmi /thunderbolt endpoint.
+//! Fallback 1: `mlx.distributed_config --dot` (requires Python/MLX).
+//! Fallback 2: ARP-based discovery.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::Command;
@@ -58,17 +58,17 @@ fn find_distributed_config() -> Result<String> {
     bail!("mlx.distributed_config not found. Install with: pip install mlx")
 }
 
-/// Discover cluster topology. Filters to SSH-reachable hosts first so that
-/// `mlx.distributed_config` doesn't fail due to offline nodes (e.g. marmac).
-/// Falls back to ARP-based discovery if the primary path still fails.
+/// Discover cluster topology. Tries native HTTP first (no Python/MLX dependency),
+/// falls back to mlx.distributed_config, then ARP.
 pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyReport> {
-    let reachable: Vec<String> = std::thread::scope(|s| {
+    // Primary: native HTTP + UUID cross-match (no SSH, no Python)
+    let http_reachable: Vec<String> = std::thread::scope(|s| {
         let handles: Vec<_> = hosts
             .iter()
             .map(|h| {
                 let h = h.clone();
                 s.spawn(move || {
-                    if is_host_reachable(&h) { Some(h) } else { None }
+                    if is_host_reachable_http(&h) { Some(h) } else { None }
                 })
             })
             .collect();
@@ -76,39 +76,66 @@ pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyRepo
     });
 
     for h in hosts {
-        if !reachable.contains(h) {
-            eprintln!("topology: skipping unreachable host {h}");
+        if !http_reachable.contains(h) {
+            eprintln!("topology: {h} not reachable via HTTP");
         }
     }
 
-    if reachable.len() < 2 {
-        bail!("need at least 2 reachable hosts for topology, got {}", reachable.len());
-    }
-
-    match discover_via_mlx(&reachable, backend) {
-        Ok(mut report) => {
-            for h in hosts {
-                if !report.nodes.contains(h) {
-                    report.nodes.push(h.clone());
-                }
+    if http_reachable.len() >= 2 {
+        match discover_via_native(&http_reachable) {
+            Ok(report) => {
+                eprintln!(
+                    "topology: native discovery found {} links across {} nodes",
+                    report.links.len(),
+                    report.nodes.len()
+                );
+                return finalize_report(report, hosts);
             }
-            let missing = compute_missing_links(&report.nodes, &report.links);
-            report.mesh_complete = missing.is_empty();
-            report.missing_links = missing;
-            let n = report.nodes.len();
-            report.jaccl_ready = report.mesh_complete && report.links.len() >= n * (n - 1) / 2;
-            report.jaccl_ready_subsets = find_jaccl_subsets_from_links(&report.nodes, &report.links);
-            Ok(report)
-        }
-        Err(e) => {
-            eprintln!("mlx.distributed_config failed ({e:#}), falling back to ARP-based discovery");
-            discover_via_arp(hosts)
+            Err(e) => eprintln!("native topology failed ({e:#}), trying mlx fallback"),
         }
     }
+
+    // Fallback 1: mlx.distributed_config (kept permanently for nodes without asmi)
+    let ssh_reachable: Vec<String> = std::thread::scope(|s| {
+        let handles: Vec<_> = hosts
+            .iter()
+            .map(|h| {
+                let h = h.clone();
+                s.spawn(move || {
+                    if is_host_reachable_ssh(&h) { Some(h) } else { None }
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().unwrap()).collect()
+    });
+
+    if ssh_reachable.len() >= 2 {
+        match discover_via_mlx(&ssh_reachable, backend) {
+            Ok(report) => return finalize_report(report, hosts),
+            Err(e) => eprintln!("mlx.distributed_config failed ({e:#}), trying ARP"),
+        }
+    }
+
+    // Fallback 2: ARP-based
+    discover_via_arp(hosts)
+}
+
+fn finalize_report(mut report: TopologyReport, all_hosts: &[String]) -> Result<TopologyReport> {
+    for h in all_hosts {
+        if !report.nodes.contains(h) {
+            report.nodes.push(h.clone());
+        }
+    }
+    let missing = compute_missing_links(&report.nodes, &report.links);
+    report.mesh_complete = missing.is_empty();
+    report.missing_links = missing;
+    report.jaccl_ready_subsets = find_jaccl_subsets_from_links(&report.nodes, &report.links);
+    report.jaccl_ready = compute_jaccl_ready(&report.links, &report.jaccl_ready_subsets);
+    Ok(report)
 }
 
 /// Quick SSH reachability check (3s timeout, BatchMode).
-fn is_host_reachable(host: &str) -> bool {
+fn is_host_reachable_ssh(host: &str) -> bool {
     let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
     Command::new("ssh")
         .args([
@@ -157,7 +184,7 @@ fn find_jaccl_subsets_from_links(nodes: &[String], links: &[TopologyLink]) -> Ve
     find_jaccl_subsets(nodes, &connected)
 }
 
-/// Primary path: `mlx.distributed_config --dot`.
+/// Fallback path: `mlx.distributed_config --dot` (requires Python/MLX).
 fn discover_via_mlx(hosts: &[String], backend: &str) -> Result<TopologyReport> {
     let bin = find_distributed_config()?;
     let hosts_arg = hosts.join(",");
@@ -279,11 +306,8 @@ fn discover_via_arp(hosts: &[String]) -> Result<TopologyReport> {
     }
 
     let mesh_complete = missing.is_empty();
-    let expected = nodes.len() * (nodes.len() - 1) / 2;
-    let jaccl_ready = mesh_complete && links.len() >= expected;
     let subsets = find_jaccl_subsets(&nodes, &connected);
-
-    // Generate DOT
+    let jaccl_ready = compute_jaccl_ready(&links, &subsets);
     let raw_dot = generate_dot(&nodes, &links);
 
     Ok(TopologyReport {
@@ -358,6 +382,186 @@ fn ssh_cmd(host: &str, cmd: &str) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default()
 }
+
+// ── Native topology: HTTP + UUID cross-match ────────────────────────
+
+fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
+    for suffix in ["", ".local"] {
+        let url = format!("http://{}{}:9090/thunderbolt", host, suffix);
+        if let Some(output) = Command::new("curl")
+            .args(["-s", "--connect-timeout", "5", "--max-time", "5", &url])
+            .output()
+            .ok()
+        {
+            if output.status.success() {
+                if let Ok(v) = serde_json::from_slice(&output.stdout) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_host_reachable_http(host: &str) -> bool {
+    for suffix in ["", ".local"] {
+        let url = format!("http://{}{}:9090/health", host, suffix);
+        let ok = Command::new("curl")
+            .args(["-s", "--connect-timeout", "3", "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}", &url])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).starts_with("200"))
+            .unwrap_or(false);
+        if ok { return true; }
+    }
+    false
+}
+
+struct NativeBusInfo {
+    _bus_index: u8,
+    domain_uuid: String,
+    peer_domain_uuid: Option<String>,
+    interface: String,
+}
+
+fn parse_thunderbolt_response(data: &serde_json::Value) -> (HashMap<String, String>, Vec<NativeBusInfo>) {
+    let bus_map: HashMap<String, String> = data
+        .get("bus_map")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut buses = Vec::new();
+    if let Some(ports) = data.get("ports").and_then(|v| v.as_array()) {
+        for port in ports {
+            let bus_index = match port.get("bus_index").and_then(|v| v.as_u64()) {
+                Some(n) => n as u8,
+                None => continue,
+            };
+            let domain_uuid = match port.get("domain_uuid").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            let peer_domain_uuid = port
+                .get("peer_domain_uuid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            let interface = bus_map
+                .get(&bus_index.to_string())
+                .cloned()
+                .unwrap_or_else(|| format!("en{}", bus_index + 2));
+            buses.push(NativeBusInfo { _bus_index: bus_index, domain_uuid, peer_domain_uuid, interface });
+        }
+    }
+    (bus_map, buses)
+}
+
+fn discover_via_native(hosts: &[String]) -> Result<TopologyReport> {
+    let node_data: Vec<(String, serde_json::Value)> = std::thread::scope(|s| {
+        let handles: Vec<_> = hosts
+            .iter()
+            .map(|h| {
+                let h = h.clone();
+                s.spawn(move || fetch_thunderbolt(&h).map(|v| (h, v)))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect()
+    });
+
+    if node_data.len() < 2 {
+        bail!(
+            "native topology: need ≥2 reachable nodes with asmi, got {}",
+            node_data.len()
+        );
+    }
+
+    let parsed: Vec<(String, Vec<NativeBusInfo>)> = node_data
+        .iter()
+        .map(|(hostname, data)| {
+            let (_bus_map, buses) = parse_thunderbolt_response(data);
+            (hostname.clone(), buses)
+        })
+        .collect();
+
+    // Build domain_uuid → (hostname, interface) lookup from all buses
+    let mut uuid_to_node: HashMap<String, (String, String)> = HashMap::new();
+    for (hostname, buses) in &parsed {
+        for bus in buses {
+            uuid_to_node.insert(
+                bus.domain_uuid.clone(),
+                (hostname.clone(), bus.interface.clone()),
+            );
+        }
+    }
+
+    // UUID cross-match: find links where nodeA.peer_domain == nodeB.local_domain
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut links: Vec<TopologyLink> = Vec::new();
+
+    for (hostname, buses) in &parsed {
+        for bus in buses {
+            let peer_uuid = match &bus.peer_domain_uuid {
+                Some(u) => u,
+                None => continue,
+            };
+            let (remote_host, remote_iface) = match uuid_to_node.get(peer_uuid) {
+                Some(entry) if &entry.0 != hostname => entry,
+                _ => continue,
+            };
+            let pair = if hostname < remote_host {
+                (hostname.clone(), remote_host.clone())
+            } else {
+                (remote_host.clone(), hostname.clone())
+            };
+            if !seen.insert(pair) {
+                continue;
+            }
+            let (node_a, dev_a, node_b, dev_b) = if hostname < remote_host {
+                (
+                    hostname.clone(),
+                    format!("rdma_{}", bus.interface),
+                    remote_host.clone(),
+                    format!("rdma_{remote_iface}"),
+                )
+            } else {
+                (
+                    remote_host.clone(),
+                    format!("rdma_{remote_iface}"),
+                    hostname.clone(),
+                    format!("rdma_{}", bus.interface),
+                )
+            };
+            links.push(TopologyLink { node_a, device_a: dev_a, node_b, device_b: dev_b });
+        }
+    }
+
+    let nodes: Vec<String> = hosts.to_vec();
+    let raw_dot = generate_dot(&nodes, &links);
+    let missing = compute_missing_links(&nodes, &links);
+    let mesh_complete = missing.is_empty();
+    let jaccl_ready_subsets = find_jaccl_subsets_from_links(&nodes, &links);
+    let jaccl_ready = compute_jaccl_ready(&links, &jaccl_ready_subsets);
+
+    Ok(TopologyReport {
+        nodes,
+        links,
+        mesh_complete,
+        missing_links: missing,
+        jaccl_ready,
+        jaccl_ready_subsets,
+        raw_dot,
+    })
+}
+
+// ── DOT graph generation ────────────────────────────────────────────
 
 /// Generate a DOT graph from discovered topology.
 fn generate_dot(nodes: &[String], links: &[TopologyLink]) -> String {
@@ -472,12 +676,8 @@ fn parse_dot(dot: &str, requested_hosts: &[String]) -> Result<TopologyReport> {
     }
 
     let mesh_complete = missing.is_empty();
-    let n = nodes.len();
-    let expected_links = n * (n - 1) / 2;
-    let jaccl_ready = mesh_complete && links.len() >= expected_links;
-
-    // Find fully-meshed subsets of 3+ nodes
     let subsets = find_jaccl_subsets(&nodes, &connected);
+    let jaccl_ready = compute_jaccl_ready(&links, &subsets);
 
     Ok(TopologyReport {
         nodes,
@@ -515,6 +715,24 @@ fn find_jaccl_subsets(
     }
 
     subsets
+}
+
+/// True when all RDMA-capable nodes (those appearing in any link) form a full mesh.
+fn compute_jaccl_ready(links: &[TopologyLink], _subsets: &[Vec<String>]) -> bool {
+    let rdma_nodes: HashSet<&str> = links.iter()
+        .flat_map(|l| [l.node_a.as_str(), l.node_b.as_str()])
+        .collect();
+    let rn = rdma_nodes.len();
+    if rn < 2 { return false; }
+    let connected: HashSet<(String, String)> = links.iter().map(|l| {
+        if l.node_a < l.node_b {
+            (l.node_a.clone(), l.node_b.clone())
+        } else {
+            (l.node_b.clone(), l.node_a.clone())
+        }
+    }).collect();
+    let rdma_vec: Vec<String> = rdma_nodes.into_iter().map(String::from).collect();
+    is_full_mesh(&rdma_vec, &connected)
 }
 
 /// Check if all pairs in the subset are connected.

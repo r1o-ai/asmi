@@ -644,16 +644,29 @@ async fn transfer_pipeline(
     let _ = tx.send(SseEvent::stage("coordinate").to_sse_line()).await;
 
     // ── 4. Resolve coordinator IP ────────────────────────────────────────
-    // JACCL's TCP side-channel for QP exchange must be reachable over the
-    // same physical link as the RDMA device. Using the LAN IP (10.x) fails
-    // with errno 60 (ETIMEDOUT) because the RDMA interface only speaks
-    // link-local 169.254.x.x. Prefer the TB5 link-local IP of the
-    // interface that connects to the peer; fall back to LAN IP.
-    let local_ip = resolve_tb5_coordinator_ip(&req.peer)
+    // JACCL's QP exchange requires the coordinator IP to match the RDMA GID.
+    // RDMA GIDs inherit from the hardware port's IPv4 (e.g. rdma_en5 uses en5's IP).
+    // So the coordinator IP must be the /30 IP assigned to the RDMA hardware port,
+    // NOT the link-local 169.254 and NOT the LAN 10.x.x.x.
+    let devices = resolve_device_for_peer(&topology_cache, local_hostname, &req.peer).await;
+    let local_ip = devices.as_ref()
+        .and_then(|(ld, _)| {
+            // Extract hardware port name: rdma_en5 → en5
+            let hw_port = ld.strip_prefix("rdma_")?;
+            // Read its IPv4 via ifconfig
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("ifconfig {} | grep 'inet ' | grep -v '127\\|169.254' | awk '{{print $2}}' | head -1", hw_port)])
+                .output().ok()?;
+            let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if ip.is_empty() { None } else {
+                tracing::info!(hw_port, %ip, "coordinator IP from RDMA hardware port");
+                Some(ip)
+            }
+        })
+        .or_else(|| resolve_tb5_coordinator_ip(&req.peer))
         .or_else(|| resolve_local_lan_ip())
         .unwrap_or_else(|| "10.1.10.100".to_string());
     tracing::info!(peer = %req.peer, coordinator_ip = %local_ip, "resolved coordinator IP");
-    let devices = resolve_device_for_peer(&topology_cache, local_hostname, &req.peer).await;
 
     // ── 5. Resolve devices + notify peer + init coordinator ───────────
     //
@@ -703,19 +716,16 @@ async fn transfer_pipeline(
         coordinator_device: devices.as_ref().map(|(ld, _)| ld.clone()),
     };
 
-    let peer_ip = match resolve_peer_mdns(&req.peer) {
-        Some(ip) => ip,
-        None => {
-            let _ = tx.send(SseEvent::error(&format!("cannot resolve peer '{}'", req.peer)).to_sse_line()).await;
-            return;
-        }
-    };
+    // Use .local mDNS hostname directly — reqwest tries all resolved IPs,
+    // avoiding the link-local-first problem of getaddrinfo.
+    let peer_host = format!("{}.local", req.peer);
+    tracing::info!(peer = %req.peer, peer_host = %peer_host, "using mDNS hostname for peer coordination");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
-    let peer_url = format!("http://{}:9090/transfer/accept", peer_ip);
+    let peer_url = format!("http://{}:9090/transfer/accept", peer_host);
     match client.post(&peer_url).json(&peer_req).send().await {
         Ok(r) if r.status().is_success() => {}
         Ok(r) => {
@@ -1302,6 +1312,12 @@ fn write_devices_json(rank: i32, local_dev: &str, peer_dev: &str) -> Result<Stri
 /// Uses libc::getaddrinfo — no Python subprocess.
 #[cfg(feature = "jaccl")]
 fn resolve_peer_mdns(peer: &str) -> Option<String> {
+    // 1. Try Tailscale status (stable IPs, always works)
+    if let Some(ip) = resolve_peer_tailscale(peer) {
+        return Some(ip);
+    }
+
+    // 2. Fallback: mDNS (.local)
     use std::ffi::CString;
     use std::net::Ipv4Addr;
 
@@ -1331,43 +1347,90 @@ fn resolve_peer_mdns(peer: &str) -> Option<String> {
     Some(addr.to_string())
 }
 
+/// Resolve peer IP via `tailscale status --json`. Stable IPs that survive reboots.
+fn resolve_peer_tailscale(peer: &str) -> Option<String> {
+    let output = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    if !output.status.success() { return None; }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    // Search peers
+    if let Some(peers) = json.get("Peer").and_then(|p| p.as_object()) {
+        for (_id, info) in peers {
+            let hostname = info.get("HostName").and_then(|h| h.as_str()).unwrap_or("");
+            if hostname.eq_ignore_ascii_case(peer) {
+                if let Some(ips) = info.get("TailscaleIPs").and_then(|i| i.as_array()) {
+                    // Return first IPv4 (skip IPv6)
+                    for ip in ips {
+                        if let Some(s) = ip.as_str() {
+                            if !s.contains(':') { return Some(s.to_string()); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the TB5 link-local IP that can reach a peer's TB5 IP.
 /// Scans all local 169.254.x.x addresses and finds one that can
 /// reach any of the peer's 169.254.x.x addresses (via ARP/ping).
 /// Returns the LOCAL IP that has connectivity.
 #[cfg(feature = "jaccl")]
 fn resolve_tb5_coordinator_ip(peer_hostname: &str) -> Option<String> {
-    // Get peer's 169.254 IPs via SSH ifconfig
-    let output = std::process::Command::new("ssh")
-        .args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes", peer_hostname,
-               "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
-        .output()
-        .ok()?;
-    let peer_ips: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| l.starts_with("169.254."))
-        .map(|s| s.to_string())
-        .collect();
+    // Get peer's 169.254 link-local IPs via SSH.
+    // Try multiple SSH targets since bare hostname may not resolve after reboot.
+    let mut ssh_targets = vec![
+        peer_hostname.to_string(),
+        format!("{}.local", peer_hostname),
+    ];
+    if let Some(ts_ip) = resolve_peer_tailscale(peer_hostname) {
+        ssh_targets.push(ts_ip);
+    }
+
+    let mut peer_ips: Vec<String> = Vec::new();
+    for target in &ssh_targets {
+        if let Ok(output) = std::process::Command::new("ssh")
+            .args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes", target,
+                   "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
+            .output()
+        {
+            if output.status.success() {
+                peer_ips = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|l| l.starts_with("169.254.") && !l.ends_with(".255"))
+                    .map(|s| s.to_string())
+                    .collect();
+                if !peer_ips.is_empty() {
+                    tracing::info!(ssh_target = %target, count = peer_ips.len(), "got peer link-local IPs");
+                    break;
+                }
+            }
+        }
+    }
     if peer_ips.is_empty() { return None; }
 
     // Get our own 169.254 IPs
-    let output = std::process::Command::new("sh")
+    let local_ips: Vec<String> = std::process::Command::new("sh")
         .args(["-c", "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
         .output()
-        .ok()?;
-    let local_ips: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| l.starts_with("169.254."))
-        .map(|s| s.to_string())
-        .collect();
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| l.starts_with("169.254.") && !l.ends_with(".255"))
+            .map(|s| s.to_string())
+            .collect())
+        .unwrap_or_default();
 
     // Find a local IP that can ping a peer IP (proves TB5 link connectivity)
     for local_ip in &local_ips {
         for peer_ip in &peer_ips {
-            let result = std::process::Command::new("ping")
-                .args(["-c", "1", "-t", "1", "-S", local_ip, peer_ip])
-                .output();
-            if let Ok(out) = result {
+            if let Ok(out) = std::process::Command::new("ping")
+                .args(["-c", "1", "-W", "1", "-S", local_ip, peer_ip])
+                .output()
+            {
                 if out.status.success() {
                     tracing::info!(%local_ip, %peer_ip, "found TB5 link-local path");
                     return Some(local_ip.clone());

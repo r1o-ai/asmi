@@ -155,6 +155,8 @@ pub enum ProcessFramework {
     MlxAudio,
     #[serde(rename = "dflash")]
     DFlashProc,
+    #[serde(rename = "ds4")]
+    Ds4,
     #[serde(rename = "watchdog")]
     Watchdog,
     #[serde(rename = "unknown")]
@@ -168,6 +170,7 @@ impl fmt::Display for ProcessFramework {
             Self::MlxLmShare => write!(f, "mlx-share"),
             Self::MlxVlm => write!(f, "mlx-vlm"),
             Self::DFlashProc => write!(f, "dflash"),
+            Self::Ds4 => write!(f, "ds4"),
             Self::VllmMlx => write!(f, "vllm-mlx"),
             Self::MlxLaunch => write!(f, "mlx-dist"),
             Self::MlxAudio => write!(f, "mlx-audio"),

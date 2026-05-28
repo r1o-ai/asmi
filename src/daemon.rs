@@ -538,17 +538,9 @@ fn match_serving(
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    // Track which ports we've already matched to avoid duplicate annotations
-    let mut matched_port: Option<u16> = None;
-
     for (frags, info) in serving_map {
-        // Skip if we already matched this model to a server on the same port
-        if matched_port == Some(info.port) {
-            continue;
-        }
         for frag in frags {
             if frag == &name_lower || frag == &dir_name || frag == &path_lower {
-                matched_port = Some(info.port);
                 return Some(serde_json::to_value(info).unwrap_or_default());
             }
         }
@@ -804,6 +796,33 @@ async fn arp_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Parse `networksetup -listallhardwareports` to build bus_index → interface name map.
+/// "Thunderbolt N" hardware port → bus_index = N-1, device = next line's "Device: enX".
+async fn build_tb_bus_map() -> serde_json::Map<String, serde_json::Value> {
+    let output = tokio::process::Command::new("networksetup")
+        .args(["-listallhardwareports"])
+        .output()
+        .await
+        .ok();
+    let mut map = serde_json::Map::new();
+    if let Some(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains("Thunderbolt") && !line.contains("Bridge") {
+                if let Some(n) = line.split("Thunderbolt ").nth(1).and_then(|s| s.trim().parse::<u8>().ok()) {
+                    if let Some(dev_line) = lines.get(i + 1) {
+                        if let Some(dev) = dev_line.strip_prefix("Device: ") {
+                            map.insert((n - 1).to_string(), serde_json::json!(dev.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Scan Thunderbolt device tree via system_profiler. Called by background cache loop.
 pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
     // Get this node's hardware model identifier (e.g., "Mac15,14", "Mac16,9")
@@ -854,6 +873,25 @@ pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
                 .unwrap_or("");
             let connected = status.contains("connected");
 
+            let domain_uuid = bus.get("domain_uuid_key")
+                .and_then(|v| v.as_str()).unwrap_or("");
+            let switch_uid = bus.get("switch_uid_key")
+                .and_then(|v| v.as_str()).unwrap_or("");
+
+            // Parse bus index from _name: "thunderboltusb4_bus_3" → 3
+            let bus_index: Option<u8> = bus.get("_name")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.strip_prefix("thunderboltusb4_bus_"))
+                .and_then(|n| n.parse().ok());
+
+            // Extract peer domain_uuid from first connected _items[] entry
+            let peer_domain_uuid = bus.get("_items")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("domain_uuid_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
             fn find_apple_devices(items: &[serde_json::Value], results: &mut Vec<(String, String)>) {
                 for item in items {
                     let vendor = item.get("vendor_name_key").and_then(|v| v.as_str()).unwrap_or("");
@@ -873,30 +911,32 @@ pub async fn scan_thunderbolt(hostname: &str) -> serde_json::Value {
                 find_apple_devices(items, &mut devices);
             }
 
-            let port_json = if devices.is_empty() {
-                serde_json::json!({
-                    "port": receptacle,
-                    "connected": connected,
-                    "speed": speed,
-                })
-            } else {
-                serde_json::json!({
-                    "port": receptacle,
-                    "connected": true,
-                    "speed": speed,
-                    "devices": devices.iter().map(|(name, model)| {
-                        serde_json::json!({ "name": name, "model_id": model })
-                    }).collect::<Vec<_>>(),
-                })
-            };
+            let mut port_json = serde_json::json!({
+                "port": receptacle,
+                "connected": connected || !devices.is_empty(),
+                "speed": speed,
+                "bus_index": bus_index,
+                "domain_uuid": domain_uuid,
+                "switch_uid": switch_uid,
+                "peer_domain_uuid": if peer_domain_uuid.is_empty() { None } else { Some(peer_domain_uuid) },
+            });
+            if !devices.is_empty() {
+                port_json["devices"] = serde_json::json!(devices.iter().map(|(name, model)| {
+                    serde_json::json!({ "name": name, "model_id": model })
+                }).collect::<Vec<_>>());
+            }
             ports.push(port_json);
         }
     }
+
+    // Bus-to-interface map from networksetup (e.g., "Thunderbolt 3" → "en4" → bus_index 2)
+    let bus_map = build_tb_bus_map().await;
 
     serde_json::json!({
         "hostname": hostname,
         "hw_model": hw_model,
         "ports": ports,
+        "bus_map": bus_map,
     })
 }
 

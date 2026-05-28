@@ -72,19 +72,6 @@ fn resolve_mlx_launch() -> String {
     "mlx.launch".to_string()
 }
 
-/// Resolve the `mlx_lm.server` CLI script path.
-fn resolve_mlx_lm_server() -> String {
-    for path in &[
-        "/opt/homebrew/bin/mlx_lm.server",
-        "/usr/local/bin/mlx_lm.server",
-    ] {
-        if std::path::Path::new(path).exists() {
-            return path.to_string();
-        }
-    }
-    "mlx_lm.server".to_string()
-}
-
 /// Warmup timeout for bare server start (no model — should be fast).
 const WARMUP_TIMEOUT_BARE_SECS: u64 = 60;
 /// Warmup timeout for model loading (large models can take 5+ minutes on M3 Ultra).

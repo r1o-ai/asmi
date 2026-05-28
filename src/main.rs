@@ -82,7 +82,7 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Discover TB5/RDMA mesh topology via mlx.distributed_config.
+    /// Discover TB5/RDMA mesh topology (native UUID + mlx fallback).
     Topology {
         /// Hosts to check (comma-separated). Defaults to config nodes.
         #[arg(long, value_delimiter = ',')]

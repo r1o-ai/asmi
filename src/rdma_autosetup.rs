@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::topology::TopologyReport;
+
 /// RDMA settings from ~/.r1o/settings.json
 #[derive(Debug, Deserialize)]
 struct RdmaSettings {
@@ -18,7 +20,7 @@ struct RdmaSettings {
     #[serde(default)]
     _ip_assignment: Option<String>,
     #[serde(default = "default_true")]
-    route_fix: bool,
+    _route_fix: bool,
     /// Static TB5 IP assignments per interface. Applied on boot instead of random
     /// link-locals. Format: [{"iface": "en5", "ip": "192.168.10.2", "mask": "255.255.255.252"}]
     /// Nodes without this list fall back to link-local auto-assignment.
@@ -48,7 +50,7 @@ impl Default for RdmaSettings {
             auto_setup: true,
             auto_destroy_bridge0: true,
             _ip_assignment: None,
-            route_fix: true,
+            _route_fix: true,
             static_ips: vec![],
             default_gateway: None,
         }
@@ -137,6 +139,7 @@ pub enum RouteResult {
         primary_interface: String,
         interfaces_with_ips: usize,
     },
+    #[allow(dead_code)]
     Failed(String),
 }
 
@@ -170,10 +173,9 @@ pub struct VerifiedLink {
 /// Run the full RDMA autosetup sequence. Non-fatal — logs warnings on failure.
 /// Respects settings from ~/.r1o/settings.json → rdma.
 ///
-/// `hosts_override`: caller-supplied list of hosts for mlx.distributed_config.
-/// `None` → derive from NodeMap.rdma_ips (legacy behaviour). `Some(vec)` → use
-/// exactly those hosts (caller is responsible for ensuring they're reachable;
-/// mlx.distributed_config aborts entirely if any host in its argv fails SSH).
+/// `hosts_override`: caller-supplied list of hosts for topology discovery.
+/// `None` → derive from NodeMap.nodes (all known nodes). `Some(vec)` → use
+/// exactly those hosts.
 pub async fn autosetup(
     node_map: &tokio::sync::RwLock<asmi_core::NodeMap>,
     hosts_override: Option<Vec<String>>,
@@ -186,35 +188,20 @@ pub async fn autosetup(
         return report;
     }
 
-    // Step 1: bridge0 (still needed — mlx.distributed_config doesn't destroy it)
+    // Step 1: bridge0
     if settings.auto_destroy_bridge0 {
         report.bridge0 = handle_bridge0().await;
     } else {
         tracing::info!("bridge0 auto-destroy disabled in settings");
     }
 
-    // Step 2: ensure IPs on active TB5 interfaces.
-    // If static_ips configured in settings, apply those (deterministic, survives reboot).
-    // Otherwise fall back to link-local auto-assignment.
-    if !settings.static_ips.is_empty() {
-        report.ips = apply_static_ips(&settings.static_ips).await;
-        if let Some(ref gw) = settings.default_gateway {
-            apply_default_gateway(gw).await;
-        }
-    } else {
-        match ensure_tb5_ips().await {
-            Ok(ips) => report.ips = ips,
-            Err(e) => tracing::warn!("ensure_tb5_ips failed: {e}"),
-        }
-    }
-
-    // Step 2b: clean self-MAC poisoned ARP entries (bridge0 proxy ARP remnants)
-    clean_self_arp_poison(&report.ips).await;
-
-    // Step 3: delegate to mlx.distributed_config (Apple's official tool)
-    // It discovers topology via SSH + system_profiler, configures 192.168.0.x /30
-    // subnets per TB5 link, and generates the correct JACCL hostfile.
-    // Host list: caller override wins; otherwise NodeMap.rdma_ips keys.
+    // Step 2: Assign IPs to TB5 interfaces.
+    // Priority: topology-derived > static config > link-local fallback.
+    //
+    // Topology-derived: discover_topology() uses native HTTP + UUID cross-match
+    // (fallback: mlx.distributed_config, then ARP). Sorts links deterministically,
+    // assigns 192.168.0.{4i+1}/30 per link. Applied locally + pushed to remote
+    // nodes via SSH.
     let hosts: Vec<String> = match hosts_override {
         Some(h) => {
             tracing::info!(count = h.len(), "autosetup: using caller-supplied host list");
@@ -222,17 +209,66 @@ pub async fn autosetup(
         }
         None => {
             let nm = node_map.read().await;
-            nm.rdma_ips.keys().cloned().collect()
+            // Use all known nodes (not just rdma_ips) so topology discovers
+            // links between nodes that don't have IPs assigned yet.
+            if !nm.nodes.is_empty() {
+                nm.nodes.clone()
+            } else {
+                nm.rdma_ips.keys().cloned().collect()
+            }
         }
     };
 
+    let local_hostname = get_local_hostname();
+    let mut topology_ok = false;
+
+    if hosts.len() >= 2 {
+        let hosts_for_topo = hosts.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::topology::discover_topology(&hosts_for_topo, "jaccl")
+        })
+        .await
+        {
+            Ok(Ok(topo)) => {
+                let assigned = assign_topology_ips(&topo, &local_hostname, true).await;
+                if !assigned.is_empty() {
+                    tracing::info!(
+                        count = assigned.len(),
+                        "topology-derived IPs assigned (local + remote)"
+                    );
+                    report.ips = assigned;
+                    topology_ok = true;
+                }
+            }
+            Ok(Err(e)) => tracing::warn!("topology discovery failed: {e}"),
+            Err(e) => tracing::warn!("topology task panicked: {e}"),
+        }
+    }
+
+    // Fallback: static config or link-local
+    if !topology_ok {
+        if !settings.static_ips.is_empty() {
+            report.ips = apply_static_ips(&settings.static_ips).await;
+            if let Some(ref gw) = settings.default_gateway {
+                apply_default_gateway(gw).await;
+            }
+        } else {
+            match ensure_tb5_ips().await {
+                Ok(ips) => report.ips = ips,
+                Err(e) => tracing::warn!("ensure_tb5_ips failed: {e}"),
+            }
+        }
+    }
+
+    // Step 2b: clean self-MAC poisoned ARP entries (bridge0 proxy ARP remnants)
+    clean_self_arp_poison(&report.ips).await;
+
+    // Step 3: generate JACCL hostfile via mlx.distributed_config (no --auto-setup).
     if !hosts.is_empty() {
         match run_mlx_distributed_config(&hosts).await {
             Ok((hostfile_path, verified_links)) => {
                 let n_verified = verified_links.len();
                 report.hostfile = Some(hostfile_path);
-                // Preserve existing schema: populate routes + peers fields
-                // consumed by r1o web/electron UI
                 report.peers = PeerResult {
                     total_tried: hosts.len(),
                     verified_links,
@@ -246,7 +282,6 @@ pub async fn autosetup(
             }
             Err(e) => {
                 tracing::warn!("mlx.distributed_config failed: {e}");
-                // Fallback: use our legacy probe
                 let nm = node_map.read().await;
                 let (routes, peers) = probe_and_route(&nm, &report.ips).await;
                 report.routes = routes;
@@ -303,8 +338,9 @@ async fn run_mlx_distributed_config(
     let output_path_clone = output_path.clone();
     let hosts_arg_clone = hosts_arg.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // Pipe empty input to skip the "Enter to continue" prompts
-        let mut child = std::process::Command::new(&mlx_config_bin)
+        // No --auto-setup: it kernel panics on macOS 26.5 (FB100029547).
+        // IP assignment is handled by assign_topology_ips() instead.
+        std::process::Command::new(&mlx_config_bin)
             .args([
                 "--hosts",
                 &hosts_arg_clone,
@@ -312,26 +348,14 @@ async fn run_mlx_distributed_config(
                 "thunderbolt",
                 "--backend",
                 "jaccl",
-                "--auto-setup",
                 "--output-hostfile",
                 &output_path_clone,
                 "--ignore-unreachable",
             ])
-            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn mlx.distributed_config: {e}"))?;
-
-        // Send newlines to pass through interactive prompts
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(b"\n\n\n\n\n\n\n\n\n\n");
-        }
-
-        child
-            .wait_with_output()
-            .map_err(|e| format!("wait mlx.distributed_config: {e}"))
+            .output()
+            .map_err(|e| format!("spawn mlx.distributed_config: {e}"))
     })
     .await
     .map_err(|e| format!("join: {e}"))??;
@@ -428,7 +452,216 @@ fn detect_bridge0() -> Vec<String> {
     }
 }
 
-// ── Step 2: ensure TB5 IPs ──────────────────────────────────────────
+// ── Step 2: topology-derived IP assignment ─────────────────────────
+
+/// Derive deterministic /30 IPs from topology links and apply them.
+///
+/// Algorithm: sort links by (min_node, max_node), then for link i:
+///   - alphabetically-first node gets 192.168.0.{4i+1}/30
+///   - alphabetically-second node gets 192.168.0.{4i+2}/30
+///
+/// Applied locally via ifconfig, pushed to remote nodes via SSH.
+/// Returns the IPs assigned to the LOCAL node only.
+pub async fn assign_topology_ips(
+    topo: &TopologyReport,
+    local_hostname: &str,
+    push_remote: bool,
+) -> Vec<InterfaceIp> {
+    let mut sorted_links = topo.links.clone();
+    sorted_links.sort_by(|a, b| {
+        let a_pair = if a.node_a < a.node_b {
+            (&a.node_a, &a.node_b)
+        } else {
+            (&a.node_b, &a.node_a)
+        };
+        let b_pair = if b.node_a < b.node_b {
+            (&b.node_a, &b.node_b)
+        } else {
+            (&b.node_b, &b.node_a)
+        };
+        a_pair.cmp(&b_pair)
+    });
+
+    let mut local_ips = vec![];
+
+    for (i, link) in sorted_links.iter().enumerate() {
+        let base = 4 * i;
+        let (first_node, first_dev, second_node, second_dev) = if link.node_a < link.node_b {
+            (&link.node_a, &link.device_a, &link.node_b, &link.device_b)
+        } else {
+            (&link.node_b, &link.device_b, &link.node_a, &link.device_a)
+        };
+
+        let ip_first = format!("192.168.0.{}", base + 1);
+        let ip_second = format!("192.168.0.{}", base + 2);
+        let iface_first = first_dev.strip_prefix("rdma_").unwrap_or(first_dev);
+        let iface_second = second_dev.strip_prefix("rdma_").unwrap_or(second_dev);
+
+        // Assign first node's side
+        if first_node == local_hostname {
+            if apply_ip_local(iface_first, &ip_first).await {
+                local_ips.push(InterfaceIp {
+                    iface: iface_first.to_string(),
+                    ip: ip_first.clone(),
+                    source: "topology".into(),
+                });
+            }
+        } else if push_remote {
+            apply_ip_remote(first_node, iface_first, &ip_first).await;
+        }
+
+        // Assign second node's side
+        if second_node == local_hostname {
+            if apply_ip_local(iface_second, &ip_second).await {
+                local_ips.push(InterfaceIp {
+                    iface: iface_second.to_string(),
+                    ip: ip_second.clone(),
+                    source: "topology".into(),
+                });
+            }
+        } else if push_remote {
+            apply_ip_remote(second_node, iface_second, &ip_second).await;
+        }
+
+        tracing::info!(
+            "link {i}: {first_node}:{iface_first}={ip_first} ↔ {second_node}:{iface_second}={ip_second}"
+        );
+    }
+
+    local_ips
+}
+
+/// Apply an IP to a local interface. Removes any existing IP, assigns the new
+/// one, and adds a /30 route through this interface.
+async fn apply_ip_local(iface: &str, ip: &str) -> bool {
+    let iface_own = iface.to_string();
+    let ip_own = ip.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        // Remove existing IP (if any) to avoid stale aliases
+        let existing = Command::new("ifconfig")
+            .arg(&iface_own)
+            .output()
+            .ok()
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .find(|l| l.contains("inet ") && !l.contains("inet6"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .map(String::from)
+            });
+        if let Some(ref old_ip) = existing {
+            if old_ip != &ip_own {
+                let _ = Command::new("sudo")
+                    .args(["ifconfig", &iface_own, "delete", old_ip])
+                    .output();
+            }
+        }
+        let out = Command::new("sudo")
+            .args(["ifconfig", &iface_own, "inet", &ip_own, "netmask", "255.255.255.252"])
+            .output();
+
+        // Ensure /30 route exists (macOS sometimes drops it on rapid reassignment)
+        let octets: Vec<u8> = ip_own.split('.').filter_map(|s| s.parse().ok()).collect();
+        if octets.len() == 4 {
+            let net_base = octets[3] & 0xFC; // /30 network base
+            let subnet = format!("{}.{}.{}.{}/30", octets[0], octets[1], octets[2], net_base);
+            let _ = Command::new("sudo")
+                .args(["route", "delete", "-net", &subnet])
+                .output();
+            let _ = Command::new("sudo")
+                .args(["route", "add", "-net", &subnet, "-interface", &iface_own])
+                .output();
+        }
+
+        out
+    })
+    .await;
+
+    match result {
+        Ok(Ok(out)) if out.status.success() => {
+            tracing::info!("{iface}: assigned {ip} (topology)");
+            true
+        }
+        _ => {
+            tracing::warn!("{iface}: failed to assign {ip}");
+            false
+        }
+    }
+}
+
+/// Push an IP to a remote node via SSH. Also adds the /30 route.
+async fn apply_ip_remote(host: &str, iface: &str, ip: &str) {
+    let host_own = host.to_string();
+    let iface_own = iface.to_string();
+    let ip_own = ip.to_string();
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+    let result = tokio::task::spawn_blocking(move || {
+        // Parse /30 network base for route
+        let octets: Vec<&str> = ip_own.split('.').collect();
+        let route_cmd = if octets.len() == 4 {
+            if let Ok(last) = octets[3].parse::<u8>() {
+                let net_base = last & 0xFC;
+                format!(
+                    "sudo route delete -net {}.{}.{}.{}/30 2>/dev/null; \
+                     sudo route add -net {}.{}.{}.{}/30 -interface {iface_own}",
+                    octets[0], octets[1], octets[2], net_base,
+                    octets[0], octets[1], octets[2], net_base,
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        let cmd = format!(
+            "old=$(ifconfig {iface_own} 2>/dev/null | grep 'inet ' | awk '{{print $2}}'); \
+             [ -n \"$old\" ] && [ \"$old\" != \"{ip_own}\" ] && sudo ifconfig {iface_own} delete $old 2>/dev/null; \
+             sudo ifconfig {iface_own} inet {ip_own} netmask 255.255.255.252; \
+             {route_cmd}"
+        );
+        Command::new("ssh")
+            .args([
+                "-o", "ConnectTimeout=5",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "BatchMode=yes",
+                "-o", "LogLevel=ERROR",
+                &format!("{user}@{host_own}"),
+                &cmd,
+            ])
+            .output()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(out)) if out.status.success() => {
+            tracing::info!("{host}:{iface}: assigned {ip} (topology, remote)");
+        }
+        _ => {
+            tracing::warn!("{host}:{iface}: failed to assign {ip} (remote)");
+        }
+    }
+}
+
+fn get_local_hostname() -> String {
+    Command::new("scutil")
+        .args(["--get", "LocalHostName"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_lowercase();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .unwrap_or_else(|| {
+            Command::new("hostname")
+                .arg("-s")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|_| "unknown".into())
+        })
+}
+
+// ── Step 2 (fallback): static/link-local ───────────────────────────
 
 /// Apply static IPs from settings. Deterministic — same result on every boot.
 async fn apply_static_ips(entries: &[StaticIpEntry]) -> Vec<InterfaceIp> {
@@ -611,78 +844,6 @@ fn get_interface_status(iface: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Ensure each Thunderbolt port (en1/en2/en3/en4/en5/en6) has its own
-/// network service. macOS won't route traffic through interfaces that
-/// only belong to the destroyed bridge0 — they need an explicit service.
-async fn ensure_tb_network_services() {
-    // Get list of active TB hardware ports and their interface names
-    let ports = tokio::task::spawn_blocking(|| {
-        Command::new("networksetup")
-            .arg("-listallhardwareports")
-            .output()
-    })
-    .await;
-
-    let Ok(Ok(ports_out)) = ports else { return };
-    let ports_text = String::from_utf8_lossy(&ports_out.stdout).to_string();
-
-    // Parse: lines come in 3-line blocks: "Hardware Port: X", "Device: enN", "Ethernet Address: ..."
-    let mut tb_devices: Vec<String> = vec![];
-    let lines: Vec<&str> = ports_text.lines().collect();
-    for i in 0..lines.len() {
-        if lines[i].starts_with("Hardware Port:") && lines[i].contains("Thunderbolt")
-            && !lines[i].contains("Bridge")
-            && i + 1 < lines.len()
-        {
-            if let Some(dev) = lines[i + 1].strip_prefix("Device: ") {
-                tb_devices.push(dev.trim().to_string());
-            }
-        }
-    }
-
-    // Get existing services
-    let services = tokio::task::spawn_blocking(|| {
-        Command::new("networksetup")
-            .arg("-listnetworkserviceorder")
-            .output()
-    })
-    .await;
-    let Ok(Ok(services_out)) = services else { return };
-    let services_text = String::from_utf8_lossy(&services_out.stdout).to_string();
-
-    // For each TB device, check if it has a service; create if missing
-    for dev in &tb_devices {
-        let device_marker = format!("Device: {})", dev);
-        if services_text.contains(&device_marker) {
-            continue; // Already has a service
-        }
-
-        let service_name = format!("r1o TB {dev}");
-        let dev_clone = dev.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            Command::new("sudo")
-                .args(["networksetup", "-createnetworkservice", &service_name, &dev_clone])
-                .output()
-        })
-        .await;
-
-        match &result {
-            Ok(Ok(out)) if out.status.success() => {
-                tracing::info!("created network service for {dev}");
-            }
-            Ok(Ok(out)) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                tracing::warn!(
-                    "failed to create service for {dev} (macOS may require System Settings > Network — manually create 'r1o TB {dev}' service): stderr={err} stdout={stdout}"
-                );
-            }
-            _ => {
-                tracing::warn!("failed to spawn networksetup for {dev}");
-            }
-        }
-    }
-}
 
 /// Clean ARP entries that point a peer IP to the LOCAL machine's MAC.
 /// These are bridge0 proxy ARP remnants that survive bridge0 destruction.

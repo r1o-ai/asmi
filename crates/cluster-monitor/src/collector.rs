@@ -225,7 +225,7 @@ fn parse_hw_identity(text: &str) -> (Option<String>, Option<String>, Option<Stri
 /// Also captures mlx.launch (distributed launcher), mlx_lm.share, mlx_audio.
 /// JACCL detection: --backend jaccl in args, or ps -E showing MLX_JACCL env vars.
 const CMD_PS_MLX: &str =
-    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch|mlx_audio' | grep -v grep";
+    "ps aux | grep -E 'mlx_lm\\.(server|share)|mlx_vlm\\.server|vllm_mlx|mlx\\.launch|mlx_audio|ds4-server' | grep -v grep";
 
 /// RDMA status + ifconfig in one command to minimize SSH connections.
 const CMD_RDMA_NET: &str =
@@ -1020,6 +1020,8 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
             ProcessFramework::VllmMlx
         } else if command.contains("mlx_audio") {
             ProcessFramework::MlxAudio
+        } else if command.contains("ds4-server") || command.contains("ds4 ") {
+            ProcessFramework::Ds4
         } else {
             continue; // Not a recognised ML process
         };
@@ -1028,8 +1030,9 @@ pub fn parse_ps_mlx(text: &str) -> Vec<ProcessInfo> {
         let cpu_percent: f64 = cap[3].parse().unwrap_or(0.0);
         let mem_percent: f64 = cap[4].parse().unwrap_or(0.0);
 
-        // Extract model path
-        let model = extract_flag_value(command, "--model");
+        // Extract model path (ds4 uses -m instead of --model)
+        let model = extract_flag_value(command, "--model")
+            .or_else(|| extract_flag_value(command, "-m"));
 
         // Simplify model path to just the model name (last path component)
         let model = model.map(|m| {

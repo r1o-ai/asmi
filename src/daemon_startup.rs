@@ -275,7 +275,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         });
     }
 
-    // Topology cache — runs mlx.distributed_config every 60s (only in cluster hub mode)
+    // Topology cache — runs discover_topology (native first, mlx/ARP fallback) every 60s (only in cluster hub mode)
     let topology_cache: Arc<tokio::sync::RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>> =
         Arc::new(tokio::sync::RwLock::new(None));
     if cluster_hub {
