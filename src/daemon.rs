@@ -1819,6 +1819,60 @@ struct TreeParams {
     min_mem: Option<f64>,
 }
 
+/// GET /port/:port — find what process is listening on a given port.
+async fn port_lookup_handler(
+    Path(port): Path<u16>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let output = tokio::process::Command::new("lsof")
+        .args(["-t", "-sTCP:LISTEN", "-i", &format!("TCP:{}", port)])
+        .output()
+        .await
+        .map_err(|e| ApiError::Internal(format!("lsof failed: {e}")))?;
+
+    let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pid_str.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "port": port,
+            "in_use": false,
+        })));
+    }
+
+    let pid: u32 = pid_str.lines().next()
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or(0);
+
+    let ps_out = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid,pcpu,rss,comm="])
+        .output()
+        .await
+        .ok();
+
+    let (cpu, rss_mb, name) = if let Some(ref o) = ps_out {
+        let line = String::from_utf8_lossy(&o.stdout);
+        let parts: Vec<&str> = line.trim().lines().last()
+            .unwrap_or("").split_whitespace().collect();
+        if parts.len() >= 4 {
+            let cpu: f64 = parts[1].parse().unwrap_or(0.0);
+            let rss_kb: u64 = parts[2].parse().unwrap_or(0);
+            let name = parts[3..].join(" ");
+            (cpu, rss_kb / 1024, name)
+        } else {
+            (0.0, 0, "unknown".to_string())
+        }
+    } else {
+        (0.0, 0, "unknown".to_string())
+    };
+
+    Ok(Json(serde_json::json!({
+        "port": port,
+        "in_use": true,
+        "pid": pid,
+        "process_name": name,
+        "cpu_percent": cpu,
+        "rss_mb": rss_mb,
+    })))
+}
+
 /// GET /processes/tree — build a process tree from ps output.
 ///
 /// On-demand endpoint (not part of the regular poll loop).
@@ -3121,6 +3175,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health/network", get(network_health_handler))
         .route("/health/network/fix", post(network_fix_handler))
         .route("/processes", get(processes_handler))
+        .route("/port/{port}", get(port_lookup_handler))
         .route("/models", get(models_handler))
         .route("/volumes", get(volumes_handler))
         .route("/logs", get(logs_handler))

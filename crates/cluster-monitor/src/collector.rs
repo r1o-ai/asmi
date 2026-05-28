@@ -239,7 +239,7 @@ const CMD_JACCL_ENV: &str =
 
 /// Top CPU-consuming processes (sorted by CPU% descending, top 8).
 const CMD_PS_TOP: &str =
-    "ps -arcxo pid,pcpu,comm 2>/dev/null | head -8";
+    "ps -arcxo pid,pcpu,rss,comm 2>/dev/null | head -50";
 
 /// iostat: 2 samples, 1s apart. Take the second (real-time) sample.
 const CMD_IOSTAT: &str =
@@ -1217,22 +1217,23 @@ fn parse_ps_top(text: &str) -> Vec<TaskEnergy> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
-            // Skip header
             if line.starts_with("PID") || line.is_empty() {
                 return None;
             }
             let mut parts = line.split_whitespace();
             let pid: u32 = parts.next()?.parse().ok()?;
             let cpu: f64 = parts.next()?.parse().ok()?;
+            let rss_kb: u64 = parts.next()?.parse().ok()?;
             let name = parts.collect::<Vec<_>>().join(" ");
-            if name.is_empty() || cpu <= 0.0 {
+            if name.is_empty() {
                 return None;
             }
             Some(TaskEnergy {
                 pid,
                 name,
                 energy_impact: cpu,
-                watts_share: 0.0, // calculated downstream if needed
+                watts_share: 0.0,
+                footprint_mb: Some((rss_kb as f64 / 1024.0).round() as u64),
             })
         })
         .collect()

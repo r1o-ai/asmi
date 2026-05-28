@@ -208,6 +208,8 @@ pub struct TaskEnergy {
     pub pid: u32,
     pub energy_impact: f64,
     pub watts_share: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_mb: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +907,16 @@ pub struct ServeStatus {
     /// keeps older clients compatible.
     #[serde(default)]
     pub launchd: Option<LaunchdInfo>,
+    /// Non-model process squatting this port. Populated when the manager is
+    /// Error/Bare but lsof finds a PID that asmi didn't launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_squatter: Option<PortSquatter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortSquatter {
+    pub pid: u32,
+    pub process_name: String,
 }
 
 /// A model process detected on the node that was NOT launched by asmi.

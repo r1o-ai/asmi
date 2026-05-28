@@ -602,6 +602,11 @@ impl ServeManager {
             Some(p) => crate::launchd::describe_pid(p).await,
             None => None,
         };
+        let port_squatter = if pid.is_none() && matches!(state, ServeState::Error | ServeState::Bare) {
+            detect_port_squatter(port).await
+        } else {
+            None
+        };
         ServeStatus {
             state,
             model,
@@ -613,6 +618,7 @@ impl ServeManager {
             elapsed_ms: elapsed,
             error,
             launchd,
+            port_squatter,
         }
     }
 
@@ -718,10 +724,20 @@ async fn probe_model_server(port: u16) -> Option<(u32, Option<String>)> {
 
 async fn get_pid_on_port(port: u16) -> Option<u32> {
     let output = tokio::process::Command::new("lsof")
-        .args(["-ti", "-sTCP:LISTEN", &format!(":{}", port)])
+        .args(["-t", "-sTCP:LISTEN", "-i", &format!("TCP:{}", port)])
         .output().await.ok()?;
     let s = String::from_utf8_lossy(&output.stdout);
     s.trim().lines().next()?.parse().ok()
+}
+
+async fn detect_port_squatter(port: u16) -> Option<asmi_core::PortSquatter> {
+    let pid = get_pid_on_port(port).await?;
+    let output = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output().await.ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() { return None; }
+    Some(asmi_core::PortSquatter { pid, process_name: name })
 }
 
 /// Background serve load task.
