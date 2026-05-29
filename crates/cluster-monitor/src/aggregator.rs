@@ -3,7 +3,36 @@
 //! cluster monitoring data.
 
 use crate::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Strip `-N` numeric suffixes from `hostname` recursively, returning the
+/// first prefix that matches a known cluster node in `real` (case-insensitive).
+/// If the input itself is already a known canonical node, return it unchanged.
+/// If no parent in the strip chain is in `real`, return the input lowered.
+///
+/// Handles mDNS rename cascades (`hub` → `hub-2` → `hub-2-3` ...) without
+/// collapsing legitimate sibling names (e.g. `worker` + `worker-2` as
+/// distinct registered nodes).
+pub fn canonicalize_hostname(hostname: &str, real: &HashSet<String>) -> String {
+    let lowered = hostname.to_lowercase();
+    if real.contains(&lowered) {
+        return lowered;
+    }
+    let mut current = lowered;
+    for _ in 0..6 {
+        let Some(idx) = current.rfind('-') else { return current; };
+        let suffix = &current[idx + 1..];
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            return current;
+        }
+        let parent = current[..idx].to_string();
+        if real.contains(&parent) {
+            return parent;
+        }
+        current = parent;
+    }
+    current
+}
 
 /// Full cluster state — latest snapshots, per-node histories, and cluster-wide
 /// aggregates. Updated by the [`ClusterMonitor`](crate::ClusterMonitor) polling
@@ -460,5 +489,79 @@ mod tests {
         assert_eq!(state.aggregates.nodes_online, 1);
         // Only online node contributes to total_watts
         assert!((state.aggregates.total_watts - 13.1).abs() < 0.1);
+    }
+
+    // ── canonicalize_hostname ─────────────────────────────────────────────
+
+    fn real_set(nodes: &[&str]) -> HashSet<String> {
+        nodes.iter().map(|n| n.to_lowercase()).collect()
+    }
+
+    #[test]
+    fn canonicalize_already_canonical_returns_unchanged() {
+        assert_eq!(canonicalize_hostname("hub", &real_set(&["hub", "m3u2"])), "hub");
+    }
+
+    #[test]
+    fn canonicalize_strips_rename_to_canonical() {
+        assert_eq!(canonicalize_hostname("hub-2", &real_set(&["hub"])), "hub");
+        assert_eq!(canonicalize_hostname("m3u4-2237", &real_set(&["m3u4"])), "m3u4");
+    }
+
+    #[test]
+    fn canonicalize_chained_renames() {
+        assert_eq!(canonicalize_hostname("hub-2-3", &real_set(&["hub"])), "hub");
+    }
+
+    #[test]
+    fn canonicalize_case_insensitive() {
+        assert_eq!(canonicalize_hostname("Hub-2", &real_set(&["hub"])), "hub");
+    }
+
+    #[test]
+    fn canonicalize_preserves_legit_sibling() {
+        // If cluster.json registers BOTH `worker` and `worker-2` as distinct
+        // canonical nodes, the input `worker-2` must NOT collapse to `worker`.
+        assert_eq!(
+            canonicalize_hostname("worker-2", &real_set(&["worker", "worker-2"])),
+            "worker-2"
+        );
+    }
+
+    #[test]
+    fn canonicalize_non_numeric_suffix_preserved() {
+        assert_eq!(canonicalize_hostname("hub-spare", &real_set(&["hub"])), "hub-spare");
+    }
+
+    #[test]
+    fn canonicalize_no_parent_in_real_returns_stripped() {
+        // No `foo` in real; strips once to `foo`, then no more hyphen → returns `foo`.
+        assert_eq!(canonicalize_hostname("foo-1", &real_set(&["hub"])), "foo");
+    }
+
+    #[test]
+    fn canonicalize_empty_real_set_terminates() {
+        // Edge case: NodeMap empty. Strip still terminates without panic.
+        assert_eq!(canonicalize_hostname("hub-2", &real_set(&[])), "hub");
+    }
+
+    #[test]
+    fn canonicalize_empty_string_returns_empty() {
+        assert_eq!(canonicalize_hostname("", &real_set(&["hub"])), "");
+    }
+
+    #[test]
+    fn canonicalize_deep_cascade_capped_at_six() {
+        // Attacker DoS test: 8-level cascade should not panic or loop forever.
+        // After 6 iters, returns whatever's left — NOT "hub", because cap exits
+        // before reaching the canonical parent.
+        let result = canonicalize_hostname("hub-1-2-3-4-5-6-7-8", &real_set(&["hub"]));
+        // Verify: terminates (no panic), returns something (not the original).
+        assert_ne!(result, "hub-1-2-3-4-5-6-7-8");
+        // After 6 strips from the right: hub-1-2-3-4-5-6-7-8 → hub-1-2-3-4-5-6-7
+        // → hub-1-2-3-4-5-6 → hub-1-2-3-4-5 → hub-1-2-3-4 → hub-1-2-3 → hub-1-2
+        // (6 iters; current="hub-1-2", loop exits). Function returns "hub-1-2".
+        // This is "hub-1-2" — NOT "hub". Confirms the cap leaves uncanonical names.
+        assert_eq!(result, "hub-1-2");
     }
 }
