@@ -1461,14 +1461,30 @@ async fn resolve_mlx_label() -> Option<String> {
 /// resolved) is NOT restarted here. Use the existing
 /// `POST /launchd/disable` + `POST /launchd/enable` with the resolved label
 /// directly for that.
+///
+/// **Loopback-gated per PR #23 adversarial-critic verdict (2026-05-28):**
+/// asmi binds 0.0.0.0 so a Tailnet/LAN peer would otherwise be able to DoS
+/// hermes-api by restarting it in a tight loop. Mirrors the pattern at
+/// `daemon.rs:2720` (`bridge0_destroy_handler`). The 403 body is shaped
+/// identically to that handler's so existing client diagnostics work.
 async fn hermes_restart_handler(
     State(_state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     const HERMES_LABEL: &str = "com.ace.hermes-api";
     const HERMES_PORT: u16 = 41104;
     const POLL_TIMEOUT_SECS: u64 = 15;
+
+    // Safety: only allow from localhost (loopback). This handler triggers
+    // launchctl disable+enable, which can knock hermes-api offline if
+    // run in a tight loop — must not be reachable from the Tailnet/LAN.
+    if !addr.ip().is_loopback() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "hermes/restart is localhost-only"
+        }))).into_response();
+    }
 
     // 1. disable
     if let Err(e) = crate::launchd::disable(HERMES_LABEL).await {
@@ -1531,13 +1547,31 @@ async fn hermes_restart_handler(
 /// Request body is forwarded as-is. Response body is forwarded as-is with
 /// the same status code. Errors at the proxy layer (connect refused,
 /// timeout) return 502 Bad Gateway.
+///
+/// **Loopback-gated per PR #23 adversarial-critic verdict (2026-05-28):**
+/// asmi binds 0.0.0.0 so a Tailnet/LAN peer would otherwise be able to
+/// overwrite the hub's `~/.hermes/config.yaml` via this proxy. Mirrors
+/// the pattern at `daemon.rs:2720` (`bridge0_destroy_handler`). The
+/// upstream hermes-api `update_config()` is itself reachable only on
+/// 127.0.0.1, so this is the only path a remote peer could mutate
+/// hermes config — gate it identically.
 async fn hermes_config_handler(
     State(_state): State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     const HERMES_PORT: u16 = 41104;
+
+    // Safety: only allow from localhost (loopback). Mutates persistent
+    // config on disk via the hermes-api PATCH proxy — must not be
+    // reachable from the Tailnet/LAN.
+    if !addr.ip().is_loopback() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "hermes/config is localhost-only"
+        }))).into_response();
+    }
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
