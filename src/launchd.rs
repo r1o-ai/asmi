@@ -260,6 +260,15 @@ pub async fn disable(label: &str) -> Result<(), LaunchdError> {
 /// Assumes the plist still exists at `~/Library/LaunchAgents/<label>.plist`.
 /// If the agent is already loaded, `bootstrap` returns an error which we
 /// downgrade (it's the desired steady state).
+///
+/// Per PR #23 adversarial-critic verdict (2026-05-28, LOW finding #5):
+/// previously the bootstrap result was discarded via `let _ = ...`, so
+/// genuine plist errors (missing file, malformed XML, invalid program
+/// path) surfaced upstream as opaque 504 timeouts after a 15s health
+/// wait. Now we inspect the error and only swallow the
+/// "already-bootstrapped" steady-state. Anything else is propagated so
+/// `hermes_restart_handler` returns a 500 with the real launchctl
+/// stderr.
 pub async fn enable(label: &str) -> Result<(), LaunchdError> {
     guard_protected(label)?;
     let uid = current_uid();
@@ -270,9 +279,23 @@ pub async fn enable(label: &str) -> Result<(), LaunchdError> {
 
     let home = std::env::var("HOME").unwrap_or_default();
     let plist = format!("{}/Library/LaunchAgents/{}.plist", home, label);
-    // bootstrap exits non-zero if service is already loaded — that's fine.
-    let _ = run_launchctl(&["bootstrap", &domain, &plist]).await;
-    Ok(())
+
+    // bootstrap exits non-zero if service is already loaded — that's
+    // the steady state we want, so swallow it; but propagate any other
+    // failure (missing plist, malformed XML, bad program path) so the
+    // caller can return a useful diagnostic instead of timing out at
+    // the /health poll.
+    match run_launchctl(&["bootstrap", &domain, &plist]).await {
+        Ok(_) => Ok(()),
+        Err(LaunchdError::NonZero { stderr, .. })
+            if stderr.contains("service already bootstrapped")
+                || stderr.contains("Service is already loaded")
+                || stderr.contains("already loaded") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Reject labels that asmi must never touch.
