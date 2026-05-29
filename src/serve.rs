@@ -798,9 +798,17 @@ async fn do_serve_load_inner(
         match probe_model_server(port).await {
             Some((pid, model)) => {
                 let mut s = inner.write().await;
-                // Mirror adopt_external guards: don't overwrite managed or recently stopped
-                if s.child.is_some() || s.state == ServeState::Loading {
-                    anyhow::bail!("port {} occupied but manager is already loading", port);
+                // Don't overwrite a manager that has its own spawned child. The
+                // sibling `state == Loading` check that lived here previously was
+                // self-referential — `ServeManager::load` sets state to Loading at
+                // the call-site BEFORE spawning the task that runs this code, so
+                // the guard always tripped and every `/serve/load` against an
+                // occupied port bailed with "manager is already loading". The
+                // child-handle check above already covers the only real race
+                // (another load() call that actually got far enough to spawn a
+                // process); state alone is not load-bearing here.
+                if s.child.is_some() {
+                    anyhow::bail!("port {} occupied but manager already has a spawned child", port);
                 }
                 if let Some(stopped) = s.stopped_at {
                     if stopped.elapsed() < std::time::Duration::from_secs(10) {
