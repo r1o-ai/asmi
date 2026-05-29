@@ -42,7 +42,13 @@ pub struct ClusterMonitor {
 impl ClusterMonitor {
     /// Create a new monitor (not yet started).
     pub fn new(config: ClusterConfig, node_map: NodeMap) -> Self {
-        let state = Arc::new(RwLock::new(ClusterState::new(config.history_capacity)));
+        // Hand the canonical node names to ClusterState so that update_node
+        // collapses mDNS rename variants (hub-2 → hub) at insert time. See
+        // aggregator::canonicalize_hostname for the rules.
+        let state = Arc::new(RwLock::new(ClusterState::with_canonical(
+            config.history_capacity,
+            node_map.nodes.clone(),
+        )));
         let (epoch_tx, _) = tokio::sync::watch::channel(0u64);
         let (events_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
