@@ -53,11 +53,24 @@ pub struct ClusterState {
     pub total_nodes: usize,
     /// Ring buffer capacity for histories.
     history_capacity: usize,
+    /// Canonical cluster node names (from NodeMap.nodes). When non-empty,
+    /// `update_node` canonicalizes the incoming snapshot's hostname against
+    /// this set, stripping mDNS rename suffixes (`hub-2` → `hub`). When
+    /// empty (e.g. unit tests), `update_node` keys by raw hostname.
+    real_canonical: HashSet<String>,
 }
 
 impl ClusterState {
     /// Create a new empty cluster state with the given history capacity.
+    /// Snapshots are keyed by raw hostname (no canonicalization).
     pub fn new(history_capacity: usize) -> Self {
+        Self::with_canonical(history_capacity, Vec::new())
+    }
+
+    /// Create a new empty cluster state that canonicalizes incoming snapshot
+    /// hostnames against `canonical_nodes` (typically `NodeMap.nodes`).
+    /// `hub-2` → `hub` etc. See [`canonicalize_hostname`] for the rules.
+    pub fn with_canonical(history_capacity: usize, canonical_nodes: Vec<String>) -> Self {
         Self {
             snapshots: HashMap::new(),
             histories: HashMap::new(),
@@ -66,14 +79,31 @@ impl ClusterState {
             scan_results: Vec::new(),
             total_nodes: 0,
             history_capacity,
+            real_canonical: canonical_nodes
+                .into_iter()
+                .map(|n| n.to_lowercase())
+                .collect(),
         }
     }
 
     /// Update with a new snapshot for a node. Automatically pushes to
     /// per-node history, recalculates cluster aggregates, and pushes to
     /// cluster-wide history.
-    pub fn update_node(&mut self, snapshot: NodeSnapshot) {
-        let hostname = snapshot.hostname.clone();
+    ///
+    /// If this ClusterState was built via [`Self::with_canonical`] with a
+    /// non-empty `canonical_nodes` list, the incoming `snapshot.hostname` is
+    /// stripped of mDNS rename suffixes back to its canonical parent. The
+    /// snapshot's own `.hostname` field is also rewritten so downstream
+    /// consumers serializing values (e.g. `/cluster` endpoint) see the
+    /// canonical name, not the raw cascaded one.
+    pub fn update_node(&mut self, mut snapshot: NodeSnapshot) {
+        let hostname = if self.real_canonical.is_empty() {
+            snapshot.hostname.clone()
+        } else {
+            let canon = canonicalize_hostname(&snapshot.hostname, &self.real_canonical);
+            snapshot.hostname = canon.clone();
+            canon
+        };
 
         // Push to per-node history ring buffer
         let history = self
@@ -92,9 +122,17 @@ impl ClusterState {
     }
 
     /// Batch-update multiple nodes at once (avoids N recalculations).
+    /// Canonicalizes hostnames against `real_canonical` if set — see
+    /// [`Self::update_node`] for the canonicalization contract.
     pub fn update_nodes(&mut self, snapshots: Vec<NodeSnapshot>) {
-        for snapshot in snapshots {
-            let hostname = snapshot.hostname.clone();
+        for mut snapshot in snapshots {
+            let hostname = if self.real_canonical.is_empty() {
+                snapshot.hostname.clone()
+            } else {
+                let canon = canonicalize_hostname(&snapshot.hostname, &self.real_canonical);
+                snapshot.hostname = canon.clone();
+                canon
+            };
 
             let history = self
                 .histories
@@ -548,6 +586,44 @@ mod tests {
     #[test]
     fn canonicalize_empty_string_returns_empty() {
         assert_eq!(canonicalize_hostname("", &real_set(&["hub"])), "");
+    }
+
+    #[test]
+    fn update_node_canonicalizes_when_real_set() {
+        // Build state with canonical `hub` registered. Insert a snapshot whose
+        // hostname is the rename-cascade variant `hub-2`. Expect:
+        //   - snapshots HashMap has ONE entry, keyed by "hub" (not "hub-2")
+        //   - the snapshot's own .hostname field is rewritten to "hub"
+        let mut state = ClusterState::with_canonical(60, vec!["hub".into()]);
+        state.update_node(mock_snapshot("hub-2", true));
+        assert_eq!(state.snapshots.len(), 1);
+        assert!(state.snapshots.contains_key("hub"));
+        assert!(!state.snapshots.contains_key("hub-2"));
+        assert_eq!(state.snapshots["hub"].hostname, "hub");
+    }
+
+    #[test]
+    fn update_node_collapses_local_and_renamed_to_single_entry() {
+        // Robin's Attack #12 in concrete form: a process restarted under
+        // LocalHostName=hub-2, while the snapshots HashMap also has a stale
+        // entry under "hub" from a prior life. After update_node with
+        // canonicalization on, both keys should resolve to "hub" and the
+        // HashMap should have exactly one entry.
+        let mut state = ClusterState::with_canonical(60, vec!["hub".into()]);
+        state.update_node(mock_snapshot("hub", true));     // simulate old entry
+        state.update_node(mock_snapshot("hub-2", true));   // simulate post-rename insert
+        assert_eq!(state.snapshots.len(), 1, "renames must collapse, not accumulate");
+        assert!(state.snapshots.contains_key("hub"));
+    }
+
+    #[test]
+    fn update_node_without_canonical_preserves_raw() {
+        // Backwards-compat: ClusterState::new(60) (no canonical set) keeps
+        // raw hostnames as keys. Used by all existing tests.
+        let mut state = ClusterState::new(60);
+        state.update_node(mock_snapshot("hub-2", true));
+        assert!(state.snapshots.contains_key("hub-2"));
+        assert_eq!(state.snapshots["hub-2"].hostname, "hub-2");
     }
 
     #[test]
