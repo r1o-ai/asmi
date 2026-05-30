@@ -3,9 +3,10 @@
 //! All node discovery is dynamic: Thunderbolt bridge scanning, system-profiler,
 //! mDNS/Bonjour, Tailscale status, or ARP table inspection.
 
+use crate::aggregator::canonicalize_hostname;
 use crate::types::RdmaLink;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -235,12 +236,22 @@ impl NodeMap {
     }
 
     /// Register a canonical hostname in the nodes list. Returns true if new.
+    ///
+    /// Strips mDNS rename-cascade suffixes (`hub-2`, `m3u4-2237`, `hub-2-3`)
+    /// at the writer so phantom entries never reach `self.nodes` regardless of
+    /// the discovery path that found them (Bonjour browse, ARP scan, HTTP
+    /// probe, etc.). See [`crate::aggregator::canonicalize_hostname`].
     pub fn register_node(&mut self, hostname: &str) -> bool {
         if hostname.is_empty() {
             return false;
         }
-        if !self.nodes.contains(&hostname.to_string()) {
-            self.nodes.push(hostname.to_string());
+        let real: HashSet<String> = self.nodes.iter().map(|n| n.to_lowercase()).collect();
+        let canonical = canonicalize_hostname(hostname, &real);
+        if canonical.is_empty() {
+            return false;
+        }
+        if !self.nodes.iter().any(|n| n.eq_ignore_ascii_case(&canonical)) {
+            self.nodes.push(canonical);
             self.nodes.sort();
             true
         } else {
@@ -453,6 +464,35 @@ mod tests {
         assert!(!nm.register_node("m3u1")); // duplicate
         assert!(nm.register_node("m3u2"));
         assert_eq!(nm.nodes, vec!["m3u1", "m3u2"]);
+    }
+
+    #[test]
+    fn test_register_node_canonicalizes_mdns_variants() {
+        // Discovery may surface mDNS conflict-renamed names (`-2`, `-3`,
+        // `-2237`). register_node must canonicalize them so phantoms never
+        // reach self.nodes regardless of arrival order vs. the canonical name.
+        let mut nm = NodeMap::default();
+
+        // Phantom-first: hub-3 arrives before hub. Should land as "hub".
+        assert!(nm.register_node("hub-3"));
+        assert_eq!(nm.nodes, vec!["hub"]);
+
+        // Canonical-then-phantom: real hub then mini2 then conflict-renames.
+        assert!(!nm.register_node("hub")); // already there as canonical
+        assert!(nm.register_node("mini2"));
+        assert!(!nm.register_node("mini2-6")); // canonicalizes to existing mini2
+
+        // 4-digit Bonjour instance suffix (`m3u4-2237`) is the worst real case.
+        assert!(nm.register_node("m3u4-2237"));
+        assert_eq!(
+            nm.nodes,
+            vec!["hub", "m3u4", "mini2"],
+            "all phantom suffixes must collapse to canonical"
+        );
+
+        // Case-fold: Hub-2 should still hit existing hub.
+        assert!(!nm.register_node("Hub-2"));
+        assert_eq!(nm.nodes, vec!["hub", "m3u4", "mini2"]);
     }
 
     #[test]
