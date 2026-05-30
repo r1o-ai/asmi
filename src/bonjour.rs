@@ -142,10 +142,13 @@ fn build_service_info(
         props.push(("mlx".to_string(), MLX_PORT.to_string()));
     }
 
-    // mdns-sd expects the hostname argument to be a `.local.` fqdn. We pass
-    // `<hostname>.local.` — the daemon will resolve to whatever local IPv4/IPv6
-    // addresses the OS reports for the bound interface.
-    let host_fqdn = format!("{}.local.", hostname);
+    // Publish the A/AAAA record under the UNIQUE service-instance name
+    // (`r1o-<hostname>.local.`), NOT the OS's own `<hostname>.local.`. Using the
+    // bare `<hostname>.local.` collides with the system's own mDNS record, which
+    // makes macOS's mDNSResponder rename the host (LocalHostName hub→hub-2→hub-3)
+    // and corrupts cluster topology with phantom nodes. The `host=` TXT record
+    // (set above) still carries the canonical hostname for consumers.
+    let host_fqdn = format!("{}.local.", instance);
     let info = ServiceInfo::new(
         SERVICE_TYPE,
         instance,
