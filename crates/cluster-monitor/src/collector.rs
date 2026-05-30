@@ -393,9 +393,20 @@ async fn collect_via_ssh(
                 }
             }
         }
-        match run(CMD_POWERMETRICS).await {
-            Ok(r) if r.has_output() => parse_powermetrics_text(&r.stdout),
-            _ => PowerMetricsResult::default(),
+        // Gate the sudo-powermetrics fallback on config.ane_power_check.
+        // When false (default), skip the shell-out — the IOReport sample
+        // running in-process via daemon_startup is still the canonical
+        // source for the headline numbers. Without this gate, every poll
+        // (~2s default) spawned a sudo powermetrics, which warmed
+        // PerfPowerServices and pinned a couple of cores on machines
+        // where asmi-helper wasn't running. See config.rs for full notes.
+        if config.ane_power_check {
+            match run(CMD_POWERMETRICS).await {
+                Ok(r) if r.has_output() => parse_powermetrics_text(&r.stdout),
+                _ => PowerMetricsResult::default(),
+            }
+        } else {
+            PowerMetricsResult::default()
         }
     };
 

@@ -103,9 +103,14 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                 "cluster hub: polling {} remote nodes (excluded self: {})",
                 remote_nodes.len(), hostname
             );
-            let cfg = ClusterConfig::default()
+            // Carry NodeMap.ane_power_check into the live ClusterConfig so the
+            // collector knows whether to fall back to sudo powermetrics. The
+            // flag is file-backed (~/.config/asmi/config.json); changes take
+            // effect on next daemon restart, not mid-flight.
+            let mut cfg = ClusterConfig::default()
                 .with_seeds(remote_nodes)
                 .with_poll_interval(Duration::from_secs(interval));
+            cfg.ane_power_check = node_map.ane_power_check;
             let mut monitor = asmi_core::ClusterMonitor::new(cfg, node_map);
             let state = monitor.state();
             monitor.start();

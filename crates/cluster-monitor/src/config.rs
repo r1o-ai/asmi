@@ -62,6 +62,20 @@ pub struct ClusterConfig {
     /// Port the asmi HTTP daemon listens on (default: 9090).
     /// Used for HTTP-first metrics fetching on remote nodes.
     pub daemon_port: u16,
+
+    /// When true, the local collector falls back to `sudo powermetrics`
+    /// for ANE/GPU power detail if the asmi-helper Unix socket is
+    /// unreachable. When false (the default), the fallback is skipped
+    /// and the snapshot only carries IOReport-sourced power values.
+    ///
+    /// Rationale: the powermetrics fallback spawns a subprocess on every
+    /// poll cycle (default 2s). That keeps PerfPowerServices warm and
+    /// can pin a couple of CPU cores on machines where asmi-helper
+    /// isn't running. Cluster monitoring rarely needs the extra ANE
+    /// precision — but when it does, flip this on via Settings → System
+    /// or by editing ~/.config/asmi/config.json directly.
+    #[serde(default)]
+    pub ane_power_check: bool,
 }
 
 impl Default for ClusterConfig {
@@ -79,6 +93,7 @@ impl Default for ClusterConfig {
             ssh_identity: None,
             history_capacity: 300,
             daemon_port: 9090,
+            ane_power_check: false,
         }
     }
 }
@@ -141,6 +156,14 @@ pub struct NodeMap {
     /// Known canonical node hostnames (the cluster).
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// When true, the local collector falls back to `sudo powermetrics`
+    /// for ANE/GPU power detail when the asmi-helper Unix socket is
+    /// unreachable. False by default — see ClusterConfig::ane_power_check
+    /// for the full rationale. Persisted here so a Settings toggle in
+    /// the r1o web UI can flip it without a daemon restart pulling args
+    /// from a different source.
+    #[serde(default)]
+    pub ane_power_check: bool,
     /// Per-node Thunderbolt bridge IPs for RDMA, keyed by canonical hostname.
     /// Dynamically populated from Thunderbolt bridge discovery.
     #[serde(default)]
