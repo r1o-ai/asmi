@@ -716,10 +716,12 @@ async fn transfer_pipeline(
         coordinator_device: devices.as_ref().map(|(ld, _)| ld.clone()),
     };
 
-    // Use .local mDNS hostname directly — reqwest tries all resolved IPs,
-    // avoiding the link-local-first problem of getaddrinfo.
-    let peer_host = format!("{}.local", req.peer);
-    tracing::info!(peer = %req.peer, peer_host = %peer_host, "using mDNS hostname for peer coordination");
+    // Resolve the peer to a concrete IP first (Tailscale → getaddrinfo, which honors
+    // /etc/hosts), then connect by literal IP. reqwest's bundled resolver does NOT consult
+    // /etc/hosts and fails on bare `{peer}.local` when mDNS doesn't route here; using a
+    // resolved IP avoids that entirely. Falls back to `.local` only if resolution fails.
+    let peer_host = resolve_peer_mdns(&req.peer).unwrap_or_else(|| format!("{}.local", req.peer));
+    tracing::info!(peer = %req.peer, peer_host = %peer_host, "resolved peer IP for coordination");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -1192,30 +1194,64 @@ async fn do_verify_via_worker(
     Ok(())
 }
 
-/// Compute SHA-256 checksums for all files in a directory.
+/// Compute SHA-256 checksums for all files in a directory, hashing files in
+/// parallel (one scoped thread per file) and streaming each in 8 MiB chunks to
+/// bound memory. The RDMA transfer runs at ~5 GB/s; serial whole-file SHA-256
+/// was the dominant end-to-end cost (e.g. ~70s of a 76s 28 GB transfer), so
+/// parallel + streaming keeps integrity while cutting verify time ~N-fold.
 #[cfg(feature = "jaccl")]
 fn compute_checksums(model_path: &std::path::Path) -> Result<VerifyManifest, String> {
     use sha2::{Sha256, Digest};
+    use std::io::Read;
 
-    let mut checksums = Vec::new();
-
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(model_path)
         .map_err(|e| format!("read dir for verify: {e}"))?
     {
         let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
         let meta = entry.metadata().map_err(|e| format!("metadata: {e}"))?;
         if meta.is_file() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            let data = std::fs::read(&path)
-                .map_err(|e| format!("read {}: {e}", path.display()))?;
-            let mut hasher = Sha256::new();
-            hasher.update(&data);
-            let hash = format!("{:x}", hasher.finalize());
-            checksums.push(FileChecksum { name, sha256: hash });
+            files.push((entry.file_name().to_string_lossy().to_string(), entry.path()));
         }
     }
 
+    // Hash files concurrently; each thread streams its file so peak memory is
+    // bounded by (file_count × 8 MiB), not the model size.
+    let results: Vec<Result<FileChecksum, String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = files
+            .iter()
+            .map(|(name, path)| {
+                s.spawn(move || -> Result<FileChecksum, String> {
+                    let mut f = std::fs::File::open(path)
+                        .map_err(|e| format!("open {}: {e}", path.display()))?;
+                    let mut hasher = Sha256::new();
+                    let mut buf = vec![0u8; 8 * 1024 * 1024];
+                    loop {
+                        let n = f
+                            .read(&mut buf)
+                            .map_err(|e| format!("read {}: {e}", path.display()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                    Ok(FileChecksum {
+                        name: name.clone(),
+                        sha256: format!("{:x}", hasher.finalize()),
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err("verify hash thread panicked".to_string())))
+            .collect()
+    });
+
+    let mut checksums = Vec::with_capacity(results.len());
+    for r in results {
+        checksums.push(r?);
+    }
     Ok(VerifyManifest { checksums })
 }
 

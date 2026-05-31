@@ -2514,7 +2514,13 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
                         "ip": ip,
                     }));
                 }
-                if ip.starts_with("169.254.") && !current_iface.starts_with("lo") {
+                // RDMA-reachable IPs: TB5 link-local (169.254) plus the canonical
+                // assigned RDMA /30 subnet (192.168.10.x). Without the 192.168.10 prefix,
+                // assigned RDMA IPs are invisible to peer discovery, so Active ports get
+                // filtered out at the link_local_ifaces gate.
+                if (ip.starts_with("169.254.") || ip.starts_with("192.168.10."))
+                    && !current_iface.starts_with("lo")
+                {
                     link_local.push(serde_json::json!({
                         "interface": current_iface,
                         "ip": ip,
@@ -2609,7 +2615,11 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
     let mut seen_ips: std::collections::HashSet<String> = peer_ips.iter().map(|(ip, _)| ip.clone()).collect();
 
     for line in arp_out.lines() {
-        if line.contains("incomplete") || !line.contains("169.254.") {
+        // Accept ARP peers on the TB5 link-local range and the canonical RDMA
+        // /30 subnet (192.168.10.x).
+        if line.contains("incomplete")
+            || !(line.contains("169.254.") || line.contains("192.168.10."))
+        {
             continue;
         }
         let ip = line.split('(').nth(1).and_then(|s| s.split(')').next());

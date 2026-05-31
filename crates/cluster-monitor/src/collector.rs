@@ -637,12 +637,12 @@ async fn collect_via_ssh(
             };
             let rdma = crate::scanner::parse_rdma_status(rdma_text);
             let all_ips = crate::scanner::parse_ifconfig_all_ips(ifconfig_text);
-            // Filter to RDMA-relevant IPs only (192.168.0.x, 169.254.x.x)
+            // Filter to RDMA-relevant IPs only (192.168.10.x, 169.254.x.x)
             let mut iface_ips = std::collections::BTreeMap::new();
             for (iface, ips) in all_ips {
                 let rdma_ips: Vec<String> = ips
                     .into_iter()
-                    .filter(|ip| ip.starts_with("192.168.0.") || ip.starts_with("169.254."))
+                    .filter(|ip| ip.starts_with("192.168.10.") || ip.starts_with("169.254."))
                     .collect();
                 if !rdma_ips.is_empty() {
                     iface_ips.insert(iface, rdma_ips);

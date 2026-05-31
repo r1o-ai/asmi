@@ -401,6 +401,17 @@ fn host_candidates(host: &str) -> Vec<String> {
     candidates
 }
 
+/// True if a node's self-reported `hostname` — which may carry a macOS Bonjour
+/// `-NNNN` LocalHostName suffix (e.g. `m3u4-2237` after an mDNS name collision)
+/// — refers to the requested canonical `host` (e.g. `m3u4`). asmi reports
+/// LocalHostName (daemon_startup.rs), so an exact `==` check silently drops any
+/// suffixed node from topology discovery. Reuse the shared canonicalize rule so
+/// this is not a divergent second implementation.
+fn reported_is(host: &str, reported: &str) -> bool {
+    let real: HashSet<String> = std::iter::once(host.to_lowercase()).collect();
+    asmi_core::aggregator::canonicalize_hostname(reported, &real) == host.to_lowercase()
+}
+
 fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
     for candidate in host_candidates(host) {
         let url = format!("http://{}:9090/thunderbolt", candidate);
@@ -413,7 +424,7 @@ fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
         };
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
             let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
-            if reported == host {
+            if reported_is(host, reported) {
                 return Some(v);
             }
         }
@@ -433,7 +444,7 @@ fn is_host_reachable_http(host: &str) -> bool {
         };
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
             let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
-            if reported == host { return true; }
+            if reported_is(host, reported) { return true; }
         }
     }
     false

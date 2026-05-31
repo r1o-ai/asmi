@@ -84,7 +84,7 @@ pub struct NodeSnapshot {
     pub rdma: Option<RdmaStatus>,
 
     // Interface → IPs mapping for RDMA link correlation.
-    // Only includes interfaces with RDMA-relevant IPs (192.168.0.x, 169.254.x.x).
+    // Only includes interfaces with RDMA-relevant IPs (192.168.10.x, 169.254.x.x).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub interface_ips: BTreeMap<String, Vec<String>>,
 }

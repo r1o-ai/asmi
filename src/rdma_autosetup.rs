@@ -200,7 +200,7 @@ pub async fn autosetup(
     //
     // Topology-derived: discover_topology() uses native HTTP + UUID cross-match
     // (fallback: mlx.distributed_config, then ARP). Sorts links deterministically,
-    // assigns 192.168.0.{4i+1}/30 per link. Applied locally + pushed to remote
+    // assigns 192.168.10.{4i+1}/30 per link. Applied locally + pushed to remote
     // nodes via SSH.
     let hosts: Vec<String> = match hosts_override {
         Some(h) => {
@@ -223,25 +223,24 @@ pub async fn autosetup(
     let mut topology_ok = false;
 
     if hosts.len() >= 2 {
-        let hosts_for_topo = hosts.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::topology::discover_topology(&hosts_for_topo, "jaccl")
-        })
-        .await
-        {
-            Ok(Ok(topo)) => {
-                let assigned = assign_topology_ips(&topo, &local_hostname, true).await;
-                if !assigned.is_empty() {
-                    tracing::info!(
-                        count = assigned.len(),
-                        "topology-derived IPs assigned (local + remote)"
-                    );
-                    report.ips = assigned;
-                    topology_ok = true;
-                }
+        // Retry discovery until the link set stabilizes before assigning. This
+        // closes the simultaneous-restart race: at boot, peers are still coming
+        // up, so a single discovery can see a partial (or empty) topology, which
+        // would flip topology_ok=false and trigger the static-IP fallback —
+        // re-applying stale/colliding values. Waiting for a stable mesh keeps the
+        // topology-derived path (the correct per-port /30 = GID/coordinator basis)
+        // as the single source of truth. See discover_stable_topology.
+        if let Some(topo) = discover_stable_topology(hosts.clone()).await {
+            let assigned = assign_topology_ips(&topo, &local_hostname, true).await;
+            if !assigned.is_empty() {
+                tracing::info!(
+                    count = assigned.len(),
+                    links = topo.links.len(),
+                    "topology-derived IPs assigned (local + remote)"
+                );
+                report.ips = assigned;
+                topology_ok = true;
             }
-            Ok(Err(e)) => tracing::warn!("topology discovery failed: {e}"),
-            Err(e) => tracing::warn!("topology task panicked: {e}"),
         }
     }
 
@@ -454,11 +453,56 @@ fn detect_bridge0() -> Vec<String> {
 
 // ── Step 2: topology-derived IP assignment ─────────────────────────
 
+/// Discover topology, retrying until the link set stabilizes, so a
+/// simultaneous-restart race (peers still booting → transient partial/empty
+/// topology) cannot trigger the static-IP fallback. Returns the best (max-link)
+/// topology seen; bounded (~60s) so a genuinely-partial cluster still proceeds.
+async fn discover_stable_topology(hosts: Vec<String>) -> Option<TopologyReport> {
+    const MAX_ATTEMPTS: u32 = 12;
+    let gap = Duration::from_secs(5);
+    let mut best: Option<TopologyReport> = None;
+    let mut best_links = 0usize;
+    let mut stable = 0u32;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let hosts_c = hosts.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::topology::discover_topology(&hosts_c, "jaccl")
+        })
+        .await
+        {
+            Ok(Ok(topo)) => {
+                let n = topo.links.len();
+                if n > best_links {
+                    best_links = n;
+                    best = Some(topo);
+                    stable = 0;
+                } else if n == best_links && n > 0 {
+                    stable += 1;
+                }
+                tracing::info!(attempt, links = n, best = best_links, "autosetup: topology retry-until-stable");
+                // Settled once the max link count repeats on consecutive scans.
+                if best_links > 0 && stable >= 1 {
+                    break;
+                }
+            }
+            Ok(Err(e)) => tracing::warn!(attempt, "topology discovery failed: {e}"),
+            Err(e) => tracing::warn!(attempt, "topology discovery task panicked: {e}"),
+        }
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(gap).await;
+        }
+    }
+    if best_links == 0 {
+        tracing::warn!("autosetup: topology never produced links after {MAX_ATTEMPTS} attempts");
+    }
+    best
+}
+
 /// Derive deterministic /30 IPs from topology links and apply them.
 ///
 /// Algorithm: sort links by (min_node, max_node), then for link i:
-///   - alphabetically-first node gets 192.168.0.{4i+1}/30
-///   - alphabetically-second node gets 192.168.0.{4i+2}/30
+///   - alphabetically-first node gets 192.168.10.{4i+1}/30
+///   - alphabetically-second node gets 192.168.10.{4i+2}/30
 ///
 /// Applied locally via ifconfig, pushed to remote nodes via SSH.
 /// Returns the IPs assigned to the LOCAL node only.
@@ -467,6 +511,19 @@ pub async fn assign_topology_ips(
     local_hostname: &str,
     push_remote: bool,
 ) -> Vec<InterfaceIp> {
+    // Canonicalize the local hostname against the topology's (canonical) node
+    // names. asmi reports scutil LocalHostName, which may carry a macOS Bonjour
+    // suffix (e.g. m3u4-2237); without this, a suffixed node matches NONE of the
+    // canonical link nodes, assigns nothing, and falls through to the static-IP
+    // path — leaving stragglers (the same suffix bug the topology keystone fixed).
+    let node_set: std::collections::HashSet<String> = topo
+        .links
+        .iter()
+        .flat_map(|l| [l.node_a.to_lowercase(), l.node_b.to_lowercase()])
+        .collect();
+    let local_canon = asmi_core::aggregator::canonicalize_hostname(local_hostname, &node_set);
+    let local_hostname: &str = &local_canon;
+
     let mut sorted_links = topo.links.clone();
     sorted_links.sort_by(|a, b| {
         let a_pair = if a.node_a < a.node_b {
@@ -492,8 +549,8 @@ pub async fn assign_topology_ips(
             (&link.node_b, &link.device_b, &link.node_a, &link.device_a)
         };
 
-        let ip_first = format!("192.168.0.{}", base + 1);
-        let ip_second = format!("192.168.0.{}", base + 2);
+        let ip_first = format!("192.168.10.{}", base + 1);
+        let ip_second = format!("192.168.10.{}", base + 2);
         let iface_first = first_dev.strip_prefix("rdma_").unwrap_or(first_dev);
         let iface_second = second_dev.strip_prefix("rdma_").unwrap_or(second_dev);
 
