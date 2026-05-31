@@ -22,11 +22,16 @@ async fn main() -> Result<()> {
 
     let latest_json = Arc::new(RwLock::new(String::from("{}")));
 
+    // --samplers picks which power domains powermetrics emits. Adding
+    // ane_power gives us the Neural Engine watts for free — same process,
+    // same 1Hz cadence, same parse pass. Without it, parsed.ane_mw is 0
+    // and any "ANE check" feature can only report from IOReport (which
+    // gives utilization, not watts).
     let mut child = Command::new("powermetrics")
         .arg("-i")
         .arg("1000")
         .arg("--samplers")
-        .arg("cpu_power,gpu_power")
+        .arg("cpu_power,gpu_power,ane_power")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

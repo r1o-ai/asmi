@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      asmi-helper system LaunchDaemon. Runs as root so the single
+      persistent `powermetrics` child can read CPU/GPU/ANE power on
+      Apple Silicon (which requires root). Exposes a /var/run socket
+      that any user-space asmi can read for live power data — replaces
+      the per-poll `sudo powermetrics` fork-bomb that pinned
+      PerfPowerServices on 2026-05-30.
+    -->
+    <key>Label</key>
+    <string>com.r1o.asmi-helper</string>
+
+    <key>UserName</key>
+    <string>root</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ma/.cargo/bin/asmi-helper</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 5s minimum between restart attempts on crash; lets the OS
+         cool down between any pathological loops. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/asmi-helper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/asmi-helper.log</string>
+
+    <!-- inherit minimal env; helper doesn't need PATH bling -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
