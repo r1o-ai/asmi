@@ -222,7 +222,23 @@ pub async fn autosetup(
     let local_hostname = get_local_hostname();
     let mut topology_ok = false;
 
-    if hosts.len() >= 2 {
+    // Only the COORDINATOR (lexically-first known host) runs topology-derived
+    // assignment with remote push. In a cluster that is not a full mesh, a peer can
+    // have a PARTIAL topology view — e.g. m3u3 is not cabled to m3u2, so it discovers
+    // only 3 of 4 nodes — and with push_remote=true it would SSH stale/partial /30s
+    // onto its peers, corrupting the coordinator's correct map (observed during the
+    // m3u2 4-node bring-up: m3u3's restart pushed 3-node IPs over hub). The
+    // coordinator is, by construction, cabled to every peer and holds the full view.
+    // Non-coordinators defer here and fall through to their own static_ips, which are
+    // the authoritative per-node /30s (and are also what the coordinator pushes), so
+    // a peer reboot is self-correct without touching anyone else.
+    let host_set: std::collections::HashSet<String> =
+        hosts.iter().map(|h| h.to_lowercase()).collect();
+    let local_canon = asmi_core::aggregator::canonicalize_hostname(&local_hostname, &host_set);
+    let coordinator = host_set.iter().min().cloned();
+    let is_coordinator = coordinator.as_deref() == Some(local_canon.as_str());
+
+    if is_coordinator && hosts.len() >= 2 {
         // Retry discovery until the link set stabilizes before assigning. This
         // closes the simultaneous-restart race: at boot, peers are still coming
         // up, so a single discovery can see a partial (or empty) topology, which
@@ -236,12 +252,17 @@ pub async fn autosetup(
                 tracing::info!(
                     count = assigned.len(),
                     links = topo.links.len(),
-                    "topology-derived IPs assigned (local + remote)"
+                    "topology-derived IPs assigned (coordinator: local + remote)"
                 );
                 report.ips = assigned;
                 topology_ok = true;
             }
         }
+    } else if !is_coordinator {
+        tracing::info!(
+            coordinator = coordinator.as_deref().unwrap_or("?"),
+            "non-coordinator node: deferring topology assignment to coordinator, using static_ips"
+        );
     }
 
     // Fallback: static config or link-local
