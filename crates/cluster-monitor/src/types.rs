@@ -978,6 +978,20 @@ pub struct LoadRequest {
     /// Max context length override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+
+    // --- VLM-only optimization (mlx_vlm reads these as ENV VARS at startup, not
+    // CLI flags — see src/serve.rs spawn). No-ops for mlx_lm, which has no KV
+    // env hooks. Names mirror what mlx_vlm/server/generation.py reads. ---
+
+    /// TurboQuant KV-cache bits (fractional ok, e.g. 3.5). → env KV_BITS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_bits: Option<f64>,
+    /// KV quantization scheme ("uniform" | "turboquant"). → env KV_QUANT_SCHEME.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_quant_scheme: Option<String>,
+    /// Vision-feature cache entries. → env MLX_VLM_VISION_CACHE_SIZE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_cache_size: Option<u32>,
 }
 
 fn default_backend_str() -> String {
@@ -1002,6 +1016,9 @@ impl Default for LoadRequest {
             use_mtp: false,
             cache_type: None,
             max_tokens: None,
+            kv_bits: None,
+            kv_quant_scheme: None,
+            vision_cache_size: None,
         }
     }
 }

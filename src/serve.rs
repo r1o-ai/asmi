@@ -960,13 +960,33 @@ async fn do_serve_load_inner(
         "spawning MLX server"
     );
 
-    let mut child = Command::new(&final_program)
+    let mut spawn_cmd = Command::new(&final_program);
+    spawn_cmd
         .args(&final_args)
         .env("MLX_METAL_FAST_SYNCH", "1")
         .stdout(log_file)
         .stderr(log_stderr)
-        .kill_on_drop(false) // we manage lifetime ourselves
-        .spawn()?;
+        .kill_on_drop(false); // we manage lifetime ourselves
+
+    // VLM KV-quant / vision-cache tuning is ENV-driven: mlx_vlm reads KV_BITS,
+    // KV_QUANT_SCHEME, and MLX_VLM_VISION_CACHE_SIZE at startup (see
+    // mlx_vlm/server/generation.py). mlx_lm has no equivalent env hooks — its
+    // tuning is the CLI flags emitted above — so these apply to the VLM engine only.
+    if matches!(engine, ServeEngine::MlxVlm) {
+        if let Some(bits) = req.kv_bits {
+            spawn_cmd.env("KV_BITS", format!("{bits}"));
+        }
+        if let Some(ref scheme) = req.kv_quant_scheme {
+            if !scheme.is_empty() {
+                spawn_cmd.env("KV_QUANT_SCHEME", scheme);
+            }
+        }
+        if let Some(n) = req.vision_cache_size {
+            spawn_cmd.env("MLX_VLM_VISION_CACHE_SIZE", n.to_string());
+        }
+    }
+
+    let mut child = spawn_cmd.spawn()?;
 
     let child_pid = child.id().unwrap_or(0);
 
