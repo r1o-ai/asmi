@@ -1,11 +1,14 @@
 //! Native RDMA file transfer via JACCL.
 //!
-//! Two endpoints:
-//! - `POST /transfer`        — initiate a file transfer (source side)
+//! Endpoints:
+//! - `POST /transfer`        — fire-and-forget: starts transfer, returns {id, status} immediately
+//! - `GET  /transfer/status`  — all active/completed transfers with progress
+//! - `GET  /transfer/:id/log` — SSE logtail for a specific transfer (disconnect-safe)
 //! - `POST /transfer/accept`  — peer coordination (destination side)
 //!
-//! Files are streamed in 64 MB chunks over RDMA. After transfer, SHA-256
-//! verification confirms integrity.
+//! The transfer runs to completion server-side regardless of client connection.
+//! Progress is stored in-memory (ActiveTransfers). Clients can poll /status or
+//! tail /log — disconnecting either has no effect on the transfer.
 //!
 //! Phase 3: All JACCL operations go through a dedicated worker thread via
 //! an mpsc channel. The worker owns all JacclGroup handles (which are !Send),
@@ -16,13 +19,65 @@
 //! feature, both endpoints return 501 Not Implemented.
 
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     response::{Json, IntoResponse},
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::daemon::AppState;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Transfer state (shared across handlers — the transfer owns this, not the HTTP connection)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+pub type ActiveTransfers = Arc<RwLock<HashMap<String, TransferState>>>;
+
+#[derive(Clone, Serialize)]
+pub struct TransferState {
+    pub id: String,
+    pub peer: String,
+    pub direction: String,
+    pub model_dir: String,
+    pub status: String,
+    pub percent: u8,
+    #[serde(rename = "bytesPerSec")]
+    pub bytes_per_sec: u64,
+    #[serde(rename = "totalBytes")]
+    pub total_bytes: u64,
+    #[serde(rename = "bytesSent")]
+    pub bytes_sent: u64,
+    pub error: Option<String>,
+    #[serde(rename = "startedAt")]
+    pub started_at_epoch: u64,
+    #[serde(rename = "completedAt")]
+    pub completed_at_epoch: Option<u64>,
+    #[serde(skip)]
+    pub log: Vec<String>,
+}
+
+impl TransferState {
+    fn push_log(&mut self, event: &SseEvent) {
+        self.log.push(event.to_sse_line());
+        if self.log.len() > 200 {
+            self.log.drain(..100);
+        }
+    }
+}
+
+fn generate_transfer_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    format!("tx-{:x}", ts)
+}
+
+fn epoch_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Request / response types
@@ -498,55 +553,114 @@ pub async fn transfer_accept_handler(
 // Native JACCL handlers
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// POST /transfer — initiate a file transfer.
+/// POST /transfer — fire-and-forget: starts transfer, returns {id, status} immediately.
 ///
-/// Streams SSE events to the caller with stage/progress/done/error updates.
+/// The transfer runs to completion server-side. Poll GET /transfer/status or
+/// tail GET /transfer/:id/log for progress. Client disconnect has no effect.
 #[cfg(feature = "jaccl")]
 pub async fn transfer_handler(
     State(state): State<AppState>,
     Json(req): Json<TransferRequest>,
 ) -> impl IntoResponse {
-    use axum::body::Body;
-    use futures::StreamExt;
-    use tokio::sync::mpsc;
-
     let direction = req.direction.to_lowercase();
     if direction != "send" && direction != "recv" {
         return (
             StatusCode::BAD_REQUEST,
-            axum::response::Response::builder()
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({"error": "direction must be 'send' or 'recv'"}).to_string(),
-                ))
-                .unwrap(),
+            Json(serde_json::json!({"error": "direction must be 'send' or 'recv'"})),
         );
     }
 
-    // SSE channel — handler streams events to the caller.
-    let (tx, rx) = mpsc::channel::<String>(64);
+    let id = generate_transfer_id();
 
-    // Spawn the async pipeline.
+    // Register the transfer in shared state before spawning.
+    let transfer = TransferState {
+        id: id.clone(),
+        peer: req.peer.clone(),
+        direction: direction.clone(),
+        model_dir: req.model_dir.clone(),
+        status: "started".into(),
+        percent: 0,
+        bytes_per_sec: 0,
+        total_bytes: 0,
+        bytes_sent: 0,
+        error: None,
+        started_at_epoch: epoch_now(),
+        completed_at_epoch: None,
+        log: Vec::new(),
+    };
+    state.active_transfers.write().await.insert(id.clone(), transfer);
+
+    // Spawn fire-and-forget — pipeline writes to shared state via drainer, not HTTP.
+    let transfers = state.active_transfers.clone();
     let jaccl_worker = state.jaccl_worker.clone();
     let topology_cache = state.topology_cache.clone();
     let hostname = state.hostname.clone();
+    let transfer_id = id.clone();
     tokio::spawn(async move {
-        transfer_pipeline(tx, jaccl_worker, topology_cache, &hostname, req).await;
+        run_transfer(transfers, transfer_id, jaccl_worker, topology_cache, hostname, req).await;
     });
 
-    // Convert the mpsc receiver into an SSE body stream.
+    (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "started"})))
+}
+
+/// GET /transfer/status — all active/completed transfers with progress.
+pub async fn transfer_status_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let map = state.active_transfers.read().await;
+    let transfers: Vec<&TransferState> = map.values().collect();
+    Json(serde_json::json!({"transfers": transfers}))
+}
+
+/// GET /transfer/:id/log — SSE logtail for a specific transfer. Disconnect-safe.
+pub async fn transfer_log_handler(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    use axum::body::Body;
+    use futures::StreamExt;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    let transfers = state.active_transfers.clone();
+    tokio::spawn(async move {
+        let mut cursor = 0usize;
+        loop {
+            let (log_slice, is_done) = {
+                let map = transfers.read().await;
+                match map.get(&id) {
+                    Some(state) => {
+                        let new_lines: Vec<String> = state.log[cursor..].to_vec();
+                        let done = state.status == "done" || state.status == "error";
+                        (new_lines, done)
+                    }
+                    None => {
+                        let _ = tx.send("data: {\"error\":\"transfer not found\"}\n\n".into()).await;
+                        return;
+                    }
+                }
+            };
+            for line in &log_slice {
+                if tx.send(line.clone()).await.is_err() {
+                    return; // client disconnected — just stop tailing, transfer continues
+                }
+            }
+            cursor += log_slice.len();
+            if is_done {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    });
+
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = Body::from_stream(stream.map(|line| Ok::<_, std::convert::Infallible>(line)));
 
-    (
-        StatusCode::OK,
-        axum::response::Response::builder()
-            .header("content-type", "text/event-stream")
-            .header("cache-control", "no-cache")
-            .header("connection", "keep-alive")
-            .body(body)
-            .unwrap(),
-    )
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .unwrap()
 }
 
 /// POST /transfer/accept — peer coordination endpoint.
@@ -602,6 +716,62 @@ pub async fn transfer_accept_handler(
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[cfg(feature = "jaccl")]
+async fn run_transfer(
+    transfers: ActiveTransfers,
+    transfer_id: String,
+    jaccl_worker: std::sync::Arc<JacclWorker>,
+    topology_cache: TopologyCache,
+    local_hostname: String,
+    req: TransferRequest,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    // Drainer task: reads SSE lines from the pipeline and writes to shared state.
+    // Runs independently — no HTTP coupling. Parses events to update progress fields.
+    let drain_transfers = transfers.clone();
+    let drain_id = transfer_id.clone();
+    tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if let Some(state) = drain_transfers.write().await.get_mut(&drain_id) {
+                state.push_log(&SseEvent::stage("_raw"));
+                // Parse the SSE data line for progress/stage/done/error
+                if let Some(json_str) = line.strip_prefix("data: ").and_then(|s| s.strip_suffix("\n\n")) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        match v.get("type").and_then(|t| t.as_str()) {
+                            Some("progress") => {
+                                state.percent = v.get("percent").and_then(|p| p.as_u64()).unwrap_or(0) as u8;
+                                state.bytes_per_sec = v.get("bytesPerSec").and_then(|b| b.as_u64()).unwrap_or(0);
+                            }
+                            Some("stage") => {
+                                if let Some(s) = v.get("stage").and_then(|s| s.as_str()) {
+                                    state.status = s.to_string();
+                                }
+                            }
+                            Some("done") => {
+                                state.status = "done".into();
+                                state.percent = 100;
+                                state.total_bytes = v.get("totalBytes").and_then(|b| b.as_u64()).unwrap_or(state.bytes_sent);
+                                state.completed_at_epoch = Some(epoch_now());
+                            }
+                            Some("error") => {
+                                state.status = "error".into();
+                                state.error = v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string());
+                                state.completed_at_epoch = Some(epoch_now());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                state.log.push(line);
+                if state.log.len() > 200 { state.log.drain(..100); }
+            }
+        }
+    });
+
+    transfer_pipeline(tx, jaccl_worker, topology_cache, &local_hostname, req).await;
+}
+
+#[cfg(feature = "jaccl")]
 async fn transfer_pipeline(
     tx: tokio::sync::mpsc::Sender<String>,
     jaccl_worker: std::sync::Arc<JacclWorker>,
@@ -644,28 +814,24 @@ async fn transfer_pipeline(
     let _ = tx.send(SseEvent::stage("coordinate").to_sse_line()).await;
 
     // ── 4. Resolve coordinator IP ────────────────────────────────────────
-    // JACCL's QP exchange requires the coordinator IP to match the RDMA GID.
-    // RDMA GIDs inherit from the hardware port's IPv4 (e.g. rdma_en5 uses en5's IP).
-    // So the coordinator IP must be the /30 IP assigned to the RDMA hardware port,
-    // NOT the link-local 169.254 and NOT the LAN 10.x.x.x.
+    // Use /30 IP from the RDMA hardware port for the coordinator TCP side-channel.
+    // LAN IP gives errno 65 (EHOSTUNREACH) from inside the JACCL worker thread,
+    // despite working from curl/nc. /30 is the direct point-to-point TB5 path.
     let devices = resolve_device_for_peer(&topology_cache, local_hostname, &req.peer).await;
     let local_ip = devices.as_ref()
         .and_then(|(ld, _)| {
-            // Extract hardware port name: rdma_en5 → en5
             let hw_port = ld.strip_prefix("rdma_")?;
-            // Read its IPv4 via ifconfig
             let out = std::process::Command::new("sh")
                 .args(["-c", &format!("ifconfig {} | grep 'inet ' | grep -v '127\\|169.254' | awk '{{print $2}}' | head -1", hw_port)])
                 .output().ok()?;
             let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if ip.is_empty() { None } else {
-                tracing::info!(hw_port, %ip, "coordinator IP from RDMA hardware port");
+                tracing::info!(hw_port, %ip, "coordinator IP from RDMA port");
                 Some(ip)
             }
         })
-        .or_else(|| resolve_tb5_coordinator_ip(&req.peer))
         .or_else(|| resolve_local_lan_ip())
-        .unwrap_or_else(|| "10.1.10.100".to_string());
+        .unwrap_or_else(|| "127.0.0.1".to_string());
     tracing::info!(peer = %req.peer, coordinator_ip = %local_ip, "resolved coordinator IP");
 
     // ── 5. Resolve devices + notify peer + init coordinator ───────────
@@ -701,9 +867,9 @@ async fn transfer_pipeline(
     }
 
     // 5b. Yield — let the worker thread pick up the command and open
-    //     the TCP listener before rank 1 tries to connect. 500ms is
-    //     generous; the worker only needs to dequeue + enter jaccl_init_mesh.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    //     the TCP listener before rank 1 tries to connect. 5s to
+    //     account for worker thread scheduling + PD alloc + CQ creation.
+    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
 
     // 5c. Notify peer to connect (coordinator listener is already up).
     let peer_req = TransferAcceptRequest {
@@ -716,11 +882,14 @@ async fn transfer_pipeline(
         coordinator_device: devices.as_ref().map(|(ld, _)| ld.clone()),
     };
 
-    // Resolve the peer to a concrete IP first (Tailscale → getaddrinfo, which honors
-    // /etc/hosts), then connect by literal IP. reqwest's bundled resolver does NOT consult
-    // /etc/hosts and fails on bare `{peer}.local` when mDNS doesn't route here; using a
-    // resolved IP avoids that entirely. Falls back to `.local` only if resolution fails.
-    let peer_host = resolve_peer_mdns(&req.peer).unwrap_or_else(|| format!("{}.local", req.peer));
+    // Resolve peer for the coordination POST (/transfer/accept).
+    // Priority: /etc/hosts (LAN) → mDNS (.local) → Tailscale (last resort).
+    // LAN is preferred because Tailscale can be slow/flaky post-reboot and the
+    // JACCL init has a 30s timeout — a slow coordination POST wastes that budget.
+    let peer_host = resolve_peer_lan(&req.peer)
+        .or_else(|| resolve_peer_mdns_only(&req.peer))
+        .or_else(|| resolve_peer_tailscale(&req.peer))
+        .unwrap_or_else(|| format!("{}.local", req.peer));
     tracing::info!(peer = %req.peer, peer_host = %peer_host, "resolved peer IP for coordination");
 
     let client = reqwest::Client::builder()
@@ -1347,13 +1516,33 @@ fn write_devices_json(rank: i32, local_dev: &str, peer_dev: &str) -> Result<Stri
 /// Resolve a peer hostname to an IPv4 address via native mDNS (Phase 4).
 /// Uses libc::getaddrinfo — no Python subprocess.
 #[cfg(feature = "jaccl")]
-fn resolve_peer_mdns(peer: &str) -> Option<String> {
-    // 1. Try Tailscale status (stable IPs, always works)
-    if let Some(ip) = resolve_peer_tailscale(peer) {
-        return Some(ip);
+/// Resolve peer via /etc/hosts — returns LAN IP (10.x.x.x). Fastest, most reliable.
+fn resolve_peer_lan(peer: &str) -> Option<String> {
+    let hosts = std::fs::read_to_string("/etc/hosts").ok()?;
+    for line in hosts.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let ip = parts[0];
+            if !ip.starts_with("10.") && !ip.starts_with("192.168.") { continue; }
+            // Skip 192.168.10.x (/30 TB5 IPs — not routable from all nodes)
+            if ip.starts_with("192.168.10.") { continue; }
+            for &name in &parts[1..] {
+                if name.eq_ignore_ascii_case(peer)
+                    || name.eq_ignore_ascii_case(&format!("{}.local", peer))
+                {
+                    tracing::info!(%peer, %ip, "resolved peer via /etc/hosts (LAN)");
+                    return Some(ip.to_string());
+                }
+            }
+        }
     }
+    None
+}
 
-    // 2. Fallback: mDNS (.local)
+/// Resolve peer via mDNS (.local) only — no Tailscale.
+fn resolve_peer_mdns_only(peer: &str) -> Option<String> {
     use std::ffi::CString;
     use std::net::Ipv4Addr;
 
@@ -1380,7 +1569,9 @@ fn resolve_peer_mdns(peer: &str) -> Option<String> {
         Ipv4Addr::from(u32::from_be((*sa).sin_addr.s_addr))
     };
     unsafe { libc::freeaddrinfo(res); }
-    Some(addr.to_string())
+    let ip = addr.to_string();
+    tracing::info!(%peer, %ip, "resolved peer via mDNS");
+    Some(ip)
 }
 
 /// Resolve peer IP via `tailscale status --json`. Stable IPs that survive reboots.

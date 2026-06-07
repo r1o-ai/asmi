@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(info.keep_alive, Some(true), "properties contains `keepalive`");
         assert_eq!(info.run_at_load, Some(true), "properties contains `runatload`");
         assert_eq!(info.state, LaunchdState::Running);
-        assert_eq!(info.program.as_deref(), Some("/Users/ma/.cargo/bin/asmi"));
+        assert_eq!(info.program.as_deref(), Some("/usr/local/bin/asmi"));
     }
 
     #[test]
