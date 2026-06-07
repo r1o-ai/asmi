@@ -182,6 +182,7 @@ const Destination& Connection::info() {
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
   ibv_gid gid = {};
+  int found_index = 0;
 
   auto try_gid = [&](int i, bool require_ipv4_mapped) -> bool {
     if (i < 0 || i >= port_attr.gid_tbl_len) {
@@ -209,6 +210,7 @@ const Destination& Connection::info() {
       }
     }
     gid = tmp;
+    found_index = i;
     return true;
   };
 
@@ -245,6 +247,7 @@ const Destination& Connection::info() {
   src.queue_pair_number = queue_pair->qp_num;
   src.packet_sequence_number = 7;
   src.global_identifier = gid;
+  sgid_index = found_index;
 
   return src;
 }
@@ -284,7 +287,7 @@ void Connection::queue_pair_rtr(const Destination& dst) {
     attr.ah_attr.is_global = 1;
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = dst.global_identifier;
-    attr.ah_attr.grh.sgid_index = 1;
+    attr.ah_attr.grh.sgid_index = sgid_index;
   }
 
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
@@ -347,8 +350,10 @@ SideChannel::SideChannel(int rank, int size, const char* addr)
   auto address = parse_address(addr);
 
   if (rank_ == 0) {
+    std::cerr << "[jaccl] rank 0: listening on " << addr << std::endl;
     TCPSocket server(IBV_TAG);
     server.listen(IBV_TAG, address);
+    std::cerr << "[jaccl] rank 0: listener ready, waiting for accept" << std::endl;
 
     for (int i = 0; i < size - 1; i++) {
       sockets_.push_back(server.accept(IBV_TAG));

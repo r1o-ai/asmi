@@ -12,6 +12,10 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 #include <json.hpp>
 
@@ -277,6 +281,26 @@ jaccl_group_t jaccl_init_mesh(
 
         std::thread([cfg, group_out, done, mtx, cv]() {
             try {
+                // Debug: TCP probe from this exact thread context
+                {
+                    auto coord = cfg->get_coordinator();
+                    auto colon = coord.find(":");
+                    std::string ip = coord.substr(0, colon);
+                    int port = std::stoi(coord.substr(colon + 1));
+                    struct sockaddr_in sa = {};
+                    sa.sin_len = sizeof(sa);
+                    sa.sin_family = AF_INET;
+                    sa.sin_port = htons(port);
+                    inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
+                    int s = socket(AF_INET, SOCK_STREAM, 0);
+                    int r = ::connect(s, (struct sockaddr*)&sa, sizeof(sa));
+                    int e = errno;
+                    std::cerr << "[jaccl-shim] TCP probe from init thread: "
+                              << ip << ":" << port << " = " << (r==0 ? "OK" : "FAIL")
+                              << " errno=" << e << std::endl;
+                    if (r == 0) close(s);
+                    else close(s);
+                }
                 auto g = jaccl::init(*cfg, /*strict=*/true);
                 {
                     std::lock_guard<std::mutex> lock(*mtx);

@@ -239,7 +239,7 @@ const CMD_JACCL_ENV: &str =
 
 /// Top CPU-consuming processes (sorted by CPU% descending, top 8).
 const CMD_PS_TOP: &str =
-    "ps -arcxo pid,pcpu,rss,comm 2>/dev/null | head -50";
+    "{ ps -arcxo pid,pcpu,rss,comm 2>/dev/null | head -50; ps -axo pid,pcpu,rss,comm 2>/dev/null | sort -rnk3 | head -10; } | awk '!seen[$1]++'";
 
 /// iostat: 2 samples, 1s apart. Take the second (real-time) sample.
 const CMD_IOSTAT: &str =

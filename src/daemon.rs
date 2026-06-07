@@ -47,6 +47,8 @@ pub struct AppState {
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     /// JACCL worker — dedicated OS thread for all RDMA operations (Phase 3).
     pub jaccl_worker: Arc<crate::transfer::JacclWorker>,
+    /// Active/completed transfers — fire-and-forget state, survives client disconnect.
+    pub active_transfers: crate::transfer::ActiveTransfers,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -3560,6 +3562,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/prep", post(prep_handler))
         // Native RDMA file transfer (gated by --features jaccl)
         .route("/transfer", post(crate::transfer::transfer_handler))
+        .route("/transfer/status", get(crate::transfer::transfer_status_handler))
+        .route("/transfer/{id}/log", get(crate::transfer::transfer_log_handler))
         .route("/transfer/accept", post(crate::transfer::transfer_accept_handler))
         // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
         .route("/ane/compute", get(crate::ane::status_handler))

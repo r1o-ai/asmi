@@ -336,7 +336,7 @@ struct ManagedProcess {
 /// Kill the existing child process (SIGTERM → 5s → SIGKILL).
 async fn kill_child(s: &mut ManagedProcess) {
     if let Some(ref mut child) = s.child {
-        // Managed child — SIGTERM then SIGKILL
+        // Managed child — SIGTERM then SIGKILL with bounded waits
         if let Some(pid) = s.pid {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
@@ -346,7 +346,12 @@ async fn kill_child(s: &mut ManagedProcess) {
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(_) => {}
             Err(_) => {
-                let _ = child.kill().await;
+                // SIGKILL + bounded wait — child.kill().await can hang on zombies
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    child.wait(),
+                ).await;
             }
         }
     } else if let Some(pid) = s.pid {

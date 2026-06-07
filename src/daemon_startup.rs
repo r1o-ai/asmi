@@ -370,6 +370,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         ane: AneState::new(_experimental_ane),
         egpu_cache,
         jaccl_worker: std::sync::Arc::new(crate::transfer::JacclWorker::new()),
+        active_transfers: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     let app = daemon::build_router(app_state);
