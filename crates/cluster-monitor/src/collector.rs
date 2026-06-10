@@ -680,9 +680,12 @@ async fn collect_via_ssh(
         chip_model,
         serial_number,
         model_name,
-        cpu_watts: power.cpu_mw,
-        gpu_watts: power.gpu_mw,
-        ane_watts: power.ane_mw,
+        // powermetrics emits MILLIWATTS — convert at the boundary. The raw
+        // mW passthrough shipped as "watts" for months (hub gpu_watts=15113
+        // observed 2026-06-10 = 15.1 W idle); every consumer reads watts.
+        cpu_watts: power.cpu_mw / 1000.0,
+        gpu_watts: power.gpu_mw / 1000.0,
+        ane_watts: power.ane_mw / 1000.0,
         power_source: None,
         cpu_percent: power.cpu_percent,
         gpu_percent: power.gpu_percent,

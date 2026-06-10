@@ -1174,6 +1174,7 @@ fn framework_to_engine(fw: asmi_core::ProcessFramework) -> asmi_core::ServeEngin
         asmi_core::ProcessFramework::MlxVlm => asmi_core::ServeEngine::MlxVlm,
         asmi_core::ProcessFramework::VllmMlx => asmi_core::ServeEngine::VllmMlx,
         asmi_core::ProcessFramework::DFlashProc => asmi_core::ServeEngine::DFlash,
+        asmi_core::ProcessFramework::Ds4 => asmi_core::ServeEngine::Ds4,
         _ => asmi_core::ServeEngine::MlxLm,
     }
 }
@@ -1189,6 +1190,7 @@ fn is_model_server_framework(fw: asmi_core::ProcessFramework) -> bool {
             | asmi_core::ProcessFramework::VllmMlx
             | asmi_core::ProcessFramework::MlxAudio
             | asmi_core::ProcessFramework::DFlashProc
+            | asmi_core::ProcessFramework::Ds4
     )
 }
 
@@ -2275,7 +2277,7 @@ async fn ane_handler(
                 "ane_active": ane_active,
                 "cpu_watts": s.cpu_watts,
                 "gpu_watts": s.gpu_watts,
-                "total_soc_mw": s.cpu_watts + s.gpu_watts + s.ane_watts,
+                "total_soc_mw": (s.cpu_watts + s.gpu_watts + s.ane_watts) * 1000.0,
                 "power_source": s.power_source,
                 "timestamp": s.timestamp,
             })))

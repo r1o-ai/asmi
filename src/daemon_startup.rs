@@ -140,14 +140,16 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                 if let Ok(mut sub_guard) = energy_sub.lock() {
                     if let Some(ref mut sub) = *sub_guard {
                         let sample = sub.sample();
+                        // ioreport sample fields are mW — same boundary
+                        // conversion as collector.rs snapshot construction.
                         if snap.ane_watts == 0.0 && sample.ane_mw > 0.0 {
-                            snap.ane_watts = sample.ane_mw;
+                            snap.ane_watts = sample.ane_mw / 1000.0;
                         }
                         if snap.cpu_watts == 0.0 && sample.cpu_mw > 0.0 {
-                            snap.cpu_watts = sample.cpu_mw;
+                            snap.cpu_watts = sample.cpu_mw / 1000.0;
                         }
                         if snap.gpu_watts == 0.0 && sample.gpu_mw > 0.0 {
-                            snap.gpu_watts = sample.gpu_mw;
+                            snap.gpu_watts = sample.gpu_mw / 1000.0;
                         }
                         snap.power_source = sample.power_source.clone();
                     }
