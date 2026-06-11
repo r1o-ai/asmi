@@ -3209,6 +3209,36 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
     let mut nodes_healthy = 0usize;
     let mut nodes_online = 0usize;
 
+    // T1b: include the LOCAL node inline — the comment at the top of this
+    // handler promised this but it was never implemented, so every node's
+    // /rdma/mesh omitted itself (web callers that fanned out themselves
+    // masked the gap). Same row shape as the remote passthrough below.
+    {
+        let local = rdma_check_handler(State(state.clone())).await.0;
+        nodes_online += 1;
+        let healthy = local.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
+        if healthy {
+            nodes_healthy += 1;
+        }
+        total_active += local.get("rdma_active_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        total_reachable_peers += local.get("peers_reachable").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        total_peers += local.get("peers_total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        nodes.push(serde_json::json!({
+            "hostname": local_hostname,
+            "online": true,
+            "healthy": healthy,
+            "summary": local.get("summary"),
+            "rdma_active_count": local.get("rdma_active_count"),
+            "peers_reachable": local.get("peers_reachable"),
+            "peers_total": local.get("peers_total"),
+            "peer_pings": local.get("peer_pings"),
+            "bridges": local.get("bridges"),
+            "topology": local.get("topology"),
+            "rdma_devices": local.get("rdma_devices"),
+            "link_local_ips": local.get("link_local_ips"),
+        }));
+    }
+
     for (name, data) in &results {
         match data {
             Some(d) => {
@@ -3231,6 +3261,8 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
                     "peer_pings": d.get("peer_pings"),
                     "bridges": d.get("bridges"),
                     "topology": d.get("topology"),
+                    "rdma_devices": d.get("rdma_devices"),
+                    "link_local_ips": d.get("link_local_ips"),
                 }));
             }
             None => {
