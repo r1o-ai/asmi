@@ -38,6 +38,8 @@ pub fn port_for_engine(engine: ServeEngine) -> u16 {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(8000),
         ServeEngine::DFlash => std::env::var("ASMI_DFLASH_PORT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(19080),
+        ServeEngine::Ds4 => std::env::var("ASMI_DS4_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(41000),
     }
 }
 
@@ -118,6 +120,82 @@ pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
         ServeBackend::Jaccl
     } else {
         ServeBackend::Single
+    }
+}
+
+/// Probe every host in a JACCL hostfile via its asmi `/health` endpoint,
+/// concurrently (serial 2 s timeouts would add hosts x 2 s of load latency).
+/// `Err` carries the unreachable host names (or a parse-level reason).
+///
+/// Why: a stale default hostfile must not silently turn a plain single-model
+/// serve into a doomed multi-rank launch. Observed 2026-06-10: both hub's and
+/// m3u3's `hostfiles/default.json` were 4-node JACCL configs left over from
+/// experiments — one still listing a node that had been SOLD — so every
+/// `backend: "auto"` load failed with rank exits 255/-15.
+pub async fn hostfile_hosts_alive(hf: &std::path::Path) -> Result<(), Vec<String>> {
+    let data = std::fs::read_to_string(hf)
+        .map_err(|e| vec![format!("unreadable hostfile: {e}")])?;
+    let json: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| vec![format!("invalid hostfile json: {e}")])?;
+    let hosts = json
+        .get("hosts")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if hosts.is_empty() {
+        return Err(vec!["hostfile has no hosts".to_string()]);
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(vec![format!("probe client: {e}")]),
+    };
+    let probes = hosts.iter().map(|h| {
+        let ssh = h
+            .get("ssh")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let client = client.clone();
+        async move {
+            let url = format!("http://{ssh}:9090/health");
+            let alive = matches!(client.get(&url).send().await, Ok(r) if r.status().is_success());
+            (ssh, alive)
+        }
+    });
+    let results = futures::future::join_all(probes).await;
+    let dead: Vec<String> = results
+        .into_iter()
+        .filter_map(|(ssh, alive)| (!alive).then_some(ssh))
+        .collect();
+    if dead.is_empty() { Ok(()) } else { Err(dead) }
+}
+
+/// `resolve_backend`, plus a liveness gate on the implicit path: when "auto"
+/// resolves to jaccl purely because a hostfile EXISTS, every host in it must
+/// answer its asmi `/health` probe — otherwise fall back to single with a
+/// warning. An EXPLICIT `backend: "jaccl"` request is honored unvalidated
+/// (the user asked for it; the launch error will name the dead rank).
+pub async fn resolve_backend_validated(backend: &str, hostfile: Option<&str>) -> ServeBackend {
+    let resolved = resolve_backend(backend, hostfile);
+    if resolved != ServeBackend::Jaccl || backend != "auto" {
+        return resolved;
+    }
+    let hf = hostfile
+        .map(PathBuf::from)
+        .unwrap_or_else(default_hostfile);
+    match hostfile_hosts_alive(&hf).await {
+        Ok(()) => ServeBackend::Jaccl,
+        Err(dead) => {
+            tracing::warn!(
+                hostfile = %hf.display(),
+                dead = ?dead,
+                "auto backend: hostfile hosts unreachable — falling back to single"
+            );
+            ServeBackend::Single
+        }
     }
 }
 
@@ -840,7 +918,7 @@ async fn do_serve_load_inner(
     let backend = if is_bare {
         ServeBackend::Single
     } else {
-        resolve_backend(&req.backend, req.hostfile.as_deref())
+        resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await
     };
 
     // Build command
@@ -1243,7 +1321,7 @@ async fn do_share_load_inner(
     }
 
     // Resolve backend
-    let backend = resolve_backend(&req.backend, req.hostfile.as_deref());
+    let backend = resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
 
     let py = resolve_python().to_string();
     let share_port = SHARE_PORT.to_string();
@@ -1920,5 +1998,51 @@ mod tests {
         assert!(WARMUP_TIMEOUT_MODEL_SECS >= 300);
         // Share timeout should be at least 5 minutes
         assert!(WARMUP_TIMEOUT_SHARE_SECS >= 300);
+    }
+}
+
+#[cfg(test)]
+mod backend_validation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn auto_falls_back_to_single_when_hostfile_hosts_dead() {
+        let dir = std::env::temp_dir().join("asmi-test-hostfiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hf = dir.join("dead-hosts.json");
+        std::fs::write(
+            &hf,
+            r#"{"backend":"jaccl","hosts":[{"ssh":"asmi-test-nonexistent.invalid"}]}"#,
+        )
+        .unwrap();
+        let resolved =
+            resolve_backend_validated("auto", Some(hf.to_str().unwrap())).await;
+        assert_eq!(resolved, ServeBackend::Single);
+    }
+
+    #[tokio::test]
+    async fn explicit_jaccl_is_honored_without_validation() {
+        let dir = std::env::temp_dir().join("asmi-test-hostfiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hf = dir.join("explicit.json");
+        std::fs::write(
+            &hf,
+            r#"{"backend":"jaccl","hosts":[{"ssh":"asmi-test-nonexistent.invalid"}]}"#,
+        )
+        .unwrap();
+        let resolved =
+            resolve_backend_validated("jaccl", Some(hf.to_str().unwrap())).await;
+        assert_eq!(resolved, ServeBackend::Jaccl);
+    }
+
+    #[tokio::test]
+    async fn unparseable_hostfile_falls_back_to_single() {
+        let dir = std::env::temp_dir().join("asmi-test-hostfiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hf = dir.join("garbage.json");
+        std::fs::write(&hf, "not json").unwrap();
+        let resolved =
+            resolve_backend_validated("auto", Some(hf.to_str().unwrap())).await;
+        assert_eq!(resolved, ServeBackend::Single);
     }
 }
