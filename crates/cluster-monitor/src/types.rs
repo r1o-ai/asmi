@@ -767,8 +767,6 @@ pub enum ServeEngine {
     MlxLmShare,
     #[serde(rename = "dflash")]
     DFlash,
-    #[serde(rename = "ds4")]
-    Ds4,
 }
 
 
@@ -780,7 +778,6 @@ impl fmt::Display for ServeEngine {
             Self::VllmMlx => write!(f, "vllm_mlx"),
             Self::MlxLmShare => write!(f, "mlx_lm_share"),
             Self::DFlash => write!(f, "dflash"),
-            Self::Ds4 => write!(f, "ds4"),
         }
     }
 }
@@ -856,13 +853,6 @@ impl ServeEngine {
             },
             Self::DFlash => EngineConfig {
                 binary: "dflash_mlx.serve",
-                binary_args: &[],
-                uvicorn_app: None,
-                model_flag: Some("--model"),
-                health_endpoints: &["/v1/models", "/health"],
-            },
-            Self::Ds4 => EngineConfig {
-                binary: "ds4-server",
                 binary_args: &[],
                 uvicorn_app: None,
                 model_flag: Some("--model"),

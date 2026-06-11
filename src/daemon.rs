@@ -1223,7 +1223,7 @@ async fn serve_load_handler(
     }
 
     // Start peer heartbeat for JACCL distributed sessions
-    let backend = crate::serve::resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
+    let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
     if backend == asmi_core::ServeBackend::Jaccl {
         let hf_path = req
             .hostfile
@@ -1888,7 +1888,7 @@ async fn serve_share_handler(
         return Err(ApiError::BadRequest("model_path required".into()));
     }
     // Start peer heartbeat for JACCL distributed sessions
-    let backend = crate::serve::resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
+    let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
     if backend == asmi_core::ServeBackend::Jaccl {
         let hf_path = req
             .hostfile
