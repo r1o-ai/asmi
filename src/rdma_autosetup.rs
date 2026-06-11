@@ -527,6 +527,58 @@ async fn discover_stable_topology(hosts: Vec<String>) -> Option<TopologyReport> 
 ///
 /// Applied locally via ifconfig, pushed to remote nodes via SSH.
 /// Returns the IPs assigned to the LOCAL node only.
+/// One link's deterministic /30 assignment. `first` is always the
+/// lexicographically-smaller node so the schema is stable regardless of
+/// discovery order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LinkAssignment {
+    pub node_first: String,
+    pub iface_first: String,
+    pub ip_first: String,
+    pub node_second: String,
+    pub iface_second: String,
+    pub ip_second: String,
+}
+
+/// Deterministic /30 allocation for a topology: sort links by
+/// (min_node, max_node, min_iface) and assign 192.168.10.(4i+1)/(4i+2).
+/// The iface tiebreaker matters for PARALLEL links between the same node
+/// pair (e.g. hub↔m3u2 over two cables): without it Vec::sort's stability
+/// makes their relative order follow discovery order, so re-runs could swap
+/// their /30s. Same cables ⇒ same IPs, every time, on every node.
+/// Single source of truth — used by both the boot-time assigner and /rdma/mesh.
+pub fn deterministic_link_ips(topo: &crate::topology::TopologyReport) -> Vec<LinkAssignment> {
+    let canon = |link: &crate::topology::TopologyLink| {
+        let strip = |d: &str| d.strip_prefix("rdma_").unwrap_or(d).to_string();
+        if link.node_a < link.node_b {
+            (link.node_a.clone(), strip(&link.device_a), link.node_b.clone(), strip(&link.device_b))
+        } else {
+            (link.node_b.clone(), strip(&link.device_b), link.node_a.clone(), strip(&link.device_a))
+        }
+    };
+    let mut links: Vec<_> = topo.links.iter().map(canon).collect();
+    links.sort_by(|a, b| {
+        let a_iface = (&a.1).min(&a.3);
+        let b_iface = (&b.1).min(&b.3);
+        (&a.0, &a.2, a_iface).cmp(&(&b.0, &b.2, b_iface))
+    });
+    links
+        .into_iter()
+        .enumerate()
+        .map(|(i, (node_first, iface_first, node_second, iface_second))| {
+            let base = 4 * i;
+            LinkAssignment {
+                node_first,
+                iface_first,
+                ip_first: format!("192.168.10.{}", base + 1),
+                node_second,
+                iface_second,
+                ip_second: format!("192.168.10.{}", base + 2),
+            }
+        })
+        .collect()
+}
+
 pub async fn assign_topology_ips(
     topo: &TopologyReport,
     local_hostname: &str,
@@ -545,35 +597,14 @@ pub async fn assign_topology_ips(
     let local_canon = asmi_core::aggregator::canonicalize_hostname(local_hostname, &node_set);
     let local_hostname: &str = &local_canon;
 
-    let mut sorted_links = topo.links.clone();
-    sorted_links.sort_by(|a, b| {
-        let a_pair = if a.node_a < a.node_b {
-            (&a.node_a, &a.node_b)
-        } else {
-            (&a.node_b, &a.node_a)
-        };
-        let b_pair = if b.node_a < b.node_b {
-            (&b.node_a, &b.node_b)
-        } else {
-            (&b.node_b, &b.node_a)
-        };
-        a_pair.cmp(&b_pair)
-    });
+    let assignments = deterministic_link_ips(topo);
 
     let mut local_ips = vec![];
 
-    for (i, link) in sorted_links.iter().enumerate() {
-        let base = 4 * i;
-        let (first_node, first_dev, second_node, second_dev) = if link.node_a < link.node_b {
-            (&link.node_a, &link.device_a, &link.node_b, &link.device_b)
-        } else {
-            (&link.node_b, &link.device_b, &link.node_a, &link.device_a)
-        };
-
-        let ip_first = format!("192.168.10.{}", base + 1);
-        let ip_second = format!("192.168.10.{}", base + 2);
-        let iface_first = first_dev.strip_prefix("rdma_").unwrap_or(first_dev);
-        let iface_second = second_dev.strip_prefix("rdma_").unwrap_or(second_dev);
+    for (i, a) in assignments.iter().enumerate() {
+        let (first_node, second_node) = (&a.node_first, &a.node_second);
+        let (iface_first, iface_second) = (a.iface_first.as_str(), a.iface_second.as_str());
+        let (ip_first, ip_second) = (a.ip_first.clone(), a.ip_second.clone());
 
         // Assign first node's side
         if first_node == local_hostname {
@@ -1262,4 +1293,76 @@ async fn write_hostfile(peers: &PeerResult, local_ips: &[InterfaceIp]) -> Result
 
     tracing::info!("wrote JACCL hostfile: {} ({} hosts)", path.display(), hosts.len());
     Ok(path.display().to_string())
+}
+
+#[cfg(test)]
+mod deterministic_ip_tests {
+    use super::*;
+    use crate::topology::{TopologyLink, TopologyReport};
+
+    fn link(a: &str, da: &str, b: &str, db: &str) -> TopologyLink {
+        TopologyLink {
+            node_a: a.into(),
+            device_a: da.into(),
+            node_b: b.into(),
+            device_b: db.into(),
+        }
+    }
+
+    fn report(links: Vec<TopologyLink>) -> TopologyReport {
+        TopologyReport {
+            nodes: vec![],
+            links,
+            mesh_complete: false,
+            missing_links: vec![],
+            jaccl_ready: false,
+            jaccl_ready_subsets: vec![],
+            raw_dot: String::new(),
+        }
+    }
+
+    #[test]
+    fn parallel_links_same_pair_are_order_independent() {
+        // hub↔m3u2 over two cables, fed in both discovery orders — the iface
+        // tiebreaker must yield identical assignments.
+        let fwd = report(vec![
+            link("hub", "rdma_en4", "m3u2", "rdma_en4"),
+            link("hub", "rdma_en5", "m3u2", "rdma_en3"),
+        ]);
+        let rev = report(vec![
+            link("m3u2", "rdma_en3", "hub", "rdma_en5"),
+            link("hub", "rdma_en4", "m3u2", "rdma_en4"),
+        ]);
+        let a = deterministic_link_ips(&fwd);
+        let b = deterministic_link_ips(&rev);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].ip_first, "192.168.10.1");
+        assert_eq!(a[0].ip_second, "192.168.10.2");
+        assert_eq!(a[1].ip_first, "192.168.10.5");
+        assert_eq!(a[1].ip_second, "192.168.10.6");
+    }
+
+    #[test]
+    fn node_order_in_link_is_canonicalized() {
+        let r1 = report(vec![link("m3u2", "rdma_en4", "hub", "rdma_en3")]);
+        let r2 = report(vec![link("hub", "rdma_en3", "m3u2", "rdma_en4")]);
+        let (a, b) = (deterministic_link_ips(&r1), deterministic_link_ips(&r2));
+        assert_eq!(a, b);
+        assert_eq!(a[0].node_first, "hub");
+        assert_eq!(a[0].iface_first, "en3");
+    }
+
+    #[test]
+    fn multi_pair_sorted_lexicographically() {
+        let r = report(vec![
+            link("m3u2", "rdma_en5", "m3u3", "rdma_en5"),
+            link("hub", "rdma_en4", "m3u2", "rdma_en4"),
+        ]);
+        let a = deterministic_link_ips(&r);
+        assert_eq!(a[0].node_first, "hub");          // hub-m3u2 sorts first
+        assert_eq!(a[0].ip_first, "192.168.10.1");
+        assert_eq!(a[1].node_first, "m3u2");         // m3u2-m3u3 second
+        assert_eq!(a[1].ip_first, "192.168.10.5");
+    }
 }

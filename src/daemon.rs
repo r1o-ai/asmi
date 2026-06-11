@@ -3133,6 +3133,30 @@ async fn rdma_health_handler(State(state): State<AppState>) -> Json<serde_json::
     }))
 }
 
+/// GET /rdma/topology → UUID cross-matched TB link map (plan: rdma-auto-mesh A1).
+/// Reuses topology::discover_topology (native HTTP + /thunderbolt UUID
+/// cross-reference) and returns the full TopologyReport: links carry
+/// node_a/device_a ↔ node_b/device_b; report carries mesh_complete,
+/// jaccl_ready and ready subsets.
+async fn rdma_topology_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let nm = state.node_map.read().await;
+    let nodes: Vec<String> = nm.nodes.clone();
+    drop(nm);
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::topology::discover_topology(&nodes, "jaccl")
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => Json(serde_json::to_value(&report).unwrap_or_else(
+            |e| serde_json::json!({"error": format!("serialize: {e}")}),
+        )),
+        Ok(Err(e)) => Json(serde_json::json!({"error": format!("discovery: {e}")})),
+        Err(e) => Json(serde_json::json!({"error": format!("join: {e}")})),
+    }
+}
+
 /// GET /rdma/mesh → query all cluster nodes, aggregate mesh health.
 ///
 /// Reads node list from NodeMap (seeded from ~/.r1o/cluster.json).
@@ -3238,6 +3262,81 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         })
     };
 
+    // Plan rdma-auto-mesh A3: deterministic per-link /30 assignments + best
+    // peer IP + SMB reachability, from the cached topology (no fresh scan on
+    // the request path). Only links where THIS node is an endpoint are probed
+    // (TCP :445 over the /30, 700ms, concurrent) — each node probes its own
+    // edges; everything else reports "unprobed".
+    let cached_report = state
+        .topology_cache
+        .read()
+        .await
+        .as_ref()
+        .map(|(report, _)| report.clone());
+    let (mesh_links, node_best_ip) = match cached_report {
+        Some(report) => {
+            let assignments = crate::rdma_autosetup::deterministic_link_ips(&report);
+            let local = state.hostname.to_lowercase();
+            let probes: Vec<_> = assignments
+                .iter()
+                .map(|a| {
+                    let local_is_first = a.node_first.to_lowercase() == local;
+                    let local_is_second = a.node_second.to_lowercase() == local;
+                    let peer_ip = if local_is_first {
+                        Some(a.ip_second.clone())
+                    } else if local_is_second {
+                        Some(a.ip_first.clone())
+                    } else {
+                        None
+                    };
+                    async move {
+                        match peer_ip {
+                            Some(ip) => {
+                                let alive = tokio::time::timeout(
+                                    std::time::Duration::from_millis(700),
+                                    tokio::net::TcpStream::connect((ip.as_str(), 445)),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
+                                Some(alive)
+                            }
+                            None => None,
+                        }
+                    }
+                })
+                .collect();
+            let probe_results = futures::future::join_all(probes).await;
+
+            let mut links = Vec::new();
+            let mut best = serde_json::Map::new();
+            for (a, probed) in assignments.iter().zip(probe_results) {
+                let (status, smb) = match probed {
+                    Some(true) => ("up", serde_json::Value::Bool(true)),
+                    Some(false) => ("down", serde_json::Value::Bool(false)),
+                    None => ("unprobed", serde_json::Value::Null),
+                };
+                if probed == Some(true) {
+                    let local_is_first = a.node_first.to_lowercase() == local;
+                    let (peer_name, peer_ip) = if local_is_first {
+                        (&a.node_second, &a.ip_second)
+                    } else {
+                        (&a.node_first, &a.ip_first)
+                    };
+                    best.entry(peer_name.clone())
+                        .or_insert_with(|| serde_json::Value::String(peer_ip.clone()));
+                }
+                links.push(serde_json::json!({
+                    "node_a": a.node_first, "iface_a": a.iface_first, "ip_a": a.ip_first,
+                    "node_b": a.node_second, "iface_b": a.iface_second, "ip_b": a.ip_second,
+                    "status": status, "smb_mountable": smb,
+                }));
+            }
+            (links, serde_json::Value::Object(best))
+        }
+        None => (Vec::new(), serde_json::json!({})),
+    };
+
     Json(serde_json::json!({
         "mesh_healthy": mesh_healthy,
         "summary": format!(
@@ -3251,6 +3350,8 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         "total_peers_reachable": total_reachable_peers,
         "total_peers": total_peers,
         "topology": mesh_topology,
+        "links": mesh_links,
+        "node_best_ip": node_best_ip,
         "nodes": nodes,
         "queried_via": "local_network",
         "queried_from": state.hostname,
@@ -3558,6 +3659,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/rdma/check", get(rdma_check_handler))
         .route("/rdma/health", get(rdma_health_handler))
         .route("/rdma/mesh", get(rdma_mesh_handler))
+        .route("/rdma/topology", get(rdma_topology_handler))
         .route("/rdma/setup", post(rdma_setup_handler))
         .route("/bridge0/destroy", post(bridge0_destroy_handler))
         .route("/bridge0/restore", post(bridge0_restore_handler))
