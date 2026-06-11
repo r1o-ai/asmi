@@ -3173,8 +3173,25 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         .map(|s| s.as_str())
         .collect();
 
+    // Latency (plan 2026-06-11 stream B): peers the hub's cluster poller
+    // already marks offline are skipped outright — each would otherwise pin
+    // the wave to the full per-peer timeout on every request. cluster_state
+    // is hub-only (--cluster), so elsewhere this set is empty and offline
+    // peers cost one (now 2s) timeout instead.
+    let known_offline: std::collections::HashSet<String> = match state.cluster_state.as_ref() {
+        Some(cs) => cs
+            .read()
+            .await
+            .snapshots
+            .iter()
+            .filter(|(_, snap)| !snap.online)
+            .map(|(name, _)| name.clone())
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(2))
         .build()
         .unwrap_or_default();
 
@@ -3184,8 +3201,12 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         .map(|&name| {
             let client = client.clone();
             let name = name.to_string();
+            let skip_offline = known_offline.contains(&name);
             let url = format!("http://{}.local:9090/rdma/check", name);
             async move {
+                if skip_offline {
+                    return (name, None);
+                }
                 match client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<serde_json::Value>().await {
@@ -3199,8 +3220,14 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         })
         .collect();
 
-    let results: Vec<(String, Option<serde_json::Value>)> =
-        futures::future::join_all(futures).await;
+    // Overlap the remote wave with the local /rdma/check (plan 2026-06-11
+    // stream B): run serially they floor at wave + 1.1-1.8s; joined, the
+    // floor is max(wave, local check). The node_map read-lock was dropped
+    // above, before either future is built.
+    let (results, local_check): (Vec<(String, Option<serde_json::Value>)>, _) = tokio::join!(
+        futures::future::join_all(futures),
+        rdma_check_handler(State(state.clone()))
+    );
 
     let mut nodes: Vec<serde_json::Value> = Vec::new();
     let mut total_active = 0usize;
@@ -3213,8 +3240,9 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
     // handler promised this but it was never implemented, so every node's
     // /rdma/mesh omitted itself (web callers that fanned out themselves
     // masked the gap). Same row shape as the remote passthrough below.
+    // The check itself ran concurrently with the remote wave (join above).
     {
-        let local = rdma_check_handler(State(state.clone())).await.0;
+        let local = local_check.0;
         nodes_online += 1;
         let healthy = local.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
         if healthy {
