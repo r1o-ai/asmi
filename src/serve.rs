@@ -1403,7 +1403,6 @@ async fn do_share_load_inner(
     let backend = resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
 
     let py = resolve_python().to_string();
-    let share_port = SHARE_PORT.to_string();
 
     // For distributed JACCL: orchestrate via asmi peer HTTP APIs
     // For single-node: run python3 -m mlx_lm.server directly

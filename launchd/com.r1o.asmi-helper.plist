@@ -18,7 +18,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/ma/.cargo/bin/asmi-helper</string>
+        <string>__ASMI_HOME__/.cargo/bin/asmi-helper</string>
     </array>
 
     <key>RunAtLoad</key>

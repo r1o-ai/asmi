@@ -9,7 +9,7 @@ chmod 755 ~/.cargo/bin/asmi-helper
 echo "  binary: $(stat -f '%Sm %z bytes' ~/.cargo/bin/asmi-helper)"
 
 # 2. Install plist (sudo)
-sudo cp /tmp/com.r1o.asmi-helper.plist /Library/LaunchDaemons/com.r1o.asmi-helper.plist
+sed "s|__ASMI_HOME__|$HOME|g" /tmp/com.r1o.asmi-helper.plist | sudo tee /Library/LaunchDaemons/com.r1o.asmi-helper.plist > /dev/null
 sudo chown root:wheel /Library/LaunchDaemons/com.r1o.asmi-helper.plist
 sudo chmod 644 /Library/LaunchDaemons/com.r1o.asmi-helper.plist
 echo "  plist installed"

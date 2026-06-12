@@ -39,7 +39,7 @@ const SERVICE_TYPE: &str = "_r1o._tcp.local.";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default ports we probe for the optional TXT records. These match the
-/// canonical r1o port table in `/Users/ma/Projects/r1o/CLAUDE.md`.
+/// canonical r1o port table in `the r1o project docs`.
 const HERMES_PORT: u16 = 41104;
 const MLX_PORT: u16 = 19080;
 

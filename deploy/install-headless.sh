@@ -7,7 +7,7 @@
 #
 # Run this on the TARGET node (not the orchestrator). Requires passwordless sudo.
 #
-# Prereqs already done: asmi binary at /Users/ma/.cargo/bin/asmi, codesigned,
+# Prereqs already done: asmi binary at $HOME/.cargo/bin/asmi, codesigned,
 # +x, and tested with `asmi --version` returning 0.
 
 set -euo pipefail
@@ -41,7 +41,7 @@ sleep 2
 
 # Install the LaunchDaemon plist with the correct ownership.
 echo "installing $PLIST_DEST"
-sudo cp "$PLIST_SOURCE" "$PLIST_DEST"
+sed "s|__ASMI_HOME__|$HOME|g" "$PLIST_SOURCE" | sudo tee "$PLIST_DEST" > /dev/null
 sudo chown root:wheel "$PLIST_DEST"
 sudo chmod 644 "$PLIST_DEST"
 
@@ -56,6 +56,6 @@ if curl -s -m 5 localhost:9090/health | grep -q '"ok":true'; then
     echo "asmi LaunchDaemon healthy on $(hostname)"
     exit 0
 else
-    echo "asmi did not come up; check /Users/ma/Library/Logs/asmi-daemon.log" >&2
+    echo "asmi did not come up; check $HOME/Library/Logs/asmi-daemon.log" >&2
     exit 1
 fi

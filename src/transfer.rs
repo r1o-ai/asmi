@@ -59,6 +59,7 @@ pub struct TransferState {
     pub log: Vec<String>,
 }
 
+#[cfg(feature = "jaccl")]
 impl TransferState {
     fn push_log(&mut self, event: &SseEvent) {
         self.log.push(event.to_sse_line());
@@ -68,12 +69,14 @@ impl TransferState {
     }
 }
 
+#[cfg(feature = "jaccl")]
 fn generate_transfer_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
     format!("tx-{:x}", ts)
 }
 
+#[cfg(feature = "jaccl")]
 fn epoch_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -83,6 +86,9 @@ fn epoch_now() -> u64 {
 // Request / response types
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+// Fields are only read by the jaccl transfer pipeline; the no-jaccl stub
+// deserializes the payload but ignores it to keep the HTTP API shape stable.
+#[cfg_attr(not(feature = "jaccl"), allow(dead_code))]
 #[derive(Deserialize)]
 pub struct TransferRequest {
     /// Model directory name (relative to ~/Models/)
@@ -113,6 +119,7 @@ pub struct TransferAcceptRequest {
     pub coordinator_device: Option<String>,
 }
 
+#[cfg(feature = "jaccl")]
 #[derive(Serialize)]
 struct SseEvent {
     #[serde(rename = "type")]
@@ -135,6 +142,7 @@ struct SseEvent {
     total_bytes: Option<u64>,
 }
 
+#[cfg(feature = "jaccl")]
 impl SseEvent {
     fn stage(name: &str) -> Self {
         SseEvent {
@@ -216,15 +224,22 @@ pub enum JacclCmd {
         reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
     },
     /// Probe group liveness for `peer`.
+    /// Handled by the worker loop and backed by jaccl_group_probe FFI;
+    /// the HTTP endpoint that sends this is not wired up yet.
+    #[allow(dead_code)]
     Probe {
         peer: String,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
     /// Drop the group for `peer`, freeing PDs.
+    /// Worker-side handled; send-side endpoint pending (see Probe).
+    #[allow(dead_code)]
     DropGroup {
         peer: String,
     },
     /// Poison and cancel all pending ops on `peer`'s group.
+    /// Worker-side handled; send-side endpoint pending (see Probe).
+    #[allow(dead_code)]
     CancelPending {
         peer: String,
     },
@@ -1513,10 +1528,8 @@ fn write_devices_json(rank: i32, local_dev: &str, peer_dev: &str) -> Result<Stri
 // Helper functions
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// Resolve a peer hostname to an IPv4 address via native mDNS (Phase 4).
-/// Uses libc::getaddrinfo — no Python subprocess.
-#[cfg(feature = "jaccl")]
 /// Resolve peer via /etc/hosts — returns LAN IP (10.x.x.x). Fastest, most reliable.
+#[cfg(feature = "jaccl")]
 fn resolve_peer_lan(peer: &str) -> Option<String> {
     let hosts = std::fs::read_to_string("/etc/hosts").ok()?;
     for line in hosts.lines() {
@@ -1542,39 +1555,22 @@ fn resolve_peer_lan(peer: &str) -> Option<String> {
 }
 
 /// Resolve peer via mDNS (.local) only — no Tailscale.
+/// std's ToSocketAddrs goes through getaddrinfo → mDNSResponder on macOS.
+#[cfg(feature = "jaccl")]
 fn resolve_peer_mdns_only(peer: &str) -> Option<String> {
-    use std::ffi::CString;
-    use std::net::Ipv4Addr;
+    use std::net::ToSocketAddrs;
 
-    let hostname = CString::new(format!("{}.local", peer)).ok()?;
-    let mut res: *mut libc::addrinfo = std::ptr::null_mut();
-    let hints = libc::addrinfo {
-        ai_family: libc::AF_INET,
-        ai_socktype: libc::SOCK_STREAM,
-        ai_flags: 0,
-        ai_protocol: 0,
-        ai_addrlen: 0,
-        ai_canonname: std::ptr::null_mut(),
-        ai_addr: std::ptr::null_mut(),
-        ai_next: std::ptr::null_mut(),
-    };
-    let rc = unsafe {
-        libc::getaddrinfo(hostname.as_ptr(), std::ptr::null(), &hints, &mut res)
-    };
-    if rc != 0 || res.is_null() {
-        return None;
-    }
-    let addr = unsafe {
-        let sa = (*res).ai_addr as *const libc::sockaddr_in;
-        Ipv4Addr::from(u32::from_be((*sa).sin_addr.s_addr))
-    };
-    unsafe { libc::freeaddrinfo(res); }
-    let ip = addr.to_string();
+    let addr = format!("{}.local:0", peer)
+        .to_socket_addrs()
+        .ok()?
+        .find(|a| a.is_ipv4())?;
+    let ip = addr.ip().to_string();
     tracing::info!(%peer, %ip, "resolved peer via mDNS");
     Some(ip)
 }
 
 /// Resolve peer IP via `tailscale status --json`. Stable IPs that survive reboots.
+#[cfg(feature = "jaccl")]
 fn resolve_peer_tailscale(peer: &str) -> Option<String> {
     let output = std::process::Command::new("tailscale")
         .args(["status", "--json"])
@@ -1594,73 +1590,6 @@ fn resolve_peer_tailscale(peer: &str) -> Option<String> {
                             if !s.contains(':') { return Some(s.to_string()); }
                         }
                     }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Resolve the TB5 link-local IP that can reach a peer's TB5 IP.
-/// Scans all local 169.254.x.x addresses and finds one that can
-/// reach any of the peer's 169.254.x.x addresses (via ARP/ping).
-/// Returns the LOCAL IP that has connectivity.
-#[cfg(feature = "jaccl")]
-fn resolve_tb5_coordinator_ip(peer_hostname: &str) -> Option<String> {
-    // Get peer's 169.254 link-local IPs via SSH.
-    // Try multiple SSH targets since bare hostname may not resolve after reboot.
-    let mut ssh_targets = vec![
-        peer_hostname.to_string(),
-        format!("{}.local", peer_hostname),
-    ];
-    if let Some(ts_ip) = resolve_peer_tailscale(peer_hostname) {
-        ssh_targets.push(ts_ip);
-    }
-
-    let mut peer_ips: Vec<String> = Vec::new();
-    for target in &ssh_targets {
-        if let Ok(output) = std::process::Command::new("ssh")
-            .args(["-o", "ConnectTimeout=3", "-o", "BatchMode=yes", target,
-                   "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
-            .output()
-        {
-            if output.status.success() {
-                peer_ips = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter(|l| l.starts_with("169.254.") && !l.ends_with(".255"))
-                    .map(|s| s.to_string())
-                    .collect();
-                if !peer_ips.is_empty() {
-                    tracing::info!(ssh_target = %target, count = peer_ips.len(), "got peer link-local IPs");
-                    break;
-                }
-            }
-        }
-    }
-    if peer_ips.is_empty() { return None; }
-
-    // Get our own 169.254 IPs
-    let local_ips: Vec<String> = std::process::Command::new("sh")
-        .args(["-c", "ifconfig | grep 'inet 169.254' | awk '{print $2}'"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| l.starts_with("169.254.") && !l.ends_with(".255"))
-            .map(|s| s.to_string())
-            .collect())
-        .unwrap_or_default();
-
-    // Find a local IP that can ping a peer IP (proves TB5 link connectivity)
-    for local_ip in &local_ips {
-        for peer_ip in &peer_ips {
-            if let Ok(out) = std::process::Command::new("ping")
-                .args(["-c", "1", "-W", "1", "-S", local_ip, peer_ip])
-                .output()
-            {
-                if out.status.success() {
-                    tracing::info!(%local_ip, %peer_ip, "found TB5 link-local path");
-                    return Some(local_ip.clone());
                 }
             }
         }

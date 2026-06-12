@@ -46,6 +46,9 @@ pub struct AppState {
     pub ane: crate::ane::AneState,
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     /// JACCL worker — dedicated OS thread for all RDMA operations (Phase 3).
+    /// Only read by jaccl-gated transfer handlers; kept unconditional so
+    /// AppState has the same shape across feature combinations.
+    #[cfg_attr(not(feature = "jaccl"), allow(dead_code))]
     pub jaccl_worker: Arc<crate::transfer::JacclWorker>,
     /// Active/completed transfers — fire-and-forget state, survives client disconnect.
     pub active_transfers: crate::transfer::ActiveTransfers,

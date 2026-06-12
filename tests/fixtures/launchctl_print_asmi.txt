@@ -1,21 +1,21 @@
 gui/501/com.asmi.daemon = {
 	active count = 1
-	path = /Users/ma/Library/LaunchAgents/com.asmi.daemon.plist
+	path = /Users/demo/Library/LaunchAgents/com.asmi.daemon.plist
 	type = LaunchAgent
 	state = running
 
-	program = /Users/ma/.cargo/bin/asmi
+	program = /usr/local/bin/asmi
 	BTM uuid = F2F88A9D-DDC4-44A8-A36D-323452BAEEFE
 	arguments = {
-		/Users/ma/.cargo/bin/asmi
+		/usr/local/bin/asmi
 		--serve
 		--cluster
 		--port
 		9090
 	}
 
-	stdout path = /Users/ma/Library/Logs/asmi-daemon.log
-	stderr path = /Users/ma/Library/Logs/asmi-daemon.log
+	stdout path = /Users/demo/Library/Logs/asmi-daemon.log
+	stderr path = /Users/demo/Library/Logs/asmi-daemon.log
 	inherited environment = {
 		SSH_AUTH_SOCK => /var/run/com.apple.launchd.tEkMQsOpDP/Listeners
 	}

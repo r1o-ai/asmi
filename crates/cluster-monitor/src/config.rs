@@ -174,7 +174,7 @@ pub struct NodeMap {
     pub rdma_links: Vec<RdmaLink>,
     /// Custom Python interpreter path for MLX operations.
     /// If set, overrides the default `resolve_python()` auto-detection.
-    /// Example: "/Users/ma/Projects/infra/hermes/.venv/bin/python3"
+    /// Example: "~/venvs/hermes/bin/python3"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_cmd: Option<String>,
 }

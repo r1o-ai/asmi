@@ -1,6 +1,6 @@
 gui/501/com.test.fixture1 = {
 	active count = 0
-	path = /Users/ma/Library/LaunchAgents/com.test.fixture1.plist
+	path = /Users/demo/Library/LaunchAgents/com.test.fixture1.plist
 	type = LaunchAgent
 	state = not running
 	disabled on keys = ["com.test.fixture1"]

@@ -16,7 +16,7 @@
     <string>com.asmi.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/ma/.cargo/bin/asmi</string>
+        <string>__ASMI_HOME__/.cargo/bin/asmi</string>
         <string>--serve</string>
         <string>--port</string>
         <string>9090</string>
@@ -26,9 +26,9 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/ma/Library/Logs/asmi-daemon.log</string>
+    <string>__ASMI_HOME__/Library/Logs/asmi-daemon.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/ma/Library/Logs/asmi-daemon.log</string>
+    <string>__ASMI_HOME__/Library/Logs/asmi-daemon.log</string>
     <key>ThrottleInterval</key>
     <integer>5</integer>
 </dict>
