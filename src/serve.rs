@@ -24,6 +24,7 @@ pub fn managed_ports() -> Vec<(u16, ServeEngine)> {
     vec![
         (port_for_engine(ServeEngine::MlxLm), ServeEngine::MlxLm),
         (port_for_engine(ServeEngine::MlxVlm), ServeEngine::MlxVlm),
+        (port_for_engine(ServeEngine::Ds4), ServeEngine::Ds4),
     ]
 }
 
@@ -39,7 +40,7 @@ pub fn port_for_engine(engine: ServeEngine) -> u16 {
         ServeEngine::DFlash => std::env::var("ASMI_DFLASH_PORT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(19080),
         ServeEngine::Ds4 => std::env::var("ASMI_DS4_PORT")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(41000),
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
     }
 }
 
@@ -72,6 +73,63 @@ fn resolve_mlx_launch() -> String {
     // Should not reach here — mlx.launch is installed via pip
     tracing::warn!("mlx.launch not found! Distributed inference will fail.");
     "mlx.launch".to_string()
+}
+
+/// Resolve a native (non-Python) server binary.
+///
+/// Search order:
+///   1. `DS4_SERVER_PATH` env var (explicit override)
+///   2. `~/.r1o/bin/<binary>` (managed install location)
+///   3. `which <binary>` (PATH lookup)
+///   4. Common fallback paths (`/usr/local/bin/`, `~/opensource/ds4/`)
+fn resolve_native_binary(binary: &str, engine: &ServeEngine) -> Result<PathBuf, anyhow::Error> {
+    // 1. Env var override (e.g. DS4_SERVER_PATH)
+    let env_key = format!("{}_PATH", binary.to_uppercase().replace('-', "_"));
+    if let Ok(p) = std::env::var(&env_key) {
+        let path = PathBuf::from(&p);
+        if path.exists() {
+            tracing::info!(%env_key, ?path, "native binary from env");
+            return Ok(path);
+        }
+        tracing::warn!(%env_key, path = %p, "env var set but path does not exist");
+    }
+
+    // 2. Managed install location
+    let managed = r1o_dir().join("bin").join(binary);
+    if managed.exists() {
+        tracing::info!(?managed, "native binary from ~/.r1o/bin");
+        return Ok(managed);
+    }
+
+    // 3. PATH lookup via `which`
+    if let Ok(output) = std::process::Command::new("which").arg(binary).output() {
+        if output.status.success() {
+            let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !p.is_empty() && std::path::Path::new(&p).exists() {
+                tracing::info!(path = %p, "native binary from PATH");
+                return Ok(PathBuf::from(p));
+            }
+        }
+    }
+
+    // 4. Common fallback paths
+    let fallbacks: Vec<PathBuf> = vec![
+        PathBuf::from(format!("/usr/local/bin/{binary}")),
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("opensource/ds4/{binary}")),
+    ];
+    for fb in &fallbacks {
+        if fb.exists() {
+            tracing::info!(?fb, "native binary from fallback path");
+            return Ok(fb.clone());
+        }
+    }
+
+    anyhow::bail!(
+        "native binary '{}' not found for engine {:?}. Set {} or place it in ~/.r1o/bin/",
+        binary, engine, env_key
+    )
 }
 
 /// Warmup timeout for bare server start (no model — should be fast).
@@ -926,10 +984,30 @@ async fn do_serve_load_inner(
     let mut cmd_args: Vec<String> = Vec::new();
     let program: String;
 
-    // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
-    let py = resolve_python().to_string();
+    // Native binary engines (e.g. ds4) bypass Python entirely.
+    let is_native = matches!(engine, ServeEngine::Ds4);
 
-    if let Some(uvicorn_app) = cfg.uvicorn_app {
+    if is_native {
+        let binary_path = resolve_native_binary(cfg.binary, &engine)?;
+        program = binary_path.to_string_lossy().to_string();
+
+        // Model flag + path
+        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
+            cmd_args.push(flag.into());
+            cmd_args.push(model_path.clone());
+        }
+
+        // Port binding (critical: without --port, ds4 defaults to 8000, not 8080)
+        cmd_args.extend(["--port".into(), port.to_string()]);
+        cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
+
+        // Context window size
+        if let Some(ctx) = req.ctx_size {
+            cmd_args.extend(["-c".into(), ctx.to_string()]);
+        }
+    } else if let Some(uvicorn_app) = cfg.uvicorn_app {
+        // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
+        let py = resolve_python().to_string();
         // Uvicorn-wrapped engines (avoids reload=True bugs in mlx_vlm)
         program = py;
         cmd_args.extend([
@@ -946,6 +1024,7 @@ async fn do_serve_load_inner(
         ]);
     } else {
         // Run as python3 -m <module> (e.g. python3 -m mlx_lm.server)
+        let py = resolve_python().to_string();
         program = py;
         cmd_args.push("-m".into());
         cmd_args.push(cfg.binary.to_string());

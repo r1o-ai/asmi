@@ -515,7 +515,7 @@ async fn collect_serving_map(state: &AppState) -> Vec<(Vec<String>, ServingInfo)
 
 /// Extract searchable name fragments from a model ID.
 /// "mlx-community/Qwen3.5-122B-A10B-6bit" → ["qwen3.5-122b-a10b-6bit"]
-/// "/Users/ma/Models/Qwen3.5-REAP-262B-A17B-4bit-mlx" → ["qwen3.5-reap-262b-a17b-4bit-mlx"]
+/// "~/Models/Qwen3.5-REAP-262B-A17B-4bit-mlx" → ["qwen3.5-reap-262b-a17b-4bit-mlx"]
 fn normalize_model_id(id: &str) -> Vec<String> {
     let mut frags = Vec::new();
     // Last path component (works for both HF IDs and absolute paths)
@@ -1261,6 +1261,82 @@ async fn serve_stop_handler(
     drop(managers);
     state.peer_heartbeat.stop().await;
     Ok(Json(serde_json::json!({"ok": true, "port": port})))
+}
+
+/// POST /serve/restart → kill and restart the server on a port.
+///
+/// For launchd-managed servers (ds4, etc.): kills the process and lets
+/// KeepAlive revive it automatically, then polls until `/v1/models` responds.
+/// For asmi-managed servers (mlx_lm, mlx_vlm): stops and re-loads the same
+/// model. Clears stuck prefill loops, jammed KV caches, and hung connections.
+async fn serve_restart_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let port = q.port.unwrap_or(DEFAULT_SERVE_PORT);
+    let managers = state.serve_managers.read().await;
+    let mgr = managers.get(&port)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+
+    let status = mgr.status().await;
+    let is_launchd = status.launchd.as_ref().is_some_and(|l| l.keep_alive.unwrap_or(false));
+    let model = status.model.clone();
+    let engine = status.engine;
+    let backend = status.backend.to_string();
+
+    mgr.stop().await;
+    drop(managers);
+    state.peer_heartbeat.stop().await;
+
+    if is_launchd {
+        // launchd KeepAlive will auto-restart the process.
+        // Poll the port until the new process responds (up to 30s).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if tokio::time::Instant::now() > deadline {
+                return Ok(Json(serde_json::json!({
+                    "ok": true, "port": port, "state": "restart_timeout",
+                    "message": "launchd should revive; process not yet healthy after 30s"
+                })));
+            }
+            if client.get(&url).send().await.is_ok_and(|r| r.status().is_success()) {
+                break;
+            }
+        }
+        Ok(Json(serde_json::json!({
+            "ok": true, "port": port, "state": "ready",
+            "message": "launchd-managed server restarted"
+        })))
+    } else if let Some(model_path) = model {
+        // asmi-managed: re-load the same model
+        let req = asmi_core::LoadRequest {
+            model_path: Some(model_path),
+            backend,
+            hostfile: None,
+            engine,
+            ..Default::default()
+        };
+        let managers = state.serve_managers.read().await;
+        if let Some(mgr) = managers.get(&port) {
+            mgr.load(req).await;
+        }
+        Ok(Json(serde_json::json!({
+            "ok": true, "port": port, "state": "loading",
+            "message": "server stopped and model reload initiated"
+        })))
+    } else {
+        // No model was loaded — just leave it stopped
+        Ok(Json(serde_json::json!({
+            "ok": true, "port": port, "state": "idle",
+            "message": "server stopped (no model to reload)"
+        })))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3694,6 +3770,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/status", get(serve_status_handler))
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
+        .route("/serve/restart", post(serve_restart_handler))
         .route("/serve/reload", post(serve_reload_handler))
         .route("/launchd/disable", post(launchd_disable_handler))
         .route("/launchd/enable", post(launchd_enable_handler))

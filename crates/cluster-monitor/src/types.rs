@@ -1002,6 +1002,10 @@ pub struct LoadRequest {
     /// Vision-feature cache entries. → env MLX_VLM_VISION_CACHE_SIZE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_cache_size: Option<u32>,
+
+    /// Context window size override (ds4 `-c` flag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_size: Option<u64>,
 }
 
 fn default_backend_str() -> String {
@@ -1029,6 +1033,7 @@ impl Default for LoadRequest {
             kv_bits: None,
             kv_quant_scheme: None,
             vision_cache_size: None,
+            ctx_size: None,
         }
     }
 }
