@@ -166,7 +166,9 @@ pub fn default_hostfile() -> PathBuf {
     r1o_dir().join("hostfiles/default.json")
 }
 
-/// Resolve "auto" backend to single or jaccl based on hostfile existence.
+/// Resolve a backend string to a ServeBackend. "auto" upgrades to jaccl when
+/// a hostfile exists; explicit distributed backends ("jaccl", "jaccl-ring",
+/// "ring") also require their hostfile to exist, else fall back to single.
 pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     if backend == "single" {
         return ServeBackend::Single;
@@ -174,11 +176,45 @@ pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     let hf = hostfile
         .map(PathBuf::from)
         .unwrap_or_else(default_hostfile);
-    if hf.exists() && (backend == "jaccl" || backend == "auto") {
-        ServeBackend::Jaccl
-    } else {
-        ServeBackend::Single
+    if !hf.exists() {
+        if backend != "auto" {
+            tracing::warn!(backend, hostfile = %hf.display(), "distributed backend requested but hostfile missing — falling back to single");
+        }
+        return ServeBackend::Single;
     }
+    match backend {
+        "jaccl" | "auto" => ServeBackend::Jaccl,
+        "jaccl-ring" => ServeBackend::JacclRing,
+        "ring" => ServeBackend::Ring,
+        other => {
+            tracing::warn!(backend = other, "unknown backend string — falling back to single");
+            ServeBackend::Single
+        }
+    }
+}
+
+/// Env-key prefixes asmi will forward into serve processes (and all
+/// distributed ranks). Prefix-gated because /serve/load is tailnet-reachable:
+/// PATH / DYLD_* / PYTHONPATH must never be injectable into spawned
+/// interpreters. Values are rejected on control chars; `mlx.launch` shlex-
+/// quotes them again on the remote side.
+const ENV_FORWARD_PREFIXES: &[&str] = &["MLX_", "KV_", "HF_", "JACCL_", "NCCL_"];
+
+fn allowlisted_env(env: Option<&std::collections::HashMap<String, String>>) -> Vec<(String, String)> {
+    let Some(env) = env else { return Vec::new() };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in env {
+        let key_ok = ENV_FORWARD_PREFIXES.iter().any(|p| k.starts_with(p))
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let val_ok = !v.chars().any(|c| c.is_control());
+        if key_ok && val_ok {
+            out.push((k.clone(), v.clone()));
+        } else {
+            tracing::warn!(key = %k, "env var dropped (not allowlisted or invalid value)");
+        }
+    }
+    out.sort(); // deterministic spawn args
+    out
 }
 
 /// Probe every host in a JACCL hostfile via its asmi `/health` endpoint,
@@ -1081,9 +1117,10 @@ async fn do_serve_load_inner(
         }
     }
 
-    // JACCL distributed wrapper (only for engines with model_flag and non-bare)
+    // Distributed wrapper (only for engines with model_flag and non-bare).
+    // Covers jaccl, jaccl-ring, and ring — mlx.launch accepts all three.
     let (final_program, final_args) = if !is_bare
-        && backend == ServeBackend::Jaccl
+        && backend.is_distributed()
         && cfg.model_flag.is_some()
     {
         let hf = req
@@ -1091,14 +1128,30 @@ async fn do_serve_load_inner(
             .clone()
             .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
         let launcher = resolve_mlx_launch();
+        let backend_str = backend.as_str();
         let mut jaccl_args = vec![
             "--hostfile".to_string(),
             hf,
             "--backend".to_string(),
-            "jaccl".to_string(),
-            "--".to_string(),
-            program,
+            backend_str.to_string(),
+            // Env lock-in: mlx.launch exports each --env pair on EVERY rank
+            // before exec (shlex-quoted, launch.py make_launch_script), so the
+            // runtime env no longer depends on per-node login-shell state.
+            // MLX_DISTRIBUTED_BACKEND is read by the _mlx_backend_fix.pth rank
+            // hook and passed to mx.distributed.init() — without it the
+            // backend-selection race can hang rank 0 (upstream rejected the
+            // env var in mlx PR #3440; the hook is our local carry).
+            "--env".to_string(),
+            format!("MLX_DISTRIBUTED_BACKEND={backend_str}"),
+            "--env".to_string(),
+            "MLX_METAL_FAST_SYNCH=1".to_string(),
         ];
+        for (k, v) in allowlisted_env(req.env.as_ref()) {
+            jaccl_args.push("--env".to_string());
+            jaccl_args.push(format!("{k}={v}"));
+        }
+        jaccl_args.push("--".to_string());
+        jaccl_args.push(program);
         jaccl_args.extend(cmd_args);
         (launcher, jaccl_args)
     } else {
@@ -1129,6 +1182,17 @@ async fn do_serve_load_inner(
         .stdout(log_file)
         .stderr(log_stderr)
         .kill_on_drop(false); // we manage lifetime ourselves
+
+    // Generic env lock-in for the LOCAL process (single-node serves, and the
+    // mlx.launch launcher itself). Distributed ranks get the same vars via
+    // the --env forwarding above. Applied before the typed VLM fields below
+    // so the explicit fields win on key collision.
+    if backend.is_distributed() {
+        spawn_cmd.env("MLX_DISTRIBUTED_BACKEND", backend.as_str());
+    }
+    for (k, v) in allowlisted_env(req.env.as_ref()) {
+        spawn_cmd.env(k, v);
+    }
 
     // VLM KV-quant / vision-cache tuning is ENV-driven: mlx_vlm reads KV_BITS,
     // KV_QUANT_SCHEME, and MLX_VLM_VISION_CACHE_SIZE at startup (see
@@ -2012,6 +2076,69 @@ mod tests {
 
         let status = hb.status().await;
         assert!(!status.active, "should be inactive after stop");
+    }
+
+    #[test]
+    fn test_resolve_backend_all_strings() {
+        // With an existing hostfile every distributed string must survive the
+        // pipeline — "jaccl-ring"/"ring" collapsing to Single was the bug that
+        // made the web UI's backend picker a no-op.
+        let dir = std::env::temp_dir();
+        let path = dir.join("test-resolve-backend-hostfile.json");
+        std::fs::write(&path, "[]").unwrap();
+        let hf = path.to_str().unwrap();
+
+        assert_eq!(resolve_backend("jaccl", Some(hf)), ServeBackend::Jaccl);
+        assert_eq!(resolve_backend("auto", Some(hf)), ServeBackend::Jaccl);
+        assert_eq!(resolve_backend("jaccl-ring", Some(hf)), ServeBackend::JacclRing);
+        assert_eq!(resolve_backend("ring", Some(hf)), ServeBackend::Ring);
+        assert_eq!(resolve_backend("single", Some(hf)), ServeBackend::Single);
+        assert_eq!(resolve_backend("bogus", Some(hf)), ServeBackend::Single);
+
+        // Missing hostfile: every distributed request degrades to single
+        let missing = "/nonexistent/hostfile.json";
+        assert_eq!(resolve_backend("jaccl", Some(missing)), ServeBackend::Single);
+        assert_eq!(resolve_backend("jaccl-ring", Some(missing)), ServeBackend::Single);
+        assert_eq!(resolve_backend("ring", Some(missing)), ServeBackend::Single);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_backend_serde_roundtrip() {
+        // The wire strings are a contract with the web LaunchRequest and the
+        // _mlx_backend_fix hook — pin them.
+        for (b, s) in [
+            (ServeBackend::Single, "\"single\""),
+            (ServeBackend::Jaccl, "\"jaccl\""),
+            (ServeBackend::JacclRing, "\"jaccl-ring\""),
+            (ServeBackend::Ring, "\"ring\""),
+        ] {
+            assert_eq!(serde_json::to_string(&b).unwrap(), s);
+            assert_eq!(serde_json::from_str::<ServeBackend>(s).unwrap(), b);
+            assert_eq!(format!("\"{b}\""), s);
+        }
+    }
+
+    #[test]
+    fn test_allowlisted_env_filters() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("MLX_FOO".to_string(), "1".to_string());
+        env.insert("KV_BITS".to_string(), "3.5".to_string());
+        env.insert("HF_HOME".to_string(), "/Users/ma/.cache/huggingface".to_string());
+        // Must be dropped: non-allowlisted prefix (interpreter hijack vectors)
+        env.insert("PATH".to_string(), "/evil".to_string());
+        env.insert("DYLD_INSERT_LIBRARIES".to_string(), "/evil.dylib".to_string());
+        env.insert("PYTHONPATH".to_string(), "/evil".to_string());
+        // Must be dropped: bad key chars / control chars in value
+        env.insert("MLX_BAD-KEY".to_string(), "x".to_string());
+        env.insert("MLX_NEWLINE".to_string(), "a\nb".to_string());
+
+        let out = allowlisted_env(Some(&env));
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["HF_HOME", "KV_BITS", "MLX_FOO"]); // sorted, filtered
+
+        assert!(allowlisted_env(None).is_empty());
     }
 
     #[test]

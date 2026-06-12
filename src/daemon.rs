@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 enum ApiError {
     BadRequest(String),
     NotFound(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -19,6 +20,7 @@ impl axum::response::IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(msg) => (axum::http::StatusCode::BAD_REQUEST, msg),
             ApiError::NotFound(msg) => (axum::http::StatusCode::NOT_FOUND, msg),
+            ApiError::Conflict(msg) => (axum::http::StatusCode::CONFLICT, msg),
             ApiError::Internal(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         let body = axum::Json(serde_json::json!({"error": message}));
@@ -63,6 +65,16 @@ pub struct RuntimeInfo {
     pub mlx_device: Option<String>,
     pub vllm_version: Option<String>,
     pub macos_version: Option<String>,
+    /// mlx_lm importable via resolve_python() — the interpreter distributed
+    /// ranks actually run. Login-shell python having it is NOT sufficient.
+    #[serde(default)]
+    pub mlx_lm_version: Option<String>,
+    /// `_mlx_backend_fix.pth` present in site-packages. The hook makes ranks
+    /// honor MLX_DISTRIBUTED_BACKEND (mlx upstream rejected the env var,
+    /// PR #3440) — without it the launch-time env lock is inert and the
+    /// jaccl/ring selection race can hang rank 0.
+    #[serde(default)]
+    pub backend_fix_hook: Option<bool>,
 }
 
 /// Re-export from asmi_core so `crate::daemon::resolve_python` still works
@@ -107,6 +119,22 @@ pub async fn probe_runtime() -> RuntimeInfo {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
+    let mlx_lm = Command::new(py)
+        .args(["-c", "import mlx_lm; print(mlx_lm.__version__)"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // site.getsitepackages() covers homebrew/system/venv layouts — never
+    // hardcode the python-versioned path.
+    let backend_fix_hook = Command::new(py)
+        .args(["-c", "import site, os; print(int(any(os.path.exists(os.path.join(p, '_mlx_backend_fix.pth')) for p in site.getsitepackages())))"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+
     let macos = Command::new("sw_vers")
         .args(["-productVersion"])
         .output().await
@@ -120,6 +148,8 @@ pub async fn probe_runtime() -> RuntimeInfo {
         mlx_device,
         vllm_version: vllm,
         macos_version: macos,
+        mlx_lm_version: mlx_lm,
+        backend_fix_hook,
     }
 }
 
@@ -328,9 +358,23 @@ async fn jaccl_config_handler(
                 }
             }).collect();
 
+            // Pull /30 IPs from cached snapshots (interface_ips → 192.168.10.x)
+            let node_ips: Vec<String> = state.cluster_state.as_ref()
+                .and_then(|cs| {
+                    let guard = cs.blocking_read();
+                    guard.snapshots.get(node.as_str()).map(|snap| {
+                        snap.interface_ips.values()
+                            .flatten()
+                            .filter(|ip| ip.starts_with("192.168.10."))
+                            .cloned()
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+
             serde_json::json!({
                 "ssh": node,
-                "ips": [],
+                "ips": node_ips,
                 "rdma": rdma_row,
             })
         }).collect();
@@ -1381,6 +1425,25 @@ async fn serve_load_handler(
     let managers = state.serve_managers.read().await;
     let mgr = managers.get(&port)
         .ok_or_else(|| ApiError::Internal(format!("manager for port {port} disappeared")))?;
+
+    // Guard: reject if already loading or running (prevents TOCTOU race between agents)
+    let (current_state, current_model) = mgr.model_snapshot().await;
+    match current_state {
+        asmi_core::ServeState::Loading => {
+            return Err(ApiError::Conflict(format!(
+                "port {port} is already loading model: {}",
+                current_model.as_deref().unwrap_or("unknown")
+            )));
+        }
+        asmi_core::ServeState::Ready => {
+            return Err(ApiError::Conflict(format!(
+                "port {port} is already serving model: {}. Stop it first with /serve/stop?port={port}",
+                current_model.as_deref().unwrap_or("unknown")
+            )));
+        }
+        _ => {}
+    }
+
     mgr.load(req).await;
     Ok(Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port})))
 }

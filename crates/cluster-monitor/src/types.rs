@@ -792,15 +792,34 @@ pub enum ServeBackend {
     #[default]
     Single,
     Jaccl,
+    /// JACCL over a ring topology (1 TB5 peer per node suffices).
+    #[serde(rename = "jaccl-ring")]
+    JacclRing,
+    /// TCP ring over TB5 — slowest, no RDMA requirement.
+    Ring,
 }
 
+impl ServeBackend {
+    /// Any multi-rank backend launched via `mlx.launch`.
+    pub fn is_distributed(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+
+    /// The exact string `mlx.launch --backend` expects (also what the
+    /// `_mlx_backend_fix` rank hook reads from MLX_DISTRIBUTED_BACKEND).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Jaccl => "jaccl",
+            Self::JacclRing => "jaccl-ring",
+            Self::Ring => "ring",
+        }
+    }
+}
 
 impl fmt::Display for ServeBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Single => write!(f, "single"),
-            Self::Jaccl => write!(f, "jaccl"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -1006,6 +1025,14 @@ pub struct LoadRequest {
     /// Context window size override (ds4 `-c` flag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ctx_size: Option<u64>,
+
+    /// Environment variables to lock onto the serve process — and, for
+    /// distributed backends, onto EVERY remote rank via `mlx.launch --env`
+    /// (exported before exec on each host, so login-shell drift can't change
+    /// the runtime env). Keys are prefix-allowlisted at spawn (see
+    /// serve.rs `allowlisted_env`); disallowed keys are dropped with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::HashMap<String, String>>,
 }
 
 fn default_backend_str() -> String {
@@ -1034,6 +1061,7 @@ impl Default for LoadRequest {
             kv_quant_scheme: None,
             vision_cache_size: None,
             ctx_size: None,
+            env: None,
         }
     }
 }
