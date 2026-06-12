@@ -821,13 +821,13 @@ impl ServeManager {
         }
     }
 
-    /// Detect and adopt unmanaged model servers on idle manager ports.
-    /// Called from the poll loop to reduce the window between external process
-    /// start and asmi detection.
+    /// Detect and adopt unmanaged model servers on managed ports.
+    /// Called from the poll loop. Probes any occupied port where we don't own
+    /// the child process — covers DFlash, manual mlx_lm, or any external launcher.
     pub async fn check_port_adoption(&self) {
         let (port, engine) = {
             let s = self.inner.read().await;
-            if s.state != ServeState::Idle || s.pid.is_some() {
+            if s.pid.is_some() || s.child.is_some() {
                 return;
             }
             match s.port {
@@ -865,7 +865,7 @@ async fn probe_model_server(port: u16) -> Option<(u32, Option<String>)> {
 
 async fn get_pid_on_port(port: u16) -> Option<u32> {
     let output = tokio::process::Command::new("lsof")
-        .args(["-t", "-sTCP:LISTEN", "-i", &format!("TCP:{}", port)])
+        .args(["-tai", "-sTCP:LISTEN", "-i", &format!(":{}", port)])
         .output().await.ok()?;
     let s = String::from_utf8_lossy(&output.stdout);
     s.trim().lines().next()?.parse().ok()
@@ -1015,7 +1015,7 @@ async fn do_serve_load_inner(
             "uvicorn".into(),
             uvicorn_app.into(),
             "--host".into(),
-            "127.0.0.1".into(),
+            "0.0.0.0".into(),
             "--port".into(),
             port.to_string(),
             "--workers".into(),
@@ -1034,7 +1034,7 @@ async fn do_serve_load_inner(
             cmd_args.push(flag.into());
             cmd_args.push(model_path.clone());
         }
-        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "127.0.0.1".into()]);
+        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
 
         // DFlash-specific flags (dflash_mlx.serve uses --draft for the drafter model)
         if matches!(engine, ServeEngine::DFlash) {
@@ -1420,7 +1420,7 @@ async fn do_share_load_inner(
         "--port".to_string(),
         SHARE_PORT.to_string(),
         "--host".to_string(),
-        "127.0.0.1".to_string(),
+        "0.0.0.0".to_string(),
     ];
     let final_program = py;
     let mut final_args = vec!["-m".to_string(), "mlx_lm".to_string(), "server".to_string()];
@@ -1658,7 +1658,7 @@ async fn do_jaccl_orchestrate(
     cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(model_path)
         .arg("--port").arg(SHARE_PORT.to_string())
-        .arg("--host").arg("127.0.0.1")
+        .arg("--host").arg("0.0.0.0")
         .env("MLX_RANK", "0")
         .env("MLX_WORLD_SIZE", world_size.to_string())
         .env("MLX_METAL_FAST_SYNCH", "1")
