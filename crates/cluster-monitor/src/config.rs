@@ -450,9 +450,15 @@ impl NodeMap {
                     })
                     .collect();
 
+                let ips: Vec<&str> = self
+                    .rdma_ips
+                    .get(&node.to_string())
+                    .map(|v| v.iter().map(|s| s.as_str()).collect())
+                    .unwrap_or_default();
+
                 serde_json::json!({
                     "ssh": node,
-                    "ips": [],
+                    "ips": ips,
                     "rdma": rdma_row,
                 })
             })
