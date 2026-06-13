@@ -157,6 +157,7 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
+  int sgid_index = 0; // GID table index selected by info()
 
   Connection(ibv_context* ctx_);
   Connection(Connection&& c);

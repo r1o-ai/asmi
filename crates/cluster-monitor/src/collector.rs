@@ -237,9 +237,9 @@ const CMD_RDMA_NET: &str =
 const CMD_JACCL_ENV: &str =
     "ps aux | grep 'mlx\\.launch.*--backend' | grep -v grep | head -5";
 
-/// Top CPU-consuming processes (sorted by CPU% descending, top 8).
+/// Top CPU-consuming processes (sorted by CPU% descending, top 25).
 const CMD_PS_TOP: &str =
-    "ps -arcxo pid,pcpu,rss,comm 2>/dev/null | head -50";
+    "{ ps -arcxo pid,pcpu,rss,comm 2>/dev/null | head -50; ps -axo pid,pcpu,rss,comm 2>/dev/null | sort -rnk3 | head -10; } | awk '!seen[$1]++'";
 
 /// iostat: 2 samples, 1s apart. Take the second (real-time) sample.
 const CMD_IOSTAT: &str =
@@ -680,9 +680,12 @@ async fn collect_via_ssh(
         chip_model,
         serial_number,
         model_name,
-        cpu_watts: power.cpu_mw,
-        gpu_watts: power.gpu_mw,
-        ane_watts: power.ane_mw,
+        // powermetrics emits MILLIWATTS — convert at the boundary. The raw
+        // mW passthrough shipped as "watts" for months (hub gpu_watts=15113
+        // observed 2026-06-10 = 15.1 W idle); every consumer reads watts.
+        cpu_watts: power.cpu_mw / 1000.0,
+        gpu_watts: power.gpu_mw / 1000.0,
+        ane_watts: power.ane_mw / 1000.0,
         power_source: None,
         cpu_percent: power.cpu_percent,
         gpu_percent: power.gpu_percent,
@@ -707,9 +710,22 @@ async fn collect_via_ssh(
         cpu_temp_c: None,
         gpu_temp_c: None,
         processes,
-        top_tasks: match &ps_top_res {
-            Ok(r) if r.has_output() => parse_ps_top(&r.stdout),
-            _ => Vec::new(),
+        top_tasks: {
+            let mut tasks = match &ps_top_res {
+                Ok(r) if r.has_output() => parse_ps_top(&r.stdout),
+                _ => Vec::new(),
+            };
+            // Enrich with true physical footprint (proc_pid_rusage) on local node.
+            // Remote nodes keep the RSS-based estimate from ps output.
+            if is_local {
+                for task in &mut tasks {
+                    if let Ok(bytes) = crate::footprint::get_phys_footprint(task.pid) {
+                        task.footprint_mb = Some((bytes as f64 / (1024.0 * 1024.0)).round() as u64);
+                    }
+                    // on error keep the ps RSS estimate (process may have exited)
+                }
+            }
+            tasks
         },
         rdma: rdma_status,
         interface_ips,

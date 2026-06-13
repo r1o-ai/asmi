@@ -132,7 +132,6 @@ dependencies = [
  "clap",
  "dirs",
  "futures",
- "libc",
  "mdns-sd",
  "nix",
  "objc2-io-surface",

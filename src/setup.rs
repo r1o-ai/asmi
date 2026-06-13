@@ -336,7 +336,7 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
 
     // ── Step 4: Write launchd plist ─────────────────────────────────────
     let plist_path = home.join(format!("Library/LaunchAgents/{}.plist", PLIST_LABEL));
-    let bin_path = cargo_bin.to_str().unwrap_or("/Users/ma/.cargo/bin/asmi");
+    let bin_path = cargo_bin.to_str().unwrap_or("/usr/local/bin/asmi");
 
     let mut args_xml = format!(
         "        <string>{}</string>\n\

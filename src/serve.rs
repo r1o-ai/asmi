@@ -24,6 +24,7 @@ pub fn managed_ports() -> Vec<(u16, ServeEngine)> {
     vec![
         (port_for_engine(ServeEngine::MlxLm), ServeEngine::MlxLm),
         (port_for_engine(ServeEngine::MlxVlm), ServeEngine::MlxVlm),
+        (port_for_engine(ServeEngine::Ds4), ServeEngine::Ds4),
     ]
 }
 
@@ -38,6 +39,8 @@ pub fn port_for_engine(engine: ServeEngine) -> u16 {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(8000),
         ServeEngine::DFlash => std::env::var("ASMI_DFLASH_PORT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(19080),
+        ServeEngine::Ds4 => std::env::var("ASMI_DS4_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
     }
 }
 
@@ -70,6 +73,63 @@ fn resolve_mlx_launch() -> String {
     // Should not reach here — mlx.launch is installed via pip
     tracing::warn!("mlx.launch not found! Distributed inference will fail.");
     "mlx.launch".to_string()
+}
+
+/// Resolve a native (non-Python) server binary.
+///
+/// Search order:
+///   1. `DS4_SERVER_PATH` env var (explicit override)
+///   2. `~/.r1o/bin/<binary>` (managed install location)
+///   3. `which <binary>` (PATH lookup)
+///   4. Common fallback paths (`/usr/local/bin/`, `~/opensource/ds4/`)
+fn resolve_native_binary(binary: &str, engine: &ServeEngine) -> Result<PathBuf, anyhow::Error> {
+    // 1. Env var override (e.g. DS4_SERVER_PATH)
+    let env_key = format!("{}_PATH", binary.to_uppercase().replace('-', "_"));
+    if let Ok(p) = std::env::var(&env_key) {
+        let path = PathBuf::from(&p);
+        if path.exists() {
+            tracing::info!(%env_key, ?path, "native binary from env");
+            return Ok(path);
+        }
+        tracing::warn!(%env_key, path = %p, "env var set but path does not exist");
+    }
+
+    // 2. Managed install location
+    let managed = r1o_dir().join("bin").join(binary);
+    if managed.exists() {
+        tracing::info!(?managed, "native binary from ~/.r1o/bin");
+        return Ok(managed);
+    }
+
+    // 3. PATH lookup via `which`
+    if let Ok(output) = std::process::Command::new("which").arg(binary).output() {
+        if output.status.success() {
+            let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !p.is_empty() && std::path::Path::new(&p).exists() {
+                tracing::info!(path = %p, "native binary from PATH");
+                return Ok(PathBuf::from(p));
+            }
+        }
+    }
+
+    // 4. Common fallback paths
+    let fallbacks: Vec<PathBuf> = vec![
+        PathBuf::from(format!("/usr/local/bin/{binary}")),
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(format!("opensource/ds4/{binary}")),
+    ];
+    for fb in &fallbacks {
+        if fb.exists() {
+            tracing::info!(?fb, "native binary from fallback path");
+            return Ok(fb.clone());
+        }
+    }
+
+    anyhow::bail!(
+        "native binary '{}' not found for engine {:?}. Set {} or place it in ~/.r1o/bin/",
+        binary, engine, env_key
+    )
 }
 
 /// Warmup timeout for bare server start (no model — should be fast).
@@ -106,7 +166,9 @@ pub fn default_hostfile() -> PathBuf {
     r1o_dir().join("hostfiles/default.json")
 }
 
-/// Resolve "auto" backend to single or jaccl based on hostfile existence.
+/// Resolve a backend string to a ServeBackend. "auto" upgrades to jaccl when
+/// a hostfile exists; explicit distributed backends ("jaccl", "jaccl-ring",
+/// "ring") also require their hostfile to exist, else fall back to single.
 pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     if backend == "single" {
         return ServeBackend::Single;
@@ -114,10 +176,120 @@ pub fn resolve_backend(backend: &str, hostfile: Option<&str>) -> ServeBackend {
     let hf = hostfile
         .map(PathBuf::from)
         .unwrap_or_else(default_hostfile);
-    if hf.exists() && (backend == "jaccl" || backend == "auto") {
-        ServeBackend::Jaccl
-    } else {
-        ServeBackend::Single
+    if !hf.exists() {
+        if backend != "auto" {
+            tracing::warn!(backend, hostfile = %hf.display(), "distributed backend requested but hostfile missing — falling back to single");
+        }
+        return ServeBackend::Single;
+    }
+    match backend {
+        "jaccl" | "auto" => ServeBackend::Jaccl,
+        "jaccl-ring" => ServeBackend::JacclRing,
+        "ring" => ServeBackend::Ring,
+        other => {
+            tracing::warn!(backend = other, "unknown backend string — falling back to single");
+            ServeBackend::Single
+        }
+    }
+}
+
+/// Env-key prefixes asmi will forward into serve processes (and all
+/// distributed ranks). Prefix-gated because /serve/load is tailnet-reachable:
+/// PATH / DYLD_* / PYTHONPATH must never be injectable into spawned
+/// interpreters. Values are rejected on control chars; `mlx.launch` shlex-
+/// quotes them again on the remote side.
+const ENV_FORWARD_PREFIXES: &[&str] = &["MLX_", "KV_", "HF_", "JACCL_", "NCCL_"];
+
+fn allowlisted_env(env: Option<&std::collections::HashMap<String, String>>) -> Vec<(String, String)> {
+    let Some(env) = env else { return Vec::new() };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in env {
+        let key_ok = ENV_FORWARD_PREFIXES.iter().any(|p| k.starts_with(p))
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let val_ok = !v.chars().any(|c| c.is_control());
+        if key_ok && val_ok {
+            out.push((k.clone(), v.clone()));
+        } else {
+            tracing::warn!(key = %k, "env var dropped (not allowlisted or invalid value)");
+        }
+    }
+    out.sort(); // deterministic spawn args
+    out
+}
+
+/// Probe every host in a JACCL hostfile via its asmi `/health` endpoint,
+/// concurrently (serial 2 s timeouts would add hosts x 2 s of load latency).
+/// `Err` carries the unreachable host names (or a parse-level reason).
+///
+/// Why: a stale default hostfile must not silently turn a plain single-model
+/// serve into a doomed multi-rank launch. Observed 2026-06-10: both hub's and
+/// m3u3's `hostfiles/default.json` were 4-node JACCL configs left over from
+/// experiments — one still listing a node that had been SOLD — so every
+/// `backend: "auto"` load failed with rank exits 255/-15.
+pub async fn hostfile_hosts_alive(hf: &std::path::Path) -> Result<(), Vec<String>> {
+    let data = std::fs::read_to_string(hf)
+        .map_err(|e| vec![format!("unreadable hostfile: {e}")])?;
+    let json: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| vec![format!("invalid hostfile json: {e}")])?;
+    let hosts = json
+        .get("hosts")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if hosts.is_empty() {
+        return Err(vec!["hostfile has no hosts".to_string()]);
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(vec![format!("probe client: {e}")]),
+    };
+    let probes = hosts.iter().map(|h| {
+        let ssh = h
+            .get("ssh")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let client = client.clone();
+        async move {
+            let url = format!("http://{ssh}:9090/health");
+            let alive = matches!(client.get(&url).send().await, Ok(r) if r.status().is_success());
+            (ssh, alive)
+        }
+    });
+    let results = futures::future::join_all(probes).await;
+    let dead: Vec<String> = results
+        .into_iter()
+        .filter_map(|(ssh, alive)| (!alive).then_some(ssh))
+        .collect();
+    if dead.is_empty() { Ok(()) } else { Err(dead) }
+}
+
+/// `resolve_backend`, plus a liveness gate on the implicit path: when "auto"
+/// resolves to jaccl purely because a hostfile EXISTS, every host in it must
+/// answer its asmi `/health` probe — otherwise fall back to single with a
+/// warning. An EXPLICIT `backend: "jaccl"` request is honored unvalidated
+/// (the user asked for it; the launch error will name the dead rank).
+pub async fn resolve_backend_validated(backend: &str, hostfile: Option<&str>) -> ServeBackend {
+    let resolved = resolve_backend(backend, hostfile);
+    if resolved != ServeBackend::Jaccl || backend != "auto" {
+        return resolved;
+    }
+    let hf = hostfile
+        .map(PathBuf::from)
+        .unwrap_or_else(default_hostfile);
+    match hostfile_hosts_alive(&hf).await {
+        Ok(()) => ServeBackend::Jaccl,
+        Err(dead) => {
+            tracing::warn!(
+                hostfile = %hf.display(),
+                dead = ?dead,
+                "auto backend: hostfile hosts unreachable — falling back to single"
+            );
+            ServeBackend::Single
+        }
     }
 }
 
@@ -336,7 +508,7 @@ struct ManagedProcess {
 /// Kill the existing child process (SIGTERM → 5s → SIGKILL).
 async fn kill_child(s: &mut ManagedProcess) {
     if let Some(ref mut child) = s.child {
-        // Managed child — SIGTERM then SIGKILL
+        // Managed child — SIGTERM then SIGKILL with bounded waits
         if let Some(pid) = s.pid {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
@@ -346,7 +518,12 @@ async fn kill_child(s: &mut ManagedProcess) {
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(_) => {}
             Err(_) => {
-                let _ = child.kill().await;
+                // SIGKILL + bounded wait — child.kill().await can hang on zombies
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    child.wait(),
+                ).await;
             }
         }
     } else if let Some(pid) = s.pid {
@@ -680,13 +857,13 @@ impl ServeManager {
         }
     }
 
-    /// Detect and adopt unmanaged model servers on idle manager ports.
-    /// Called from the poll loop to reduce the window between external process
-    /// start and asmi detection.
+    /// Detect and adopt unmanaged model servers on managed ports.
+    /// Called from the poll loop. Probes any occupied port where we don't own
+    /// the child process — covers DFlash, manual mlx_lm, or any external launcher.
     pub async fn check_port_adoption(&self) {
         let (port, engine) = {
             let s = self.inner.read().await;
-            if s.state != ServeState::Idle || s.pid.is_some() {
+            if s.pid.is_some() || s.child.is_some() {
                 return;
             }
             match s.port {
@@ -724,7 +901,7 @@ async fn probe_model_server(port: u16) -> Option<(u32, Option<String>)> {
 
 async fn get_pid_on_port(port: u16) -> Option<u32> {
     let output = tokio::process::Command::new("lsof")
-        .args(["-t", "-sTCP:LISTEN", "-i", &format!("TCP:{}", port)])
+        .args(["-tai", "-sTCP:LISTEN", "-i", &format!(":{}", port)])
         .output().await.ok()?;
     let s = String::from_utf8_lossy(&output.stdout);
     s.trim().lines().next()?.parse().ok()
@@ -835,7 +1012,7 @@ async fn do_serve_load_inner(
     let backend = if is_bare {
         ServeBackend::Single
     } else {
-        resolve_backend(&req.backend, req.hostfile.as_deref())
+        resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await
     };
 
     // Build command
@@ -843,10 +1020,30 @@ async fn do_serve_load_inner(
     let mut cmd_args: Vec<String> = Vec::new();
     let program: String;
 
-    // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
-    let py = resolve_python().to_string();
+    // Native binary engines (e.g. ds4) bypass Python entirely.
+    let is_native = matches!(engine, ServeEngine::Ds4);
 
-    if let Some(uvicorn_app) = cfg.uvicorn_app {
+    if is_native {
+        let binary_path = resolve_native_binary(cfg.binary, &engine)?;
+        program = binary_path.to_string_lossy().to_string();
+
+        // Model flag + path
+        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
+            cmd_args.push(flag.into());
+            cmd_args.push(model_path.clone());
+        }
+
+        // Port binding (critical: without --port, ds4 defaults to 8000, not 8080)
+        cmd_args.extend(["--port".into(), port.to_string()]);
+        cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
+
+        // Context window size
+        if let Some(ctx) = req.ctx_size {
+            cmd_args.extend(["-c".into(), ctx.to_string()]);
+        }
+    } else if let Some(uvicorn_app) = cfg.uvicorn_app {
+        // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
+        let py = resolve_python().to_string();
         // Uvicorn-wrapped engines (avoids reload=True bugs in mlx_vlm)
         program = py;
         cmd_args.extend([
@@ -854,7 +1051,7 @@ async fn do_serve_load_inner(
             "uvicorn".into(),
             uvicorn_app.into(),
             "--host".into(),
-            "127.0.0.1".into(),
+            "0.0.0.0".into(),
             "--port".into(),
             port.to_string(),
             "--workers".into(),
@@ -863,6 +1060,7 @@ async fn do_serve_load_inner(
         ]);
     } else {
         // Run as python3 -m <module> (e.g. python3 -m mlx_lm.server)
+        let py = resolve_python().to_string();
         program = py;
         cmd_args.push("-m".into());
         cmd_args.push(cfg.binary.to_string());
@@ -872,7 +1070,7 @@ async fn do_serve_load_inner(
             cmd_args.push(flag.into());
             cmd_args.push(model_path.clone());
         }
-        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "127.0.0.1".into()]);
+        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
 
         // DFlash-specific flags (dflash_mlx.serve uses --draft for the drafter model)
         if matches!(engine, ServeEngine::DFlash) {
@@ -919,9 +1117,10 @@ async fn do_serve_load_inner(
         }
     }
 
-    // JACCL distributed wrapper (only for engines with model_flag and non-bare)
+    // Distributed wrapper (only for engines with model_flag and non-bare).
+    // Covers jaccl, jaccl-ring, and ring — mlx.launch accepts all three.
     let (final_program, final_args) = if !is_bare
-        && backend == ServeBackend::Jaccl
+        && backend.is_distributed()
         && cfg.model_flag.is_some()
     {
         let hf = req
@@ -929,14 +1128,30 @@ async fn do_serve_load_inner(
             .clone()
             .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
         let launcher = resolve_mlx_launch();
+        let backend_str = backend.as_str();
         let mut jaccl_args = vec![
             "--hostfile".to_string(),
             hf,
             "--backend".to_string(),
-            "jaccl".to_string(),
-            "--".to_string(),
-            program,
+            backend_str.to_string(),
+            // Env lock-in: mlx.launch exports each --env pair on EVERY rank
+            // before exec (shlex-quoted, launch.py make_launch_script), so the
+            // runtime env no longer depends on per-node login-shell state.
+            // MLX_DISTRIBUTED_BACKEND is read by the _mlx_backend_fix.pth rank
+            // hook and passed to mx.distributed.init() — without it the
+            // backend-selection race can hang rank 0 (upstream rejected the
+            // env var in mlx PR #3440; the hook is our local carry).
+            "--env".to_string(),
+            format!("MLX_DISTRIBUTED_BACKEND={backend_str}"),
+            "--env".to_string(),
+            "MLX_METAL_FAST_SYNCH=1".to_string(),
         ];
+        for (k, v) in allowlisted_env(req.env.as_ref()) {
+            jaccl_args.push("--env".to_string());
+            jaccl_args.push(format!("{k}={v}"));
+        }
+        jaccl_args.push("--".to_string());
+        jaccl_args.push(program);
         jaccl_args.extend(cmd_args);
         (launcher, jaccl_args)
     } else {
@@ -960,13 +1175,44 @@ async fn do_serve_load_inner(
         "spawning MLX server"
     );
 
-    let mut child = Command::new(&final_program)
+    let mut spawn_cmd = Command::new(&final_program);
+    spawn_cmd
         .args(&final_args)
         .env("MLX_METAL_FAST_SYNCH", "1")
         .stdout(log_file)
         .stderr(log_stderr)
-        .kill_on_drop(false) // we manage lifetime ourselves
-        .spawn()?;
+        .kill_on_drop(false); // we manage lifetime ourselves
+
+    // Generic env lock-in for the LOCAL process (single-node serves, and the
+    // mlx.launch launcher itself). Distributed ranks get the same vars via
+    // the --env forwarding above. Applied before the typed VLM fields below
+    // so the explicit fields win on key collision.
+    if backend.is_distributed() {
+        spawn_cmd.env("MLX_DISTRIBUTED_BACKEND", backend.as_str());
+    }
+    for (k, v) in allowlisted_env(req.env.as_ref()) {
+        spawn_cmd.env(k, v);
+    }
+
+    // VLM KV-quant / vision-cache tuning is ENV-driven: mlx_vlm reads KV_BITS,
+    // KV_QUANT_SCHEME, and MLX_VLM_VISION_CACHE_SIZE at startup (see
+    // mlx_vlm/server/generation.py). mlx_lm has no equivalent env hooks — its
+    // tuning is the CLI flags emitted above — so these apply to the VLM engine only.
+    if matches!(engine, ServeEngine::MlxVlm) {
+        if let Some(bits) = req.kv_bits {
+            spawn_cmd.env("KV_BITS", format!("{bits}"));
+        }
+        if let Some(ref scheme) = req.kv_quant_scheme {
+            if !scheme.is_empty() {
+                spawn_cmd.env("KV_QUANT_SCHEME", scheme);
+            }
+        }
+        if let Some(n) = req.vision_cache_size {
+            spawn_cmd.env("MLX_VLM_VISION_CACHE_SIZE", n.to_string());
+        }
+    }
+
+    let mut child = spawn_cmd.spawn()?;
 
     let child_pid = child.id().unwrap_or(0);
 
@@ -1218,10 +1464,9 @@ async fn do_share_load_inner(
     }
 
     // Resolve backend
-    let backend = resolve_backend(&req.backend, req.hostfile.as_deref());
+    let backend = resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
 
     let py = resolve_python().to_string();
-    let share_port = SHARE_PORT.to_string();
 
     // For distributed JACCL: orchestrate via asmi peer HTTP APIs
     // For single-node: run python3 -m mlx_lm.server directly
@@ -1239,7 +1484,7 @@ async fn do_share_load_inner(
         "--port".to_string(),
         SHARE_PORT.to_string(),
         "--host".to_string(),
-        "127.0.0.1".to_string(),
+        "0.0.0.0".to_string(),
     ];
     let final_program = py;
     let mut final_args = vec!["-m".to_string(), "mlx_lm".to_string(), "server".to_string()];
@@ -1477,7 +1722,7 @@ async fn do_jaccl_orchestrate(
     cmd.arg("-m").arg("mlx_lm").arg("server")
         .arg("--model").arg(model_path)
         .arg("--port").arg(SHARE_PORT.to_string())
-        .arg("--host").arg("127.0.0.1")
+        .arg("--host").arg("0.0.0.0")
         .env("MLX_RANK", "0")
         .env("MLX_WORLD_SIZE", world_size.to_string())
         .env("MLX_METAL_FAST_SYNCH", "1")
@@ -1834,6 +2079,69 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_backend_all_strings() {
+        // With an existing hostfile every distributed string must survive the
+        // pipeline — "jaccl-ring"/"ring" collapsing to Single was the bug that
+        // made the web UI's backend picker a no-op.
+        let dir = std::env::temp_dir();
+        let path = dir.join("test-resolve-backend-hostfile.json");
+        std::fs::write(&path, "[]").unwrap();
+        let hf = path.to_str().unwrap();
+
+        assert_eq!(resolve_backend("jaccl", Some(hf)), ServeBackend::Jaccl);
+        assert_eq!(resolve_backend("auto", Some(hf)), ServeBackend::Jaccl);
+        assert_eq!(resolve_backend("jaccl-ring", Some(hf)), ServeBackend::JacclRing);
+        assert_eq!(resolve_backend("ring", Some(hf)), ServeBackend::Ring);
+        assert_eq!(resolve_backend("single", Some(hf)), ServeBackend::Single);
+        assert_eq!(resolve_backend("bogus", Some(hf)), ServeBackend::Single);
+
+        // Missing hostfile: every distributed request degrades to single
+        let missing = "/nonexistent/hostfile.json";
+        assert_eq!(resolve_backend("jaccl", Some(missing)), ServeBackend::Single);
+        assert_eq!(resolve_backend("jaccl-ring", Some(missing)), ServeBackend::Single);
+        assert_eq!(resolve_backend("ring", Some(missing)), ServeBackend::Single);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_backend_serde_roundtrip() {
+        // The wire strings are a contract with the web LaunchRequest and the
+        // _mlx_backend_fix hook — pin them.
+        for (b, s) in [
+            (ServeBackend::Single, "\"single\""),
+            (ServeBackend::Jaccl, "\"jaccl\""),
+            (ServeBackend::JacclRing, "\"jaccl-ring\""),
+            (ServeBackend::Ring, "\"ring\""),
+        ] {
+            assert_eq!(serde_json::to_string(&b).unwrap(), s);
+            assert_eq!(serde_json::from_str::<ServeBackend>(s).unwrap(), b);
+            assert_eq!(format!("\"{b}\""), s);
+        }
+    }
+
+    #[test]
+    fn test_allowlisted_env_filters() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("MLX_FOO".to_string(), "1".to_string());
+        env.insert("KV_BITS".to_string(), "3.5".to_string());
+        env.insert("HF_HOME".to_string(), "/Users/ma/.cache/huggingface".to_string());
+        // Must be dropped: non-allowlisted prefix (interpreter hijack vectors)
+        env.insert("PATH".to_string(), "/evil".to_string());
+        env.insert("DYLD_INSERT_LIBRARIES".to_string(), "/evil.dylib".to_string());
+        env.insert("PYTHONPATH".to_string(), "/evil".to_string());
+        // Must be dropped: bad key chars / control chars in value
+        env.insert("MLX_BAD-KEY".to_string(), "x".to_string());
+        env.insert("MLX_NEWLINE".to_string(), "a\nb".to_string());
+
+        let out = allowlisted_env(Some(&env));
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["HF_HOME", "KV_BITS", "MLX_FOO"]); // sorted, filtered
+
+        assert!(allowlisted_env(None).is_empty());
+    }
+
+    #[test]
     fn test_parse_hostfile_peers() {
         let dir = std::env::temp_dir();
         let path = dir.join("test-hostfile.json");
@@ -1895,5 +2203,51 @@ mod tests {
         assert!(WARMUP_TIMEOUT_MODEL_SECS >= 300);
         // Share timeout should be at least 5 minutes
         assert!(WARMUP_TIMEOUT_SHARE_SECS >= 300);
+    }
+}
+
+#[cfg(test)]
+mod backend_validation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn auto_falls_back_to_single_when_hostfile_hosts_dead() {
+        let dir = std::env::temp_dir().join("asmi-test-hostfiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hf = dir.join("dead-hosts.json");
+        std::fs::write(
+            &hf,
+            r#"{"backend":"jaccl","hosts":[{"ssh":"asmi-test-nonexistent.invalid"}]}"#,
+        )
+        .unwrap();
+        let resolved =
+            resolve_backend_validated("auto", Some(hf.to_str().unwrap())).await;
+        assert_eq!(resolved, ServeBackend::Single);
+    }
+
+    #[tokio::test]
+    async fn explicit_jaccl_is_honored_without_validation() {
+        let dir = std::env::temp_dir().join("asmi-test-hostfiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hf = dir.join("explicit.json");
+        std::fs::write(
+            &hf,
+            r#"{"backend":"jaccl","hosts":[{"ssh":"asmi-test-nonexistent.invalid"}]}"#,
+        )
+        .unwrap();
+        let resolved =
+            resolve_backend_validated("jaccl", Some(hf.to_str().unwrap())).await;
+        assert_eq!(resolved, ServeBackend::Jaccl);
+    }
+
+    #[tokio::test]
+    async fn unparseable_hostfile_falls_back_to_single() {
+        let dir = std::env::temp_dir().join("asmi-test-hostfiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let hf = dir.join("garbage.json");
+        std::fs::write(&hf, "not json").unwrap();
+        let resolved =
+            resolve_backend_validated("auto", Some(hf.to_str().unwrap())).await;
+        assert_eq!(resolved, ServeBackend::Single);
     }
 }

@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 enum ApiError {
     BadRequest(String),
     NotFound(String),
+    Conflict(String),
     Internal(String),
 }
 
@@ -19,6 +20,7 @@ impl axum::response::IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(msg) => (axum::http::StatusCode::BAD_REQUEST, msg),
             ApiError::NotFound(msg) => (axum::http::StatusCode::NOT_FOUND, msg),
+            ApiError::Conflict(msg) => (axum::http::StatusCode::CONFLICT, msg),
             ApiError::Internal(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
         let body = axum::Json(serde_json::json!({"error": message}));
@@ -33,6 +35,7 @@ pub struct AppState {
     pub cluster_state: Option<Arc<RwLock<asmi_core::ClusterState>>>,
     pub node_map: Arc<RwLock<asmi_core::NodeMap>>,
     pub hostname: String,
+    pub port: u16,
     pub started_at: std::time::Instant,
     pub metrics_tx: tokio::sync::broadcast::Sender<String>,
     pub model_cache: Arc<RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>>,
@@ -46,7 +49,12 @@ pub struct AppState {
     pub ane: crate::ane::AneState,
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     /// JACCL worker — dedicated OS thread for all RDMA operations (Phase 3).
+    /// Only read by jaccl-gated transfer handlers; kept unconditional so
+    /// AppState has the same shape across feature combinations.
+    #[cfg_attr(not(feature = "jaccl"), allow(dead_code))]
     pub jaccl_worker: Arc<crate::transfer::JacclWorker>,
+    /// Active/completed transfers — fire-and-forget state, survives client disconnect.
+    pub active_transfers: crate::transfer::ActiveTransfers,
 }
 
 /// Cached Python/MLX/macOS version info, probed once at startup.
@@ -57,6 +65,16 @@ pub struct RuntimeInfo {
     pub mlx_device: Option<String>,
     pub vllm_version: Option<String>,
     pub macos_version: Option<String>,
+    /// mlx_lm importable via resolve_python() — the interpreter distributed
+    /// ranks actually run. Login-shell python having it is NOT sufficient.
+    #[serde(default)]
+    pub mlx_lm_version: Option<String>,
+    /// `_mlx_backend_fix.pth` present in site-packages. The hook makes ranks
+    /// honor MLX_DISTRIBUTED_BACKEND (mlx upstream rejected the env var,
+    /// PR #3440) — without it the launch-time env lock is inert and the
+    /// jaccl/ring selection race can hang rank 0.
+    #[serde(default)]
+    pub backend_fix_hook: Option<bool>,
 }
 
 /// Re-export from asmi_core so `crate::daemon::resolve_python` still works
@@ -101,6 +119,22 @@ pub async fn probe_runtime() -> RuntimeInfo {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
+    let mlx_lm = Command::new(py)
+        .args(["-c", "import mlx_lm; print(mlx_lm.__version__)"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // site.getsitepackages() covers homebrew/system/venv layouts — never
+    // hardcode the python-versioned path.
+    let backend_fix_hook = Command::new(py)
+        .args(["-c", "import site, os; print(int(any(os.path.exists(os.path.join(p, '_mlx_backend_fix.pth')) for p in site.getsitepackages())))"])
+        .output().await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1");
+
     let macos = Command::new("sw_vers")
         .args(["-productVersion"])
         .output().await
@@ -114,6 +148,8 @@ pub async fn probe_runtime() -> RuntimeInfo {
         mlx_device,
         vllm_version: vllm,
         macos_version: macos,
+        mlx_lm_version: mlx_lm,
+        backend_fix_hook,
     }
 }
 
@@ -161,6 +197,85 @@ async fn cluster_handler(State(state): State<AppState>) -> Result<Json<serde_jso
         }
         None => Err(ApiError::BadRequest("not running in cluster hub mode (start with --cluster)".into())),
     }
+}
+
+/// GET /cluster/full → unified endpoint aggregating nodes, topology, serving, and roles.
+/// Single-call entry point for TUI, iOS, and omp clients.
+async fn cluster_full_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    // 1. Nodes — from cluster_state (same as /cluster)
+    let nodes_json = match &state.cluster_state {
+        Some(cs) => {
+            let s = cs.read().await;
+            let snapshots: Vec<&asmi_core::NodeSnapshot> = s.snapshots.values().collect();
+            serde_json::to_value(&snapshots).unwrap_or(serde_json::json!([]))
+        }
+        None => serde_json::json!([]),
+    };
+
+    // 2. Topology — from cached topology scan
+    let topo_json = {
+        let cache = state.topology_cache.read().await;
+        cache.as_ref().map(|(report, scanned_at)| {
+            serde_json::json!({
+                "links": report.links,
+                "nodes": report.nodes,
+                "missing_links": report.missing_links,
+                "jaccl_ready": report.jaccl_ready,
+                "jaccl_ready_subsets": report.jaccl_ready_subsets,
+                "mesh_complete": report.mesh_complete,
+                "scan_age_seconds": scanned_at.elapsed().as_secs(),
+            })
+        })
+    };
+
+    // 3. Serving — from managed servers + detected processes
+    let serving_entries = collect_serving_map(&state).await;
+    let serving_json: Vec<serde_json::Value> = serving_entries.iter().map(|(names, info)| {
+        serde_json::json!({
+            "model": names.first().unwrap_or(&String::new()),
+            "port": info.port,
+            "engine": info.engine,
+            "pid": info.pid,
+            "managed": info.managed,
+        })
+    }).collect();
+
+    // 4. Roles — from ~/.r1o/cluster.json
+    let roles_json = read_cluster_roles();
+
+    Json(serde_json::json!({
+        "nodes": nodes_json,
+        "topology": topo_json,
+        "serving": serving_json,
+        "roles": roles_json,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// Read node roles from ~/.r1o/cluster.json.
+fn read_cluster_roles() -> serde_json::Value {
+    let path = dirs::home_dir()
+        .map(|h| h.join(".r1o/cluster.json"))
+        .unwrap_or_default();
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return serde_json::json!({});
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return serde_json::json!({});
+    };
+    // Extract hostname → role mapping
+    let mut roles = serde_json::Map::new();
+    if let Some(nodes) = config.get("nodes").and_then(|n| n.as_array()) {
+        for node in nodes {
+            if let (Some(hostname), Some(role)) = (
+                node.get("hostname").and_then(|h| h.as_str()),
+                node.get("role").and_then(|r| r.as_str()),
+            ) {
+                roles.insert(hostname.to_string(), serde_json::json!(role));
+            }
+        }
+    }
+    serde_json::Value::Object(roles)
 }
 
 /// GET /nodes → list of known node hostnames
@@ -243,9 +358,23 @@ async fn jaccl_config_handler(
                 }
             }).collect();
 
+            // Pull /30 IPs from cached snapshots (interface_ips → 192.168.10.x)
+            let node_ips: Vec<String> = state.cluster_state.as_ref()
+                .and_then(|cs| {
+                    let guard = cs.blocking_read();
+                    guard.snapshots.get(node.as_str()).map(|snap| {
+                        snap.interface_ips.values()
+                            .flatten()
+                            .filter(|ip| ip.starts_with("192.168.10."))
+                            .cloned()
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+
             serde_json::json!({
                 "ssh": node,
-                "ips": [],
+                "ips": node_ips,
                 "rdma": rdma_row,
             })
         }).collect();
@@ -419,6 +548,60 @@ async fn jaccl_generate_handler(
     })))
 }
 
+/// POST /config/sync → trigger config.db sync + JACCL hostfile regen.
+/// Called by web routes after cluster.json mutations for instant propagation.
+async fn config_sync_handler(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let result = trigger_config_sync(&state).await;
+    Json(result)
+}
+
+/// Bust caches + regenerate JACCL hostfile. Callable from handlers and internal loops.
+pub async fn trigger_config_sync(state: &AppState) -> serde_json::Value {
+    {
+        let mut tb = state.thunderbolt_cache.write().await;
+        *tb = None;
+    }
+    {
+        let mut topo = state.topology_cache.write().await;
+        *topo = None;
+    }
+
+    let hostfile_path = std::env::var("HOME")
+        .map(|h| format!("{h}/.r1o/hostfiles/auto.json"))
+        .unwrap_or_else(|_| "/tmp/auto.json".into());
+    let body = serde_json::json!({ "write": true, "path": hostfile_path });
+    let client = reqwest::Client::new();
+    let regen = client.post(format!("http://127.0.0.1:{}/jaccl/config", state.port))
+        .json(&body).send().await;
+    let regen_ok = regen.is_ok();
+
+    tracing::info!(hostfile_regen = regen_ok, "config/sync triggered");
+    serde_json::json!({ "ok": true, "hostfile_regen": regen_ok })
+}
+
+/// Hash a TopologyReport's links into a stable u64 for change detection.
+/// Sorted (node_a, device_a, node_b, device_b) tuples → FNV-1a.
+pub fn topology_hash(report: &crate::topology::TopologyReport) -> u64 {
+    let mut links: Vec<String> = report.links.iter().map(|l| {
+        let mut pair = [
+            format!("{}:{}", l.node_a, l.device_a),
+            format!("{}:{}", l.node_b, l.device_b),
+        ];
+        pair.sort();
+        pair.join("<>")
+    }).collect();
+    links.sort();
+    let joined = links.join("|");
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in joined.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// GET /models → cached local model file listing (now includes external volumes)
 /// Each model is annotated with live serving info if it's currently loaded.
 async fn models_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -513,7 +696,7 @@ async fn collect_serving_map(state: &AppState) -> Vec<(Vec<String>, ServingInfo)
 
 /// Extract searchable name fragments from a model ID.
 /// "mlx-community/Qwen3.5-122B-A10B-6bit" → ["qwen3.5-122b-a10b-6bit"]
-/// "/Users/ma/Models/Qwen3.5-REAP-262B-A17B-4bit-mlx" → ["qwen3.5-reap-262b-a17b-4bit-mlx"]
+/// "~/Models/Qwen3.5-REAP-262B-A17B-4bit-mlx" → ["qwen3.5-reap-262b-a17b-4bit-mlx"]
 fn normalize_model_id(id: &str) -> Vec<String> {
     let mut frags = Vec::new();
     // Last path component (works for both HF IDs and absolute paths)
@@ -610,8 +793,8 @@ async fn cluster_models_handler(State(state): State<AppState>) -> Json<serde_jso
 
             // Remote node: try .local mDNS first, then Tailscale hostname
             let urls = vec![
-                format!("http://{}.local:9090/models", node),
-                format!("http://{}:9090/models", node),
+                format!("http://{}.local:{}/models", node, state.port),
+                format!("http://{}:{}/models", node, state.port),
             ];
             for url in &urls {
                 if let Ok(resp) = client.get(url).send().await {
@@ -1172,6 +1355,7 @@ fn framework_to_engine(fw: asmi_core::ProcessFramework) -> asmi_core::ServeEngin
         asmi_core::ProcessFramework::MlxVlm => asmi_core::ServeEngine::MlxVlm,
         asmi_core::ProcessFramework::VllmMlx => asmi_core::ServeEngine::VllmMlx,
         asmi_core::ProcessFramework::DFlashProc => asmi_core::ServeEngine::DFlash,
+        asmi_core::ProcessFramework::Ds4 => asmi_core::ServeEngine::Ds4,
         _ => asmi_core::ServeEngine::MlxLm,
     }
 }
@@ -1187,6 +1371,7 @@ fn is_model_server_framework(fw: asmi_core::ProcessFramework) -> bool {
             | asmi_core::ProcessFramework::VllmMlx
             | asmi_core::ProcessFramework::MlxAudio
             | asmi_core::ProcessFramework::DFlashProc
+            | asmi_core::ProcessFramework::Ds4
     )
 }
 
@@ -1219,7 +1404,7 @@ async fn serve_load_handler(
     }
 
     // Start peer heartbeat for JACCL distributed sessions
-    let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
+    let backend = crate::serve::resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
     if backend == asmi_core::ServeBackend::Jaccl {
         let hf_path = req
             .hostfile
@@ -1229,7 +1414,7 @@ async fn serve_load_handler(
         if !peers.is_empty() {
             state
                 .peer_heartbeat
-                .start(peers, 9090, state.serve_managers.clone(), state.share_manager.clone())
+                .start(peers, state.port, state.serve_managers.clone(), state.share_manager.clone())
                 .await;
         }
     } else {
@@ -1240,6 +1425,25 @@ async fn serve_load_handler(
     let managers = state.serve_managers.read().await;
     let mgr = managers.get(&port)
         .ok_or_else(|| ApiError::Internal(format!("manager for port {port} disappeared")))?;
+
+    // Guard: reject if already loading or running (prevents TOCTOU race between agents)
+    let (current_state, current_model) = mgr.model_snapshot().await;
+    match current_state {
+        asmi_core::ServeState::Loading => {
+            return Err(ApiError::Conflict(format!(
+                "port {port} is already loading model: {}",
+                current_model.as_deref().unwrap_or("unknown")
+            )));
+        }
+        asmi_core::ServeState::Ready => {
+            return Err(ApiError::Conflict(format!(
+                "port {port} is already serving model: {}. Stop it first with /serve/stop?port={port}",
+                current_model.as_deref().unwrap_or("unknown")
+            )));
+        }
+        _ => {}
+    }
+
     mgr.load(req).await;
     Ok(Json(serde_json::json!({"ok": true, "state": "loading", "engine": engine, "port": port})))
 }
@@ -1257,6 +1461,82 @@ async fn serve_stop_handler(
     drop(managers);
     state.peer_heartbeat.stop().await;
     Ok(Json(serde_json::json!({"ok": true, "port": port})))
+}
+
+/// POST /serve/restart → kill and restart the server on a port.
+///
+/// For launchd-managed servers (ds4, etc.): kills the process and lets
+/// KeepAlive revive it automatically, then polls until `/v1/models` responds.
+/// For asmi-managed servers (mlx_lm, mlx_vlm): stops and re-loads the same
+/// model. Clears stuck prefill loops, jammed KV caches, and hung connections.
+async fn serve_restart_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let port = q.port.unwrap_or(DEFAULT_SERVE_PORT);
+    let managers = state.serve_managers.read().await;
+    let mgr = managers.get(&port)
+        .ok_or_else(|| ApiError::NotFound(format!("unknown port: {port}")))?;
+
+    let status = mgr.status().await;
+    let is_launchd = status.launchd.as_ref().is_some_and(|l| l.keep_alive.unwrap_or(false));
+    let model = status.model.clone();
+    let engine = status.engine;
+    let backend = status.backend.to_string();
+
+    mgr.stop().await;
+    drop(managers);
+    state.peer_heartbeat.stop().await;
+
+    if is_launchd {
+        // launchd KeepAlive will auto-restart the process.
+        // Poll the port until the new process responds (up to 30s).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if tokio::time::Instant::now() > deadline {
+                return Ok(Json(serde_json::json!({
+                    "ok": true, "port": port, "state": "restart_timeout",
+                    "message": "launchd should revive; process not yet healthy after 30s"
+                })));
+            }
+            if client.get(&url).send().await.is_ok_and(|r| r.status().is_success()) {
+                break;
+            }
+        }
+        Ok(Json(serde_json::json!({
+            "ok": true, "port": port, "state": "ready",
+            "message": "launchd-managed server restarted"
+        })))
+    } else if let Some(model_path) = model {
+        // asmi-managed: re-load the same model
+        let req = asmi_core::LoadRequest {
+            model_path: Some(model_path),
+            backend,
+            hostfile: None,
+            engine,
+            ..Default::default()
+        };
+        let managers = state.serve_managers.read().await;
+        if let Some(mgr) = managers.get(&port) {
+            mgr.load(req).await;
+        }
+        Ok(Json(serde_json::json!({
+            "ok": true, "port": port, "state": "loading",
+            "message": "server stopped and model reload initiated"
+        })))
+    } else {
+        // No model was loaded — just leave it stopped
+        Ok(Json(serde_json::json!({
+            "ok": true, "port": port, "state": "idle",
+            "message": "server stopped (no model to reload)"
+        })))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,7 +2164,7 @@ async fn serve_share_handler(
         return Err(ApiError::BadRequest("model_path required".into()));
     }
     // Start peer heartbeat for JACCL distributed sessions
-    let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
+    let backend = crate::serve::resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
     if backend == asmi_core::ServeBackend::Jaccl {
         let hf_path = req
             .hostfile
@@ -1894,7 +2174,7 @@ async fn serve_share_handler(
         if !peers.is_empty() {
             state
                 .peer_heartbeat
-                .start(peers, 9090, state.serve_managers.clone(), state.share_manager.clone())
+                .start(peers, state.port, state.serve_managers.clone(), state.share_manager.clone())
                 .await;
         }
     }
@@ -2273,7 +2553,7 @@ async fn ane_handler(
                 "ane_active": ane_active,
                 "cpu_watts": s.cpu_watts,
                 "gpu_watts": s.gpu_watts,
-                "total_soc_mw": s.cpu_watts + s.gpu_watts + s.ane_watts,
+                "total_soc_mw": (s.cpu_watts + s.gpu_watts + s.ane_watts) * 1000.0,
                 "power_source": s.power_source,
                 "timestamp": s.timestamp,
             })))
@@ -3129,6 +3409,30 @@ async fn rdma_health_handler(State(state): State<AppState>) -> Json<serde_json::
     }))
 }
 
+/// GET /rdma/topology → UUID cross-matched TB link map (plan: rdma-auto-mesh A1).
+/// Reuses topology::discover_topology (native HTTP + /thunderbolt UUID
+/// cross-reference) and returns the full TopologyReport: links carry
+/// node_a/device_a ↔ node_b/device_b; report carries mesh_complete,
+/// jaccl_ready and ready subsets.
+async fn rdma_topology_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let nm = state.node_map.read().await;
+    let nodes: Vec<String> = nm.nodes.clone();
+    drop(nm);
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::topology::discover_topology(&nodes, "jaccl")
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => Json(serde_json::to_value(&report).unwrap_or_else(
+            |e| serde_json::json!({"error": format!("serialize: {e}")}),
+        )),
+        Ok(Err(e)) => Json(serde_json::json!({"error": format!("discovery: {e}")})),
+        Err(e) => Json(serde_json::json!({"error": format!("join: {e}")})),
+    }
+}
+
 /// GET /rdma/mesh → query all cluster nodes, aggregate mesh health.
 ///
 /// Reads node list from NodeMap (seeded from ~/.r1o/cluster.json).
@@ -3145,19 +3449,41 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         .map(|s| s.as_str())
         .collect();
 
+    // Latency (plan 2026-06-11 stream B): peers the hub's cluster poller
+    // already marks offline are skipped outright — each would otherwise pin
+    // the wave to the full per-peer timeout on every request. cluster_state
+    // is hub-only (--cluster), so elsewhere this set is empty and offline
+    // peers cost one (now 2s) timeout instead.
+    let known_offline: std::collections::HashSet<String> = match state.cluster_state.as_ref() {
+        Some(cs) => cs
+            .read()
+            .await
+            .snapshots
+            .iter()
+            .filter(|(_, snap)| !snap.online)
+            .map(|(name, _)| name.clone())
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(2))
         .build()
         .unwrap_or_default();
 
     // Query remote nodes over local network (.local mDNS)
+    let port = state.port;
     let futures: Vec<_> = remote_nodes
         .iter()
         .map(|&name| {
             let client = client.clone();
             let name = name.to_string();
-            let url = format!("http://{}.local:9090/rdma/check", name);
+let skip_offline = known_offline.contains(&name);
+            let url = format!("http://{}.local:{}/rdma/check", name, port);
             async move {
+                if skip_offline {
+                    return (name, None);
+                }
                 match client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<serde_json::Value>().await {
@@ -3171,8 +3497,14 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         })
         .collect();
 
-    let results: Vec<(String, Option<serde_json::Value>)> =
-        futures::future::join_all(futures).await;
+    // Overlap the remote wave with the local /rdma/check (plan 2026-06-11
+    // stream B): run serially they floor at wave + 1.1-1.8s; joined, the
+    // floor is max(wave, local check). The node_map read-lock was dropped
+    // above, before either future is built.
+    let (results, local_check): (Vec<(String, Option<serde_json::Value>)>, _) = tokio::join!(
+        futures::future::join_all(futures),
+        rdma_check_handler(State(state.clone()))
+    );
 
     let mut nodes: Vec<serde_json::Value> = Vec::new();
     let mut total_active = 0usize;
@@ -3180,6 +3512,37 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
     let mut total_peers = 0usize;
     let mut nodes_healthy = 0usize;
     let mut nodes_online = 0usize;
+
+    // T1b: include the LOCAL node inline — the comment at the top of this
+    // handler promised this but it was never implemented, so every node's
+    // /rdma/mesh omitted itself (web callers that fanned out themselves
+    // masked the gap). Same row shape as the remote passthrough below.
+    // The check itself ran concurrently with the remote wave (join above).
+    {
+        let local = local_check.0;
+        nodes_online += 1;
+        let healthy = local.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
+        if healthy {
+            nodes_healthy += 1;
+        }
+        total_active += local.get("rdma_active_count").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        total_reachable_peers += local.get("peers_reachable").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        total_peers += local.get("peers_total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        nodes.push(serde_json::json!({
+            "hostname": local_hostname,
+            "online": true,
+            "healthy": healthy,
+            "summary": local.get("summary"),
+            "rdma_active_count": local.get("rdma_active_count"),
+            "peers_reachable": local.get("peers_reachable"),
+            "peers_total": local.get("peers_total"),
+            "peer_pings": local.get("peer_pings"),
+            "bridges": local.get("bridges"),
+            "topology": local.get("topology"),
+            "rdma_devices": local.get("rdma_devices"),
+            "link_local_ips": local.get("link_local_ips"),
+        }));
+    }
 
     for (name, data) in &results {
         match data {
@@ -3203,6 +3566,8 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
                     "peer_pings": d.get("peer_pings"),
                     "bridges": d.get("bridges"),
                     "topology": d.get("topology"),
+                    "rdma_devices": d.get("rdma_devices"),
+                    "link_local_ips": d.get("link_local_ips"),
                 }));
             }
             None => {
@@ -3234,6 +3599,81 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         })
     };
 
+    // Plan rdma-auto-mesh A3: deterministic per-link /30 assignments + best
+    // peer IP + SMB reachability, from the cached topology (no fresh scan on
+    // the request path). Only links where THIS node is an endpoint are probed
+    // (TCP :445 over the /30, 700ms, concurrent) — each node probes its own
+    // edges; everything else reports "unprobed".
+    let cached_report = state
+        .topology_cache
+        .read()
+        .await
+        .as_ref()
+        .map(|(report, _)| report.clone());
+    let (mesh_links, node_best_ip) = match cached_report {
+        Some(report) => {
+            let assignments = crate::rdma_autosetup::deterministic_link_ips(&report);
+            let local = state.hostname.to_lowercase();
+            let probes: Vec<_> = assignments
+                .iter()
+                .map(|a| {
+                    let local_is_first = a.node_first.to_lowercase() == local;
+                    let local_is_second = a.node_second.to_lowercase() == local;
+                    let peer_ip = if local_is_first {
+                        Some(a.ip_second.clone())
+                    } else if local_is_second {
+                        Some(a.ip_first.clone())
+                    } else {
+                        None
+                    };
+                    async move {
+                        match peer_ip {
+                            Some(ip) => {
+                                let alive = tokio::time::timeout(
+                                    std::time::Duration::from_millis(700),
+                                    tokio::net::TcpStream::connect((ip.as_str(), 445)),
+                                )
+                                .await
+                                .map(|r| r.is_ok())
+                                .unwrap_or(false);
+                                Some(alive)
+                            }
+                            None => None,
+                        }
+                    }
+                })
+                .collect();
+            let probe_results = futures::future::join_all(probes).await;
+
+            let mut links = Vec::new();
+            let mut best = serde_json::Map::new();
+            for (a, probed) in assignments.iter().zip(probe_results) {
+                let (status, smb) = match probed {
+                    Some(true) => ("up", serde_json::Value::Bool(true)),
+                    Some(false) => ("down", serde_json::Value::Bool(false)),
+                    None => ("unprobed", serde_json::Value::Null),
+                };
+                if probed == Some(true) {
+                    let local_is_first = a.node_first.to_lowercase() == local;
+                    let (peer_name, peer_ip) = if local_is_first {
+                        (&a.node_second, &a.ip_second)
+                    } else {
+                        (&a.node_first, &a.ip_first)
+                    };
+                    best.entry(peer_name.clone())
+                        .or_insert_with(|| serde_json::Value::String(peer_ip.clone()));
+                }
+                links.push(serde_json::json!({
+                    "node_a": a.node_first, "iface_a": a.iface_first, "ip_a": a.ip_first,
+                    "node_b": a.node_second, "iface_b": a.iface_second, "ip_b": a.ip_second,
+                    "status": status, "smb_mountable": smb,
+                }));
+            }
+            (links, serde_json::Value::Object(best))
+        }
+        None => (Vec::new(), serde_json::json!({})),
+    };
+
     Json(serde_json::json!({
         "mesh_healthy": mesh_healthy,
         "summary": format!(
@@ -3247,6 +3687,8 @@ async fn rdma_mesh_handler(State(state): State<AppState>) -> Json<serde_json::Va
         "total_peers_reachable": total_reachable_peers,
         "total_peers": total_peers,
         "topology": mesh_topology,
+        "links": mesh_links,
+        "node_best_ip": node_best_ip,
         "nodes": nodes,
         "queried_via": "local_network",
         "queried_from": state.hostname,
@@ -3517,6 +3959,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/logs", get(logs_handler))
         .route("/runtime", get(runtime_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/cluster/full", get(cluster_full_handler))
         .route("/cluster/models", get(cluster_models_handler))
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))
@@ -3529,6 +3972,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/status", get(serve_status_handler))
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
+        .route("/serve/restart", post(serve_restart_handler))
         .route("/serve/reload", post(serve_reload_handler))
         .route("/launchd/disable", post(launchd_disable_handler))
         .route("/launchd/enable", post(launchd_enable_handler))
@@ -3554,18 +3998,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/rdma/check", get(rdma_check_handler))
         .route("/rdma/health", get(rdma_health_handler))
         .route("/rdma/mesh", get(rdma_mesh_handler))
+        .route("/rdma/topology", get(rdma_topology_handler))
         .route("/rdma/setup", post(rdma_setup_handler))
         .route("/bridge0/destroy", post(bridge0_destroy_handler))
         .route("/bridge0/restore", post(bridge0_restore_handler))
         .route("/prep", post(prep_handler))
         // Native RDMA file transfer (gated by --features jaccl)
         .route("/transfer", post(crate::transfer::transfer_handler))
+        .route("/transfer/status", get(crate::transfer::transfer_status_handler))
+        .route("/transfer/{id}/log", get(crate::transfer::transfer_log_handler))
         .route("/transfer/accept", post(crate::transfer::transfer_accept_handler))
         // Experimental ANE compute endpoints (gated by --experimental-ane + --features ane)
         .route("/ane/compute", get(crate::ane::status_handler))
         .route("/ane/eval", post(crate::ane::eval_handler))
         .route("/ane/probe", get(crate::ane::probe_handler))
         // Autoresearch benchmark validation
+        .route("/config/sync", post(config_sync_handler))
         .route("/autoresearch/gate", get(autoresearch_gate_handler))
         .route("/autoresearch/reset", post(autoresearch_reset_handler))
         .with_state(state)

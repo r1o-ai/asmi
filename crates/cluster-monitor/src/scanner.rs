@@ -1079,6 +1079,8 @@ fn parse_mlx_processes(text: &str) -> Vec<ProcessInfo> {
         let pid: u32 = fields.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let cpu_percent: f64 = fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let mem_percent: f64 = fields.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let rss_kb: u64 = fields.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rss_mb = if rss_kb > 0 { Some(rss_kb as f64 / 1024.0) } else { None };
 
         let port = MLX_PORT_RE
             .captures(line)
@@ -1110,7 +1112,7 @@ fn parse_mlx_processes(text: &str) -> Vec<ProcessInfo> {
             port,
             cpu_percent,
             mem_percent,
-            footprint_mb: None,
+            footprint_mb: rss_mb,
             distributed,
             server_models: Vec::new(),
         });

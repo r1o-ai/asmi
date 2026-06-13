@@ -463,6 +463,14 @@ async fn test_load_request_json_round_trip_with_all_fields() {
         use_mtp: false,
         cache_type: Some("q8".to_string()),
         max_tokens: Some(4096),
+        kv_bits: Some(3.5),
+        kv_quant_scheme: Some("turboquant".to_string()),
+        vision_cache_size: Some(16),
+        ctx_size: Some(262144),
+        env: Some(std::collections::HashMap::from([(
+            "MLX_DISTRIBUTED_BACKEND".to_string(),
+            "jaccl".to_string(),
+        )])),
     };
 
     let json_str = serde_json::to_string(&original).expect("should serialize");
@@ -477,6 +485,11 @@ async fn test_load_request_json_round_trip_with_all_fields() {
     assert_eq!(deserialized.pipeline, original.pipeline);
     assert_eq!(deserialized.prompt_cache_size, original.prompt_cache_size);
     assert_eq!(deserialized.prompt_cache_bytes, original.prompt_cache_bytes);
+    assert_eq!(deserialized.kv_bits, original.kv_bits);
+    assert_eq!(deserialized.kv_quant_scheme, original.kv_quant_scheme);
+    assert_eq!(deserialized.vision_cache_size, original.vision_cache_size);
+    assert_eq!(deserialized.ctx_size, original.ctx_size);
+    assert_eq!(deserialized.env, original.env);
 }
 
 #[tokio::test]

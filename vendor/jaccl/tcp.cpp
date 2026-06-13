@@ -2,7 +2,9 @@
 
 #include <netdb.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 #include <cstring>
+#include <iostream>
 #include <sstream>
 #include <thread>
 
@@ -179,10 +181,24 @@ TCPSocket TCPSocket::connect(
       throw std::runtime_error(msg.str());
     }
 
+    // Log the target address (raw hex + parsed)
+    {
+      const unsigned char* raw = (const unsigned char*)addr.get();
+      std::cerr << tag << " connect attempt " << attempt << " raw=[";
+      for (int b = 0; b < 16 && b < (int)addr.len; b++)
+        fprintf(stderr, "%02x", raw[b]);
+      std::cerr << "] len=" << addr.len << std::endl;
+    }
+
     success = ::connect(sock, addr.get(), addr.len);
     if (success == 0) {
+      std::cerr << tag << " connected successfully" << std::endl;
       break;
     }
+
+    int err = errno;
+    std::cerr << tag << " connect failed: errno=" << err << std::endl;
+    close(sock);  // close failed socket to avoid leak
 
     if (cb != nullptr) {
       cb(attempt, wait);

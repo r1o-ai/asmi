@@ -280,21 +280,21 @@ pub async fn enable(label: &str) -> Result<(), LaunchdError> {
     let home = std::env::var("HOME").unwrap_or_default();
     let plist = format!("{}/Library/LaunchAgents/{}.plist", home, label);
 
-    // bootstrap exits non-zero if service is already loaded — that's
-    // the steady state we want, so swallow it; but propagate any other
-    // failure (missing plist, malformed XML, bad program path) so the
-    // caller can return a useful diagnostic instead of timing out at
-    // the /health poll.
+    // bootstrap exits non-zero if the service is already loaded — that's
+    // the steady state we want. Modern launchctl (macOS 26/27) reports this
+    // as bare "Bootstrap failed: 5: Input/output error" with NO
+    // 'already loaded' text, so string-matching stderr misses it (observed
+    // 2026-06-10: r1oMac Start-daemon button → HTTP 500 while the service
+    // was running). Ground truth is the service's actual state: probe
+    // `launchctl print` — running ⇒ steady-state no-op; loaded-but-dead ⇒
+    // kickstart -k; absent ⇒ the bootstrap error was real, propagate it.
     match run_launchctl(&["bootstrap", &domain, &plist]).await {
         Ok(_) => Ok(()),
-        Err(LaunchdError::NonZero { stderr, .. })
-            if stderr.contains("service already bootstrapped")
-                || stderr.contains("Service is already loaded")
-                || stderr.contains("already loaded") =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(e),
+        Err(first_err) => match run_launchctl(&["print", &target]).await {
+            Ok(out) if out.contains("state = running") => Ok(()),
+            Ok(_) => run_launchctl(&["kickstart", "-k", &target]).await.map(|_| ()),
+            Err(_) => Err(first_err),
+        },
     }
 }
 
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(info.keep_alive, Some(true), "properties contains `keepalive`");
         assert_eq!(info.run_at_load, Some(true), "properties contains `runatload`");
         assert_eq!(info.state, LaunchdState::Running);
-        assert_eq!(info.program.as_deref(), Some("/Users/ma/.cargo/bin/asmi"));
+        assert_eq!(info.program.as_deref(), Some("/usr/local/bin/asmi"));
     }
 
     #[test]

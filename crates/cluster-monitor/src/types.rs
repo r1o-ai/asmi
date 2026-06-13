@@ -767,6 +767,8 @@ pub enum ServeEngine {
     MlxLmShare,
     #[serde(rename = "dflash")]
     DFlash,
+    #[serde(rename = "ds4")]
+    Ds4,
 }
 
 
@@ -778,6 +780,7 @@ impl fmt::Display for ServeEngine {
             Self::VllmMlx => write!(f, "vllm_mlx"),
             Self::MlxLmShare => write!(f, "mlx_lm_share"),
             Self::DFlash => write!(f, "dflash"),
+            Self::Ds4 => write!(f, "ds4"),
         }
     }
 }
@@ -789,15 +792,34 @@ pub enum ServeBackend {
     #[default]
     Single,
     Jaccl,
+    /// JACCL over a ring topology (1 TB5 peer per node suffices).
+    #[serde(rename = "jaccl-ring")]
+    JacclRing,
+    /// TCP ring over TB5 — slowest, no RDMA requirement.
+    Ring,
 }
 
+impl ServeBackend {
+    /// Any multi-rank backend launched via `mlx.launch`.
+    pub fn is_distributed(self) -> bool {
+        !matches!(self, Self::Single)
+    }
+
+    /// The exact string `mlx.launch --backend` expects (also what the
+    /// `_mlx_backend_fix` rank hook reads from MLX_DISTRIBUTED_BACKEND).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Jaccl => "jaccl",
+            Self::JacclRing => "jaccl-ring",
+            Self::Ring => "ring",
+        }
+    }
+}
 
 impl fmt::Display for ServeBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Single => write!(f, "single"),
-            Self::Jaccl => write!(f, "jaccl"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -853,6 +875,13 @@ impl ServeEngine {
             },
             Self::DFlash => EngineConfig {
                 binary: "dflash_mlx.serve",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: Some("--model"),
+                health_endpoints: &["/v1/models", "/health"],
+            },
+            Self::Ds4 => EngineConfig {
+                binary: "ds4-server",
                 binary_args: &[],
                 uvicorn_app: None,
                 model_flag: Some("--model"),
@@ -978,6 +1007,32 @@ pub struct LoadRequest {
     /// Max context length override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+
+    // --- VLM-only optimization (mlx_vlm reads these as ENV VARS at startup, not
+    // CLI flags — see src/serve.rs spawn). No-ops for mlx_lm, which has no KV
+    // env hooks. Names mirror what mlx_vlm/server/generation.py reads. ---
+
+    /// TurboQuant KV-cache bits (fractional ok, e.g. 3.5). → env KV_BITS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_bits: Option<f64>,
+    /// KV quantization scheme ("uniform" | "turboquant"). → env KV_QUANT_SCHEME.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_quant_scheme: Option<String>,
+    /// Vision-feature cache entries. → env MLX_VLM_VISION_CACHE_SIZE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_cache_size: Option<u32>,
+
+    /// Context window size override (ds4 `-c` flag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctx_size: Option<u64>,
+
+    /// Environment variables to lock onto the serve process — and, for
+    /// distributed backends, onto EVERY remote rank via `mlx.launch --env`
+    /// (exported before exec on each host, so login-shell drift can't change
+    /// the runtime env). Keys are prefix-allowlisted at spawn (see
+    /// serve.rs `allowlisted_env`); disallowed keys are dropped with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::HashMap<String, String>>,
 }
 
 fn default_backend_str() -> String {
@@ -1002,6 +1057,11 @@ impl Default for LoadRequest {
             use_mtp: false,
             cache_type: None,
             max_tokens: None,
+            kv_bits: None,
+            kv_quant_scheme: None,
+            vision_cache_size: None,
+            ctx_size: None,
+            env: None,
         }
     }
 }
