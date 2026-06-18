@@ -78,6 +78,25 @@ pub(crate) fn parse_launchctl_list(text: &str) -> HashMap<u32, String> {
         .collect()
 }
 
+/// Parse `launchctl list` output into a flat list of labels.
+///
+/// Unlike `parse_launchctl_list`, this includes rows whose PID is `-` —
+/// i.e. agents that are registered but not currently running. Those are the
+/// most interesting rows for a watchdog scanner because they include disabled
+/// or crashed agents that a user may want to clear out.
+pub(crate) fn parse_launchctl_list_labels(text: &str) -> Vec<String> {
+    text.lines()
+        .skip(1) // header
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next()?;
+            let _status = fields.next()?;
+            let label = fields.next()?;
+            Some(label.to_string())
+        })
+        .collect()
+}
+
 /// Parse `launchctl print gui/UID/label` output.
 ///
 /// `label` is passed in by the caller because the print output's first line
@@ -283,6 +302,66 @@ pub fn guard_protected(label: &str) -> Result<(), LaunchdError> {
     Ok(())
 }
 
+/// Whether a label is protected from disable/enable. Used by callers that
+/// want to *display* protection state without erroring (e.g. the scanner UI).
+pub fn is_protected(label: &str) -> bool {
+    PROTECTED_PREFIXES.iter().any(|p| label.starts_with(p))
+}
+
+/// Default label prefixes the scanner cares about — r1o stack + mlx model
+/// servers (when ever someone wraps mlx in a launchd plist) + asmi itself
+/// (so users can see the daemon, even though it's protected from actions).
+pub const DEFAULT_SCANNER_PREFIXES: &[&str] =
+    &["com.r1o.", "com.mlx.", "com.asmi."];
+
+/// Enumerate launchd agents whose label starts with any of `prefixes`,
+/// describing each one. Sorted by label for stable UI ordering.
+///
+/// Walks both running agents (`launchctl list`) and disabled-but-known agents
+/// (`launchctl print-disabled`) so the caller sees disabled entries that have
+/// been booted out — those are the ones a user is most likely to want to
+/// re-enable or fully remove.
+pub async fn list_with_prefixes(prefixes: &[&str]) -> Result<Vec<LaunchdInfo>, LaunchdError> {
+    let mut labels: std::collections::BTreeSet<String> = Default::default();
+
+    // Running / waiting agents from `launchctl list`.
+    if let Ok(list_out) = run_launchctl(&["list"]).await {
+        for label in parse_launchctl_list_labels(&list_out) {
+            if prefixes.iter().any(|p| label.starts_with(p)) {
+                labels.insert(label);
+            }
+        }
+    }
+
+    // Disabled agents from `launchctl print-disabled gui/$UID`.
+    let uid = current_uid();
+    if let Ok(disabled_out) = run_launchctl(&["print-disabled", &format!("gui/{}", uid)]).await {
+        for label in parse_print_disabled(&disabled_out).into_keys() {
+            if prefixes.iter().any(|p| label.starts_with(p)) {
+                labels.insert(label);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(labels.len());
+    for label in labels {
+        if let Some(info) = describe_label(&label).await {
+            out.push(info);
+        } else {
+            // describe_label returned None — agent vanished between list and describe,
+            // or print failed. Emit a minimal record so the UI still surfaces it.
+            out.push(LaunchdInfo {
+                label,
+                keep_alive: None,
+                run_at_load: None,
+                state: LaunchdState::Waiting,
+                program: None,
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -380,5 +459,43 @@ mod tests {
     fn guard_protected_allows_user_labels() {
         assert!(guard_protected("com.test.fixture1").is_ok());
         assert!(guard_protected("com.example.mlx-server").is_ok());
+    }
+
+    // ── Live `launchctl` smoke tests ──────────────────────────────────────
+    //
+    // Unlike the fixture-driven parsing tests above, these shell out to the
+    // real `launchctl` binary. Always run on macOS developer machines; on
+    // non-macOS CI, the `launchctl list` call inside `list_with_prefixes`
+    // returns Err and the function falls through to an empty result — so the
+    // empty-prefix test still passes there. The happy-path test is gated.
+
+    #[tokio::test]
+    async fn list_with_prefixes_filters_by_prefix() {
+        // Skip on non-macOS CI where launchctl is absent.
+        if std::env::var("CI").is_ok() && cfg!(not(target_os = "macos")) {
+            return;
+        }
+        let agents = list_with_prefixes(&["com.apple."]).await.unwrap();
+        // Every macOS user has at least a few `com.apple.*` agents — empty would
+        // mean either launchctl broke or our prefix filter is wrong.
+        assert!(
+            !agents.is_empty(),
+            "expected at least one com.apple.* agent on macOS"
+        );
+        for a in &agents {
+            assert!(
+                a.label.starts_with("com.apple."),
+                "prefix filter leaked: {}",
+                a.label
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_with_prefixes_empty_when_no_match() {
+        let agents = list_with_prefixes(&["com.thisdoesnotexist."])
+            .await
+            .unwrap();
+        assert!(agents.is_empty());
     }
 }

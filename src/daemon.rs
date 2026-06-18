@@ -195,13 +195,70 @@ async fn stream_handler(
     )
 }
 
-/// GET /jaccl/config → JACCL hostfile matrix from stored RDMA link topology.
+/// GET /jaccl/config → JACCL hostfile matrix.
+///
+/// Resolution order:
+///   1. `~/.r1o/hostfiles/asmi-auto.json` (written by `mlx.distributed_config --auto-setup`)
+///   2. Regenerate via `mlx_distributed_config::auto_setup` if file is missing
+///   3. Fall back to live topology cache (legacy synthesis from RDMA link probes)
+///   4. Final fallback: stale NodeMap rdma_links
+///
 /// Query params: ?hosts=m3u2,m3u1 (comma-separated hostnames, optional — defaults to all)
 async fn jaccl_config_handler(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Prefer live topology cache over stale NodeMap rdma_links
+    // Step 1: Prefer the asmi-auto.json hostfile written by Phase 2.2 autosetup.
+    let auto_path = dirs::home_dir()
+        .map(|h| h.join(".r1o/hostfiles/asmi-auto.json"))
+        .unwrap_or_default();
+    if let Ok(body) = tokio::fs::read_to_string(&auto_path).await {
+        if let Ok(hostfile) = serde_json::from_str::<serde_json::Value>(&body) {
+            return Ok(Json(filter_and_wrap_hostfile(
+                hostfile,
+                "asmi_auto_hostfile",
+                &state.hostname,
+                &params,
+            )));
+        }
+    }
+
+    // Step 2: Regenerate via mlx.distributed_config if cluster has multiple nodes.
+    let cluster_hosts: Vec<String> = {
+        let nm = state.node_map.read().await;
+        nm.nodes.clone()
+    };
+    if cluster_hosts.len() >= 2 {
+        match crate::mlx_distributed_config::auto_setup(&cluster_hosts, "jaccl-ring").await {
+            Ok(hostfile) => {
+                let json = serde_json::to_value(&hostfile)
+                    .unwrap_or_else(|_| serde_json::json!({"hosts": []}));
+                // Cache it so subsequent calls are fast.
+                if let Some(parent) = auto_path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                if let Ok(body) = serde_json::to_string_pretty(&hostfile) {
+                    let _ = tokio::fs::write(&auto_path, body).await;
+                }
+                return Ok(Json(filter_and_wrap_hostfile(
+                    json,
+                    "mlx_distributed_config",
+                    &state.hostname,
+                    &params,
+                )));
+            }
+            Err(crate::mlx_distributed_config::ConfigError::BinaryNotFound) => {
+                tracing::warn!(
+                    "mlx.distributed_config not installed; falling back to live topology cache"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("mlx.distributed_config failed: {e}; falling back");
+            }
+        }
+    }
+
+    // Step 3: Live topology cache (legacy synthesis from RDMA probes).
     let topo_cache = state.topology_cache.read().await;
     if let Some((report, scanned_at)) = topo_cache.as_ref() {
         if report.links.is_empty() {
@@ -319,6 +376,57 @@ async fn jaccl_config_handler(
         }
         Err(e) => Err(ApiError::Internal(format!("Failed to build JACCL matrix: {e}"))),
     }
+}
+
+/// Apply optional `?hosts=` filtering to a hostfile JSON and wrap it in the
+/// daemon's standard envelope (success/source/hosts/nodeCount/local_hostname).
+///
+/// Accepts either a raw hostfile (with `hosts: [...]`) or a value already
+/// shaped like the legacy `node_map_fallback` envelope.
+fn filter_and_wrap_hostfile(
+    hostfile_json: serde_json::Value,
+    source: &'static str,
+    local_hostname: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let hosts_arr = hostfile_json
+        .get("hosts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let filtered: Vec<serde_json::Value> = if let Some(hosts_param) = params.get("hosts") {
+        let requested: Vec<&str> = hosts_param.split(',').collect();
+        hosts_arr
+            .into_iter()
+            .filter(|h| {
+                h.get("ssh")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|ssh| requested.iter().any(|r| ssh.starts_with(r)))
+            })
+            .collect()
+    } else {
+        hosts_arr
+    };
+
+    let count = filtered.len();
+    let mut envelope = serde_json::json!({
+        "success": true,
+        "source": source,
+        "hosts": filtered,
+        "nodeCount": count,
+        "local_hostname": local_hostname,
+    });
+
+    // Surface the upstream backend tag (if present) so consumers see e.g. "jaccl-ring".
+    if let Some(backend) = hostfile_json.get("backend") {
+        envelope["backend"] = backend.clone();
+    }
+    if let Some(envs) = hostfile_json.get("envs") {
+        envelope["envs"] = envs.clone();
+    }
+
+    envelope
 }
 
 /// POST /jaccl/config → generate and write JACCL hostfile to coordinator
@@ -982,10 +1090,15 @@ async fn network_fix_handler() -> Result<Json<serde_json::Value>, ApiError> {
 // Serve lifecycle endpoints (replaces mlx_daemon.py on port 19079)
 // ---------------------------------------------------------------------------
 
-/// Query params for serve endpoints — optional ?port= (defaults to 19080).
+/// Query params for serve endpoints.
+/// - `port`: address a specific server slot directly (overrides auto-pick).
+/// - `engine`: when auto-picking, restrict to slots running this engine
+///   ("mlx_lm", "mlx_vlm", "vllm_mlx", "mlx_lm_share"). Lets clients say
+///   "give me the VLM proxy" without knowing the port.
 #[derive(Deserialize)]
 struct ServeQuery {
     port: Option<u16>,
+    engine: Option<String>,
 }
 
 /// Default MLX server port (backwards compatible).
@@ -1174,9 +1287,9 @@ async fn serve_load_handler(
         }
     }
 
-    // Start peer heartbeat for JACCL distributed sessions
+    // Start peer heartbeat for distributed sessions
     let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
-    if backend == asmi_core::ServeBackend::Jaccl {
+    if matches!(backend, asmi_core::ServeBackend::Jaccl | asmi_core::ServeBackend::JacclRing | asmi_core::ServeBackend::Ring) {
         let hf_path = req
             .hostfile
             .clone()
@@ -1241,6 +1354,83 @@ fn launchd_err_response(e: crate::launchd::LaunchdError) -> axum::response::Resp
             Json(serde_json::json!({"error": other.to_string()})),
         )
             .into_response(),
+    }
+}
+
+/// Query for `/launchd/list` and `/launchd/describe`.
+#[derive(Deserialize, Default)]
+struct LaunchdListQuery {
+    /// Comma-separated label prefixes to include. When omitted, defaults to
+    /// `DEFAULT_SCANNER_PREFIXES` (`com.r1o.`, `com.mlx.`, `com.asmi.`).
+    /// Example: `?prefix=com.r1o.,com.litellm.`
+    prefix: Option<String>,
+    /// Single label to describe (used by `/launchd/describe`).
+    label: Option<String>,
+}
+
+/// GET /launchd/list — Enumerate launchd agents matching the prefix filter.
+///
+/// Returns `[{label, state, keep_alive, run_at_load, program, protected}]`.
+/// `protected` is added per-entry (not part of `LaunchdInfo` itself) so the
+/// UI can grey out disable/enable buttons for `com.asmi.*` etc.
+async fn launchd_list_handler(
+    State(_state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<LaunchdListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owned: Vec<String>;
+    let prefixes: Vec<&str> = match q.prefix.as_deref() {
+        Some(s) => {
+            owned = s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+            owned.iter().map(|s| s.as_str()).collect()
+        }
+        None => crate::launchd::DEFAULT_SCANNER_PREFIXES.to_vec(),
+    };
+
+    let agents = crate::launchd::list_with_prefixes(&prefixes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("launchctl list failed: {e}")))?;
+
+    let enriched: Vec<serde_json::Value> = agents
+        .into_iter()
+        .map(|info| {
+            let protected = crate::launchd::is_protected(&info.label);
+            // Re-shape: include `protected` alongside the LaunchdInfo fields.
+            let mut v = serde_json::to_value(&info).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("protected".to_string(), serde_json::Value::Bool(protected));
+            }
+            v
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "agents": enriched,
+        "prefixes": prefixes,
+    })))
+}
+
+/// GET /launchd/describe?label=com.foo.bar — Describe a single label.
+///
+/// 404 when the agent is not found in `launchctl print` AND not in
+/// `print-disabled`. Useful for the stop-flow keepalive check.
+async fn launchd_describe_handler(
+    State(_state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<LaunchdListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let label = q
+        .label
+        .ok_or_else(|| ApiError::BadRequest("missing ?label= query param".to_string()))?;
+    let info = crate::launchd::describe_label(&label).await;
+    match info {
+        Some(info) => {
+            let protected = crate::launchd::is_protected(&info.label);
+            let mut v = serde_json::to_value(&info).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("protected".to_string(), serde_json::Value::Bool(protected));
+            }
+            Ok(Json(v))
+        }
+        None => Err(ApiError::NotFound(format!("no launchd agent named: {label}"))),
     }
 }
 
@@ -1513,9 +1703,9 @@ async fn serve_share_handler(
     if req.model_path.is_empty() {
         return Err(ApiError::BadRequest("model_path required".into()));
     }
-    // Start peer heartbeat for JACCL distributed sessions
+    // Start peer heartbeat for distributed sessions
     let backend = crate::serve::resolve_backend(&req.backend, req.hostfile.as_deref());
-    if backend == asmi_core::ServeBackend::Jaccl {
+    if matches!(backend, asmi_core::ServeBackend::Jaccl | asmi_core::ServeBackend::JacclRing | asmi_core::ServeBackend::Ring) {
         let hf_path = req
             .hostfile
             .clone()
@@ -2927,6 +3117,241 @@ async fn prep_handler(
     }
 }
 
+// ── OpenAI-compatible proxy ─────────────────────────────────────────────────
+
+/// Pure form of the proxy-port selection rule. No async, no locks, no I/O.
+///
+/// Selection contract:
+/// 1. `explicit` (from `?port=`) wins unconditionally — the caller is asserting
+///    which slot they want, even Loading/Bare ones (used for early `/v1/models`
+///    probes during deploy).
+/// 2. Otherwise the first `state == Ready` status wins.
+/// 3. When `engine_filter` is `Some(...)`, only Ready statuses whose engine
+///    `Display`-formats to the same string qualify (`"mlx_lm"`, `"mlx_vlm"`, …).
+/// 4. `None` means "no eligible slot" — caller renders OpenAI-shaped 503.
+///
+/// Exposed as `pub(crate)` so the in-file `#[cfg(test)]` module can call it
+/// directly. Integration tests cannot reach this — apple-smi is binary-only,
+/// no `lib.rs`.
+pub(crate) fn pick_port_pure(
+    statuses: &[asmi_core::ServeStatus],
+    explicit: Option<u16>,
+    engine_filter: Option<&str>,
+) -> Option<u16> {
+    if let Some(p) = explicit {
+        return Some(p);
+    }
+    for st in statuses {
+        if st.state != asmi_core::ServeState::Ready {
+            continue;
+        }
+        if let Some(want) = engine_filter {
+            if st.engine.to_string() != want {
+                continue;
+            }
+        }
+        return Some(st.port);
+    }
+    None
+}
+
+/// Pick the model-server port to proxy a /v1/* request to.
+///
+/// Wraps `pick_port_pure` with the live `serve_managers` snapshot. Tracing is
+/// kept here (not in the pure helper) so the logic remains side-effect free.
+async fn pick_proxy_port(
+    state: &AppState,
+    explicit: Option<u16>,
+    engine_filter: Option<&str>,
+) -> Option<u16> {
+    if let Some(p) = explicit {
+        tracing::debug!(port = p, "pick_proxy_port: explicit override");
+        return Some(p);
+    }
+    let managers = state.serve_managers.read().await;
+    let mut statuses = Vec::with_capacity(managers.len());
+    let mut considered: Vec<(u16, String, String)> = Vec::with_capacity(managers.len());
+    for mgr in managers.values() {
+        let st = mgr.status().await;
+        considered.push((st.port, st.engine.to_string(), format!("{:?}", st.state)));
+        statuses.push(st);
+    }
+    let picked = pick_port_pure(&statuses, None, engine_filter);
+    match picked {
+        Some(port) => {
+            tracing::info!(
+                port,
+                engine_filter = engine_filter.unwrap_or("none"),
+                "pick_proxy_port: selected"
+            );
+        }
+        None => {
+            tracing::warn!(
+                engine_filter = engine_filter.unwrap_or("none"),
+                considered = ?considered,
+                "pick_proxy_port: no eligible Ready slot"
+            );
+        }
+    }
+    picked
+}
+
+/// OpenAI-shaped 503 used when no eligible server is loaded. Matching the
+/// shape `{"error":{"message":..,"type":..}}` keeps OpenAI clients happy.
+fn no_model_loaded_response(detail: &str) -> axum::response::Response {
+    use axum::body::Body;
+    let body = format!(
+        r#"{{"error":{{"message":"No model loaded.{}","type":"server_error"}}}}"#,
+        if detail.is_empty() { String::new() } else { format!(" {detail}") }
+    );
+    axum::response::Response::builder()
+        .status(503)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// POST /v1/chat/completions — Proxy to the active model server.
+/// Streams SSE back with `delta.reasoning` renamed to `delta.reasoning_content`
+/// so AI SDK's OpenAI provider handles thinking natively.
+async fn v1_chat_completions_proxy(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+    req: axum::extract::Request,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::body::Body;
+    use futures::StreamExt;
+
+    let port = match pick_proxy_port(&state, q.port, q.engine.as_deref()).await {
+        Some(p) => p,
+        None => {
+            let hint = match q.engine.as_deref() {
+                Some(e) => format!("No Ready server matches engine={e}. Deploy from Topology or use /serve/load."),
+                None => "Deploy from Topology or use /serve/load.".to_string(),
+            };
+            return Ok(no_model_loaded_response(&hint));
+        }
+    };
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("Failed to read request body: {e}")))?;
+
+    let client = reqwest::Client::new();
+    let upstream = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("Content-Type", "application/json")
+        .body(body_bytes.to_vec())
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Model server on :{port} unreachable: {e}")))?;
+
+    if !upstream.status().is_success() {
+        let status = upstream.status().as_u16();
+        let body = upstream.text().await.unwrap_or_default();
+        return Ok(axum::response::Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap());
+    }
+
+    let is_stream = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"));
+
+    if !is_stream {
+        // Pure passthrough — AI SDK's openai-compatible provider handles
+        // both delta.reasoning and delta.reasoning_content natively.
+        let body = upstream.text().await.unwrap_or_default();
+        return Ok(axum::response::Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap());
+    }
+
+    // SSE passthrough — no transformation needed
+    let byte_stream = upstream.bytes_stream();
+    let transform = byte_stream.map(|chunk| match chunk {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+    });
+
+    Ok(axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from_stream(transform))
+        .unwrap())
+}
+
+/// GET /v1/models — Proxy to the active model server, inject context_length from config.json.
+///
+/// Port selection mirrors `v1_chat_completions_proxy`: explicit `?port=`
+/// wins, otherwise auto-pick the first Ready slot, optionally constrained
+/// by `?engine=`. Returns an OpenAI-shaped 503 when nothing qualifies — no
+/// more silent passthrough of upstream connection errors from an empty slot.
+async fn v1_models_proxy(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ServeQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::body::Body;
+
+    let port = match pick_proxy_port(&state, q.port, q.engine.as_deref()).await {
+        Some(p) => p,
+        None => {
+            let hint = match q.engine.as_deref() {
+                Some(e) => format!("No Ready server matches engine={e}."),
+                None => String::new(),
+            };
+            return Ok(no_model_loaded_response(&hint));
+        }
+    };
+
+    let res = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Model server on :{port} unreachable: {e}")))?;
+
+    let mut data = res.json::<serde_json::Value>().await
+        .map_err(|e| ApiError::Internal(format!("Invalid JSON from model server: {e}")))?;
+
+    if let Some(serde_json::Value::Array(models)) = data.get_mut("data") {
+        for model in models.iter_mut() {
+            if model.get("context_length").is_some() {
+                continue;
+            }
+            let model_id = model.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let cfg_path = std::path::Path::new(model_id).join("config.json");
+            if let Ok(cfg_str) = std::fs::read_to_string(&cfg_path) {
+                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+                    let ctx = cfg["max_position_embeddings"].as_u64()
+                        .or_else(|| cfg["text_config"]["max_position_embeddings"].as_u64());
+                    if let Some(ctx) = ctx {
+                        model.as_object_mut().unwrap().insert(
+                            "context_length".to_string(),
+                            serde_json::Value::Number(ctx.into()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let body = serde_json::to_vec(&data)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize models response: {e}")))?;
+    Ok(axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body))
+        .unwrap())
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
@@ -2953,6 +3378,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/serve/load", post(serve_load_handler))
         .route("/serve/stop", post(serve_stop_handler))
         .route("/serve/reload", post(serve_reload_handler))
+        .route("/launchd/list", get(launchd_list_handler))
+        .route("/launchd/describe", get(launchd_describe_handler))
         .route("/launchd/disable", post(launchd_disable_handler))
         .route("/launchd/enable", post(launchd_enable_handler))
         .route("/serve/share", post(serve_share_handler))
@@ -2982,5 +3409,82 @@ pub fn build_router(state: AppState) -> Router {
         // Autoresearch benchmark validation
         .route("/autoresearch/gate", get(autoresearch_gate_handler))
         .route("/autoresearch/reset", post(autoresearch_reset_handler))
+        // OpenAI-compatible proxy — routes to the active model server
+        .route("/v1/chat/completions", post(v1_chat_completions_proxy))
+        .route("/v1/models", get(v1_models_proxy))
+        // HuggingFace search proxy + model download manager
+        .route("/hf/search", get(crate::hf::search_handler))
+        .route("/models/download", post(crate::downloads::start_handler))
+        .route("/models/downloads", get(crate::downloads::list_handler))
+        .route("/models/download/{job_id}", get(crate::downloads::snapshot_handler))
+        .route("/models/download/{job_id}/progress", get(crate::downloads::progress_sse_handler))
         .with_state(state)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod pick_proxy_port_tests {
+    //! Selection contract for `pick_port_pure`.
+    //!
+    //! Lives as a unit test inside `daemon.rs` because apple-smi is a
+    //! binary-only crate — there is no `lib.rs` for `tests/*.rs` integration
+    //! tests to import from. Same-module unit tests can reach `pub(crate)`.
+
+    use super::pick_port_pure;
+    use asmi_core::{ServeBackend, ServeEngine, ServeState, ServeStatus};
+
+    fn fake_status(port: u16, engine: ServeEngine, state: ServeState) -> ServeStatus {
+        ServeStatus {
+            state,
+            model: if state == ServeState::Ready {
+                Some("/Users/ma/Models/X".to_string())
+            } else {
+                None
+            },
+            engine,
+            backend: ServeBackend::Single,
+            port,
+            pid: Some(1),
+            port_verified: true,
+            elapsed_ms: 0,
+            error: None,
+            launchd: None,
+            verified_inference: None,
+            verified_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn explicit_port_wins_even_if_not_ready() {
+        let statuses = vec![fake_status(19084, ServeEngine::MlxVlm, ServeState::Bare)];
+        assert_eq!(pick_port_pure(&statuses, Some(19084), None), Some(19084));
+    }
+
+    #[test]
+    fn auto_pick_skips_non_ready() {
+        let statuses = vec![
+            fake_status(19084, ServeEngine::MlxVlm, ServeState::Bare),
+            fake_status(19080, ServeEngine::MlxLm, ServeState::Ready),
+        ];
+        assert_eq!(pick_port_pure(&statuses, None, None), Some(19080));
+    }
+
+    #[test]
+    fn engine_filter_narrows_choice() {
+        let statuses = vec![
+            fake_status(19080, ServeEngine::MlxLm, ServeState::Ready),
+            fake_status(19084, ServeEngine::MlxVlm, ServeState::Ready),
+        ];
+        assert_eq!(
+            pick_port_pure(&statuses, None, Some("mlx_vlm")),
+            Some(19084)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_nothing_qualifies() {
+        let statuses = vec![fake_status(19084, ServeEngine::MlxVlm, ServeState::Bare)];
+        assert_eq!(pick_port_pure(&statuses, None, Some("mlx_lm")), None);
+    }
 }
