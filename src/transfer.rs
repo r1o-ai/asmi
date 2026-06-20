@@ -236,6 +236,8 @@ pub enum JacclCmd {
         /// Topology-resolved RDMA device on the peer (e.g. "rdma_en10").
         peer_device: Option<String>,
         reply: tokio::sync::oneshot::Sender<Result<i32, String>>,
+        /// Optional events channel for emitting Establish events on group init.
+        events_tx: Option<tokio::sync::broadcast::Sender<String>>,
     },
     /// Send data to rank `dst` on the group for `peer`.
     Send {
@@ -254,24 +256,24 @@ pub enum JacclCmd {
         reply: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
     },
     /// Probe group liveness for `peer`.
-    /// Handled by the worker loop and backed by jaccl_group_probe FFI;
-    /// the HTTP endpoint that sends this is not wired up yet.
-    #[allow(dead_code)]
+    /// Handled by the worker loop and backed by jaccl_group_probe FFI.
+    /// Now reachable via HeartbeatAll; individually callable in future.
     Probe {
         peer: String,
         reply: tokio::sync::oneshot::Sender<bool>,
     },
     /// Drop the group for `peer`, freeing PDs.
-    /// Worker-side handled; send-side endpoint pending (see Probe).
-    #[allow(dead_code)]
     DropGroup {
         peer: String,
     },
     /// Poison and cancel all pending ops on `peer`'s group.
-    /// Worker-side handled; send-side endpoint pending (see Probe).
-    #[allow(dead_code)]
     CancelPending {
         peer: String,
+    },
+    /// Probe all cached groups, emit events for each, drop stale ones.
+    /// The events_tx is passed in because the worker thread has no access to AppState.
+    HeartbeatAll {
+        events_tx: tokio::sync::broadcast::Sender<String>,
     },
     /// Bulk send a file — tight loop on the worker thread, no per-chunk channel hops.
     BulkSendFile {
@@ -331,7 +333,7 @@ impl JacclWorker {
 
         while let Ok(cmd) = rx.recv() {
             match cmd {
-                JacclCmd::GetOrInitGroup { peer, rank, coordinator_ip, coordinator_port, local_device, peer_device, reply } => {
+                JacclCmd::GetOrInitGroup { peer, rank, coordinator_ip, coordinator_port, local_device, peer_device, reply, events_tx } => {
                     // Check if we have a cached group that's alive
                     if let Some((group, port)) = groups.get(&peer) {
                         if group.probe() {
@@ -373,7 +375,15 @@ impl JacclWorker {
 
                     match result {
                         Some(group) => {
-                            groups.insert(peer, (group, port));
+                            groups.insert(peer.clone(), (group, port));
+                            if let Some(ref tx) = events_tx {
+                                let ev = ConnectionPoolEvent::Establish {
+                                    peer: peer.clone(),
+                                    device: local_device.clone(),
+                                    port,
+                                };
+                                let _ = tx.send(serde_json::to_string(&ev).unwrap_or_default());
+                            }
                             let _ = reply.send(Ok(port));
                         }
                         None => {
@@ -423,6 +433,47 @@ impl JacclWorker {
                     if let Some((group, _)) = groups.get(&peer) {
                         group.cancel_pending();
                     }
+                }
+
+                JacclCmd::HeartbeatAll { events_tx } => {
+                    let mut stale_peers: Vec<String> = Vec::new();
+
+                    for (peer, (group, _port)) in groups.iter() {
+                        if group.probe() {
+                            let ev = ConnectionPoolEvent::HeartbeatOk {
+                                peer: peer.clone(),
+                            };
+                            let _ = events_tx.send(serde_json::to_string(&ev).unwrap_or_default());
+                        } else {
+                            let ev = ConnectionPoolEvent::HeartbeatFail {
+                                peer: peer.clone(),
+                                reason: "probe returned false".into(),
+                            };
+                            let _ = events_tx.send(serde_json::to_string(&ev).unwrap_or_default());
+                            stale_peers.push(peer.clone());
+                        }
+                    }
+
+                    // Drop stale groups and emit PdReclaim events
+                    for peer in stale_peers {
+                        if let Some((group, _)) = groups.remove(&peer) {
+                            group.cancel_pending();
+                            drop(group);
+                            let ev = ConnectionPoolEvent::PdReclaim {
+                                peer: peer.clone(),
+                                remaining_groups: groups.len(),
+                            };
+                            let _ = events_tx.send(serde_json::to_string(&ev).unwrap_or_default());
+                        }
+                    }
+
+                    // PD budget snapshot
+                    let pd_result = jaccl_ffi::pd_probe_any_active();
+                    let ev = ConnectionPoolEvent::PdBudget {
+                        active: groups.len() as i32,
+                        probe_result: pd_result,
+                    };
+                    let _ = events_tx.send(serde_json::to_string(&ev).unwrap_or_default());
                 }
 
                 JacclCmd::BulkSendFile { peer, file_path, file_size, dst, progress, reply } => {
@@ -640,9 +691,10 @@ pub async fn transfer_handler(
     let jaccl_worker = state.jaccl_worker.clone();
     let topology_cache = state.topology_cache.clone();
     let hostname = state.hostname.clone();
+    let events_tx = state.events_tx.clone();
     let transfer_id = id.clone();
     tokio::spawn(async move {
-        run_transfer(transfers, transfer_id, jaccl_worker, topology_cache, hostname, req).await;
+        run_transfer(transfers, transfer_id, jaccl_worker, topology_cache, hostname, events_tx, req).await;
     });
 
     (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "started"})))
@@ -730,6 +782,7 @@ pub async fn transfer_accept_handler(
     let model_path = models_root.join(&req.model_dir);
 
     let jaccl_worker = state.jaccl_worker.clone();
+    let events_tx = state.events_tx.clone();
     let coordinator_ip = req.coordinator_ip.clone();
     let coordinator_port = req.coordinator_port;
     let model_dir = req.model_dir.clone();
@@ -744,6 +797,7 @@ pub async fn transfer_accept_handler(
             &model_path,
             &model_dir,
             jaccl_worker,
+            events_tx,
             peer_device,
             coordinator_device,
         ).await;
@@ -767,6 +821,7 @@ async fn run_transfer(
     jaccl_worker: std::sync::Arc<JacclWorker>,
     topology_cache: TopologyCache,
     local_hostname: String,
+    events_tx: tokio::sync::broadcast::Sender<String>,
     req: TransferRequest,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -813,7 +868,7 @@ async fn run_transfer(
         }
     });
 
-    transfer_pipeline(tx, jaccl_worker, topology_cache, &local_hostname, req).await;
+    transfer_pipeline(tx, jaccl_worker, topology_cache, &local_hostname, events_tx, req).await;
 }
 
 #[cfg(feature = "jaccl")]
@@ -822,6 +877,7 @@ async fn transfer_pipeline(
     jaccl_worker: std::sync::Arc<JacclWorker>,
     topology_cache: TopologyCache,
     local_hostname: &str,
+    events_tx: tokio::sync::broadcast::Sender<String>,
     req: TransferRequest,
 ) {
     use asmi_core::jaccl_ffi;
@@ -906,6 +962,7 @@ async fn transfer_pipeline(
         local_device: devices.as_ref().map(|(ld, _)| ld.clone()),
         peer_device: devices.as_ref().map(|(_, pd)| pd.clone()),
         reply: init_reply_tx,
+        events_tx: Some(events_tx.clone()),
     }) {
         let _ = tx.send(SseEvent::error(&e).to_sse_line()).await;
         return;
@@ -1017,6 +1074,7 @@ async fn accept_worker(
     model_path: &std::path::Path,
     model_dir: &str,
     jaccl_worker: std::sync::Arc<JacclWorker>,
+    events_tx: tokio::sync::broadcast::Sender<String>,
     peer_device: Option<String>,
     coordinator_device: Option<String>,
 ) {
@@ -1048,6 +1106,7 @@ async fn accept_worker(
         local_device: validated_local,
         peer_device: coordinator_device,
         reply: reply_tx,
+        events_tx: Some(events_tx.clone()),
     }) {
         tracing::error!("transfer/accept: worker send failed for {model_dir}: {e}");
         return;
