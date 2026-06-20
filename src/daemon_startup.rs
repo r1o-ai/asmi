@@ -184,10 +184,13 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                 }
 
                 // Inject lightweight serve-slot state into the snapshot.
-                // No model_cache access needed — slot_snapshot() is a pure RwLock read.
                 {
                     let mut slots = Vec::new();
                     for mgr in serve_managers.read().await.values() {
+                        // Refresh port_verified cache every 15s (lsof fork, not every tick)
+                        if mgr.needs_port_verify_refresh(std::time::Duration::from_secs(15)).await {
+                            mgr.refresh_port_verified().await;
+                        }
                         slots.push(mgr.slot_snapshot().await);
                     }
                     snap.serve_slots = slots;

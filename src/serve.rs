@@ -778,6 +778,31 @@ impl ServeManager {
         }
     }
 
+    /// Whether port_verified cache is stale and needs a refresh.
+    pub async fn needs_port_verify_refresh(&self, max_age: std::time::Duration) -> bool {
+        let s = self.inner.read().await;
+        if !matches!(s.state, ServeState::Ready | ServeState::Bare) { return false; }
+        if s.pid.is_none() { return false; }
+        match s.port_verified_at {
+            Some(at) => at.elapsed() > max_age,
+            None => true,
+        }
+    }
+
+    /// Run verify_port_owner and cache the result. Acquires write lock.
+    pub async fn refresh_port_verified(&self) {
+        let (pid, port, should_run) = {
+            let s = self.inner.read().await;
+            let should = matches!(s.state, ServeState::Ready | ServeState::Bare) && s.pid.is_some();
+            (s.pid, s.port, should)
+        };
+        if !should_run { return; }
+        let verified = verify_port_owner(pid.unwrap(), port.unwrap_or(19080)).await;
+        let mut s = self.inner.write().await;
+        s.port_verified_cached = verified;
+        s.port_verified_at = Some(std::time::Instant::now());
+    }
+
     /// Get a read-only status snapshot.
     pub async fn status(&self) -> ServeStatus {
         let s = self.inner.read().await;
