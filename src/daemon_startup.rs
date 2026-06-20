@@ -490,6 +490,34 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         active_transfers: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
+    // ── Boot-time pool scan (informational — no PDs allocated) ────────
+    {
+        let topo = app_state.topology_cache.read().await;
+        let link_count = topo.as_ref().map(|(r, _)| r.links.len()).unwrap_or(0);
+        let ev = crate::transfer::ConnectionPoolEvent::PoolBoot {
+            known_links: link_count,
+        };
+        let _ = app_state.events_tx.send(serde_json::to_string(&ev).unwrap_or_default());
+        tracing::info!(links = link_count, "RDMA connection pool boot scan");
+    }
+
+    // ── 120-second heartbeat interval (safety net for software staleness) ──
+    #[cfg(feature = "jaccl")]
+    {
+        let jaccl_worker = app_state.jaccl_worker.clone();
+        let events_tx = app_state.events_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                let _ = jaccl_worker.send(crate::transfer::JacclCmd::HeartbeatAll {
+                    events_tx: events_tx.clone(),
+                });
+            }
+        });
+    }
+
     let app = daemon::build_router(app_state);
 
     // Bonjour publisher — make this node discoverable on the LAN as
