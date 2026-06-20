@@ -183,6 +183,16 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                     mgr.check_port_adoption().await;
                 }
 
+                // Inject lightweight serve-slot state into the snapshot.
+                // No model_cache access needed — slot_snapshot() is a pure RwLock read.
+                {
+                    let mut slots = Vec::new();
+                    for mgr in serve_managers.read().await.values() {
+                        slots.push(mgr.slot_snapshot().await);
+                    }
+                    snap.serve_slots = slots;
+                }
+
                 tracing::debug!(
                     cpu = format!("{:.1}%", snap.cpu_percent),
                     gpu = format!("{:.1}%", snap.gpu_percent),
