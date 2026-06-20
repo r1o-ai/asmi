@@ -309,8 +309,12 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
             tokio::spawn(async move {
                 let mut last_hash: u64 = 0;
                 // Union-merge state: track known links and how many consecutive
-                // scans each has been missing. A link is evicted only after 3
-                // consecutive misses — prevents SSH timeout flicker.
+                // scans each has been missing. A link is evicted only after
+                // EVICT_AFTER consecutive misses. Native discovery is extremely
+                // flaky (0-3 of 6 links per scan), so the threshold must be
+                // high enough to ride out extended cold streaks. 10 × 60s = 10
+                // minutes — physical cables don't disappear.
+                const EVICT_AFTER: u32 = 10;
                 let mut known_links: std::collections::HashMap<String, crate::topology::TopologyLink> =
                     std::collections::HashMap::new();
                 let mut missing_streak: std::collections::HashMap<String, u32> =
@@ -376,9 +380,9 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                             }
                         }
 
-                        // Evict links missing for 3+ consecutive scans
+                        // Evict links missing for EVICT_AFTER consecutive scans
                         known_links.retain(|k, _| {
-                            missing_streak.get(k).copied().unwrap_or(0) < 3
+                            missing_streak.get(k).copied().unwrap_or(0) < EVICT_AFTER
                         });
                         missing_streak.retain(|k, _| known_links.contains_key(k));
 

@@ -1560,6 +1560,8 @@ mod union_merge_tests {
         }
     }
 
+    const EVICT_AFTER: u32 = 10;
+
     fn simulate_merge(
         known_links: &mut HashMap<String, TopologyLink>,
         missing_streak: &mut HashMap<String, u32>,
@@ -1580,7 +1582,7 @@ mod union_merge_tests {
             }
         }
 
-        known_links.retain(|k, _| missing_streak.get(k).copied().unwrap_or(0) < 3);
+        known_links.retain(|k, _| missing_streak.get(k).copied().unwrap_or(0) < EVICT_AFTER);
         missing_streak.retain(|k, _| known_links.contains_key(k));
     }
 
@@ -1601,7 +1603,7 @@ mod union_merge_tests {
     }
 
     #[test]
-    fn test_link_evicted_after_3_misses() {
+    fn test_link_evicted_after_threshold_misses() {
         let mut known = HashMap::new();
         let mut streaks = HashMap::new();
 
@@ -1612,15 +1614,15 @@ mod union_merge_tests {
         simulate_merge(&mut known, &mut streaks, &[link_a.clone(), link_b.clone()]);
         assert_eq!(known.len(), 2);
 
-        // Scans 2-3: only link_b seen (link_a missing 2x)
-        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
-        assert_eq!(known.len(), 2, "link_a should survive 1 miss");
-        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
-        assert_eq!(known.len(), 2, "link_a should survive 2 misses");
+        // Miss link_a for EVICT_AFTER-1 scans — should survive
+        for i in 1..EVICT_AFTER {
+            simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+            assert_eq!(known.len(), 2, "link_a should survive {i} misses (threshold={EVICT_AFTER})");
+        }
 
-        // Scan 4: still only link_b — link_a at 3 misses → evicted
+        // One more miss → evicted
         simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
-        assert_eq!(known.len(), 1, "link_a should be evicted after 3 misses");
+        assert_eq!(known.len(), 1, "link_a should be evicted after {EVICT_AFTER} misses");
         assert!(known.values().any(|l| l.node_b == "m3u3"), "link_b should remain");
     }
 
@@ -1654,12 +1656,13 @@ mod union_merge_tests {
         let link_a = make_link("hub", "rdma_en4", "m3u2", "rdma_en4");
         simulate_merge(&mut known, &mut streaks, &[link_a.clone()]);
 
-        // Empty scan 3 times → eviction
+        // Empty scans up to threshold → eviction
+        for _ in 0..(EVICT_AFTER - 1) {
+            simulate_merge(&mut known, &mut streaks, &[]);
+        }
+        assert_eq!(known.len(), 1, "still present after {} empty scans", EVICT_AFTER - 1);
         simulate_merge(&mut known, &mut streaks, &[]);
-        simulate_merge(&mut known, &mut streaks, &[]);
-        assert_eq!(known.len(), 1, "still present after 2 empty scans");
-        simulate_merge(&mut known, &mut streaks, &[]);
-        assert_eq!(known.len(), 0, "evicted after 3 empty scans");
+        assert_eq!(known.len(), 0, "evicted after {EVICT_AFTER} empty scans");
     }
 
     #[test]
@@ -1702,7 +1705,7 @@ mod union_merge_tests {
         simulate_merge(&mut known, &mut streaks, &[link_a.clone()]);
 
         // Evict link_a
-        for _ in 0..3 {
+        for _ in 0..EVICT_AFTER {
             simulate_merge(&mut known, &mut streaks, &[]);
         }
         assert_eq!(known.len(), 0);
