@@ -563,10 +563,11 @@ pub async fn trigger_config_sync(state: &AppState) -> serde_json::Value {
         let mut tb = state.thunderbolt_cache.write().await;
         *tb = None;
     }
-    {
-        let mut topo = state.topology_cache.write().await;
-        *topo = None;
-    }
+    // NOTE: topology_cache is NOT cleared here. The union-merge scan loop
+    // manages the cache and calls /config/sync when the hash changes; clearing
+    // the cache here would create a vicious cycle (sync clears → handler returns
+    // "not yet scanned" for 60s until next scan → scan writes → hash changes →
+    // sync clears again). The scan loop's next iteration will update the cache.
 
     let hostfile_path = std::env::var("HOME")
         .map(|h| format!("{h}/.r1o/hostfiles/auto.json"))
