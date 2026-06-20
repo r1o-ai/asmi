@@ -16,6 +16,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 #include <json.hpp>
 
@@ -157,34 +159,129 @@ jaccl_group_t jaccl_init_mesh_auto(
         auto& ibv = jaccl::ibv();
         if (!ibv.is_available()) return nullptr;
 
-        // Discover first available RDMA device
+        // Discover the RDMA device whose /30 subnet reaches the coordinator.
+        // Each TB5 RDMA link gets a /30 (4-addr) subnet: e.g. 192.168.10.0/30
+        // has .0 (network), .1 (hub), .2 (peer), .3 (broadcast). Two IPs on
+        // the same /30 are on the same physical cable.
+        //
+        // Strategy: enumerate local interfaces with 192.168.10.x IPs, find the
+        // one whose /30 base matches the coordinator IP's /30 base. That
+        // interface name (enN) maps to rdma_enN.
         int num_devices = 0;
         ibv_device** devices = ibv.get_device_list(&num_devices);
         if (!devices || num_devices == 0) return nullptr;
 
-        std::string active_device;
+        uint32_t coord_addr = 0;
+        inet_pton(AF_INET, coordinator_ip, &coord_addr);
+        uint32_t coord_host = ntohl(coord_addr);
+        uint32_t coord_subnet = coord_host & ~3u; // /30 mask
+
+        // Flush stale ARP for the coordinator IP so the kernel doesn't
+        // route through a cached (wrong) interface from a previous session.
+        {
+            std::string flush_cmd = "arp -d " + std::string(coordinator_ip) + " 2>/dev/null";
+            system(flush_cmd.c_str());
+        }
+
+        // Build a map: interface name → RDMA device name for active devices
+        std::unordered_map<std::string, std::string> iface_to_rdma;
         for (int i = 0; i < num_devices; i++) {
             ibv_context* ctx = ibv.open_device(devices[i]);
             if (!ctx) continue;
-            // Check if PD can be allocated (device is usable)
-            ibv_pd* pd = ibv.alloc_pd(ctx);
-            if (pd) {
-                active_device = ibv.get_device_name(devices[i]);
-                ibv.dealloc_pd(pd);
-                ibv.close_device(ctx);
-                break;
-            }
+            ibv_port_attr pattr;
+            bool active = (ibv.query_port(ctx, 1, &pattr) == 0 &&
+                           pattr.state == IBV_PORT_ACTIVE);
             ibv.close_device(ctx);
+            if (!active) continue;
+
+            std::string rdma_name = ibv.get_device_name(devices[i]);
+            // rdma_enN → enN
+            if (rdma_name.rfind("rdma_", 0) == 0) {
+                std::string iface = rdma_name.substr(5);
+                iface_to_rdma[iface] = rdma_name;
+            }
         }
         ibv.free_device_list(devices);
 
-        if (active_device.empty()) return nullptr;
+        // Find which local interface is on the coordinator's /30 subnet
+        std::string matched_device;
+        struct ifaddrs* ifap = nullptr;
+        if (getifaddrs(&ifap) == 0) {
+            for (struct ifaddrs* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+                    continue;
+                auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+                uint32_t ip_host = ntohl(sin->sin_addr.s_addr);
+                uint32_t ip_subnet = ip_host & ~3u;
+
+                if (ip_subnet == coord_subnet && ip_host != coord_host) {
+                    auto it = iface_to_rdma.find(ifa->ifa_name);
+                    if (it != iface_to_rdma.end()) {
+                        matched_device = it->second;
+                        break;
+                    }
+                }
+            }
+            freeifaddrs(ifap);
+        }
+
+        // Fallback: if we're the coordinator ourselves, find the device
+        // whose subnet matches. The coordinator's own IP IS on the subnet.
+        if (matched_device.empty()) {
+            if (getifaddrs(&ifap) == 0) {
+                for (struct ifaddrs* ifa = ifap; ifa; ifa = ifa->ifa_next) {
+                    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+                        continue;
+                    auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+                    uint32_t ip_host = ntohl(sin->sin_addr.s_addr);
+                    uint32_t ip_subnet = ip_host & ~3u;
+
+                    if (ip_subnet == coord_subnet) {
+                        auto it = iface_to_rdma.find(ifa->ifa_name);
+                        if (it != iface_to_rdma.end()) {
+                            matched_device = it->second;
+                            break;
+                        }
+                    }
+                }
+                freeifaddrs(ifap);
+            }
+        }
+
+        // Last resort: first active device (original behavior)
+        if (matched_device.empty()) {
+            std::cerr << "[jaccl-shim] auto-discover: no /30 match for coord="
+                      << coordinator_ip << " (subnet=." << (coord_subnet & 0xFF)
+                      << ") — local IPs:";
+            struct ifaddrs* dbg_ifap = nullptr;
+            if (getifaddrs(&dbg_ifap) == 0) {
+                for (struct ifaddrs* ifa = dbg_ifap; ifa; ifa = ifa->ifa_next) {
+                    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+                    auto* s = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+                    uint32_t h = ntohl(s->sin_addr.s_addr);
+                    if ((h >> 24) == 192 && ((h >> 16) & 0xFF) == 168 && ((h >> 8) & 0xFF) == 10)
+                        std::cerr << " " << ifa->ifa_name << "=." << (h & 0xFF);
+                }
+                freeifaddrs(dbg_ifap);
+            }
+            std::cerr << " — falling back to first active device" << std::endl;
+
+            for (auto& [iface, rdma] : iface_to_rdma) {
+                matched_device = rdma;
+                break;
+            }
+        }
+
+        if (matched_device.empty()) return nullptr;
+
+        std::cerr << "[jaccl-shim] auto-discover: coord=" << coordinator_ip
+                  << " → device=" << matched_device << std::endl;
 
         // Build device_names on the heap — shared ownership so the async
         // lambda outlives this stack frame on timeout (Bug 1 fix, Phase 1).
         auto device_names = std::make_shared<std::vector<std::string>>(world_size);
         for (int i = 0; i < world_size; i++) {
-            (*device_names)[i] = (i == rank) ? "" : active_device;
+            (*device_names)[i] = (i == rank) ? "" : matched_device;
         }
 
         // Build coordinator string on the heap (same reason)
