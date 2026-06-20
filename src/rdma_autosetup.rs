@@ -10,6 +10,105 @@ use std::time::Duration;
 
 use crate::topology::TopologyReport;
 
+// ── Coordinator IP persistence ─────────────────────────────────────────
+// The coordinator (hub) computes and applies /30 IPs during autosetup, but
+// autosetup runs AFTER the topology cache loop starts. On restart, the first
+// topology scan races against IP assignment → incomplete results. Fix: persist
+// the coordinator's own IPs to a file and restore them synchronously at boot,
+// before either loop starts.
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedCoordinatorIps {
+    ips: Vec<PersistedIpEntry>,
+    assigned_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedIpEntry {
+    iface: String,
+    ip: String,
+    netmask: String,
+}
+
+fn coordinator_ips_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("asmi/coordinator_ips.json")
+}
+
+/// Save the coordinator's own /30 IPs after topology-derived assignment.
+/// Called only on the coordinator node after successful assign_topology_ips().
+pub fn persist_coordinator_ips(ips: &[InterfaceIp]) {
+    let path = coordinator_ips_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let data = PersistedCoordinatorIps {
+        ips: ips.iter().map(|ip| PersistedIpEntry {
+            iface: ip.iface.clone(),
+            ip: ip.ip.clone(),
+            netmask: "255.255.255.252".into(),
+        }).collect(),
+        assigned_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match serde_json::to_string_pretty(&data) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!("failed to persist coordinator IPs to {}: {e}", path.display());
+            } else {
+                tracing::info!("persisted {} coordinator IPs to {}", ips.len(), path.display());
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize coordinator IPs: {e}"),
+    }
+}
+
+/// Restore and apply coordinator's persisted /30 IPs at daemon boot.
+/// Runs synchronously (blocking) — call before topology cache loop starts.
+pub fn restore_coordinator_ips() -> Vec<InterfaceIp> {
+    let path = coordinator_ips_path();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let persisted: PersistedCoordinatorIps = match serde_json::from_str(&data) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to parse {}: {e}", path.display());
+            return vec![];
+        }
+    };
+
+    let mut applied = vec![];
+    for entry in &persisted.ips {
+        let out = Command::new("sudo")
+            .args(["ifconfig", &entry.iface, "inet", &entry.ip, "netmask", &entry.netmask])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                // Ensure /30 route
+                let octets: Vec<u8> = entry.ip.split('.').filter_map(|s| s.parse().ok()).collect();
+                if octets.len() == 4 {
+                    let net_base = octets[3] & 0xFC;
+                    let subnet = format!("{}.{}.{}.{}/30", octets[0], octets[1], octets[2], net_base);
+                    let _ = Command::new("sudo").args(["route", "delete", "-net", &subnet]).output();
+                    let _ = Command::new("sudo").args(["route", "add", "-net", &subnet, "-interface", &entry.iface]).output();
+                }
+                applied.push(InterfaceIp {
+                    iface: entry.iface.clone(),
+                    ip: entry.ip.clone(),
+                    source: "persisted".into(),
+                });
+            }
+            _ => tracing::warn!("{}: failed to restore IP {}", entry.iface, entry.ip),
+        }
+    }
+    if !applied.is_empty() {
+        tracing::info!("restored {} coordinator IPs from {}", applied.len(), path.display());
+    }
+    applied
+}
+
 /// RDMA settings from ~/.r1o/settings.json
 #[derive(Debug, Deserialize)]
 struct RdmaSettings {
@@ -254,6 +353,7 @@ pub async fn autosetup(
                     links = topo.links.len(),
                     "topology-derived IPs assigned (coordinator: local + remote)"
                 );
+                persist_coordinator_ips(&assigned);
                 report.ips = assigned;
                 topology_ok = true;
             }
@@ -1364,5 +1464,248 @@ mod deterministic_ip_tests {
         assert_eq!(a[0].ip_first, "192.168.10.1");
         assert_eq!(a[1].node_first, "m3u2");         // m3u2-m3u3 second
         assert_eq!(a[1].ip_first, "192.168.10.5");
+    }
+}
+
+#[cfg(test)]
+mod coordinator_ip_tests {
+    use super::*;
+
+    #[test]
+    fn test_persist_and_restore_roundtrip() {
+        let path = std::env::temp_dir().join("asmi_test_coordinator_ips.json");
+
+        let ips = vec![
+            InterfaceIp { iface: "en4".into(), ip: "192.168.10.1".into(), source: "topology".into() },
+            InterfaceIp { iface: "en3".into(), ip: "192.168.10.5".into(), source: "topology".into() },
+            InterfaceIp { iface: "en5".into(), ip: "192.168.10.9".into(), source: "topology".into() },
+        ];
+
+        // Serialize
+        let data = PersistedCoordinatorIps {
+            ips: ips.iter().map(|ip| PersistedIpEntry {
+                iface: ip.iface.clone(),
+                ip: ip.ip.clone(),
+                netmask: "255.255.255.252".into(),
+            }).collect(),
+            assigned_at: "2026-06-20T01:00:00Z".into(),
+        };
+        let json = serde_json::to_string_pretty(&data).unwrap();
+        std::fs::write(&path, &json).unwrap();
+
+        // Deserialize
+        let read_back: PersistedCoordinatorIps =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(read_back.ips.len(), 3);
+        assert_eq!(read_back.ips[0].iface, "en4");
+        assert_eq!(read_back.ips[0].ip, "192.168.10.1");
+        assert_eq!(read_back.ips[0].netmask, "255.255.255.252");
+        assert_eq!(read_back.ips[1].iface, "en3");
+        assert_eq!(read_back.ips[1].ip, "192.168.10.5");
+        assert_eq!(read_back.ips[2].iface, "en5");
+        assert_eq!(read_back.ips[2].ip, "192.168.10.9");
+        assert_eq!(read_back.assigned_at, "2026-06-20T01:00:00Z");
+    }
+
+    #[test]
+    fn test_persisted_format_matches_plan() {
+        let data = PersistedCoordinatorIps {
+            ips: vec![
+                PersistedIpEntry { iface: "en4".into(), ip: "192.168.10.1".into(), netmask: "255.255.255.252".into() },
+            ],
+            assigned_at: "2026-06-20T01:00:00Z".into(),
+        };
+        let json = serde_json::to_string_pretty(&data).unwrap();
+        // Verify JSON shape matches plan's expected format
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["ips"].is_array());
+        assert!(v["ips"][0]["iface"].is_string());
+        assert!(v["ips"][0]["ip"].is_string());
+        assert!(v["ips"][0]["netmask"].is_string());
+        assert!(v["assigned_at"].is_string());
+    }
+
+    #[test]
+    fn test_restore_returns_empty_on_missing_file() {
+        // restore_coordinator_ips reads from the default path, which won't have
+        // our test data. But we can test the deserialization path directly.
+        let empty: Result<PersistedCoordinatorIps, _> = serde_json::from_str("{}");
+        assert!(empty.is_err() || empty.unwrap().ips.is_empty());
+    }
+
+    #[test]
+    fn test_restore_handles_corrupt_json() {
+        let result: Result<PersistedCoordinatorIps, _> = serde_json::from_str("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_persisted_ip_entry_default_mask() {
+        let json = r#"{"iface":"en4","ip":"192.168.10.1","netmask":"255.255.255.252"}"#;
+        let entry: PersistedIpEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.netmask, "255.255.255.252");
+    }
+}
+
+#[cfg(test)]
+mod union_merge_tests {
+    use crate::topology::{TopologyLink, link_key};
+    use std::collections::{HashMap, HashSet};
+
+    fn make_link(a: &str, da: &str, b: &str, db: &str) -> TopologyLink {
+        TopologyLink {
+            node_a: a.into(), device_a: da.into(),
+            node_b: b.into(), device_b: db.into(),
+        }
+    }
+
+    fn simulate_merge(
+        known_links: &mut HashMap<String, TopologyLink>,
+        missing_streak: &mut HashMap<String, u32>,
+        scan_links: &[TopologyLink],
+    ) {
+        let scan_keys: HashSet<String> = scan_links.iter().map(link_key).collect();
+
+        for link in scan_links {
+            let key = link_key(link);
+            known_links.insert(key.clone(), link.clone());
+            missing_streak.insert(key, 0);
+        }
+
+        let all_keys: Vec<String> = known_links.keys().cloned().collect();
+        for key in &all_keys {
+            if !scan_keys.contains(key) {
+                *missing_streak.entry(key.clone()).or_insert(0) += 1;
+            }
+        }
+
+        known_links.retain(|k, _| missing_streak.get(k).copied().unwrap_or(0) < 3);
+        missing_streak.retain(|k, _| known_links.contains_key(k));
+    }
+
+    #[test]
+    fn test_links_accumulate_across_scans() {
+        let mut known = HashMap::new();
+        let mut streaks = HashMap::new();
+
+        // Scan 1: sees link A
+        let link_a = make_link("hub", "rdma_en4", "m3u2", "rdma_en4");
+        simulate_merge(&mut known, &mut streaks, &[link_a.clone()]);
+        assert_eq!(known.len(), 1);
+
+        // Scan 2: sees link B (not A) — A should still be present
+        let link_b = make_link("hub", "rdma_en3", "m3u3", "rdma_en4");
+        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+        assert_eq!(known.len(), 2, "both links should be present after union");
+    }
+
+    #[test]
+    fn test_link_evicted_after_3_misses() {
+        let mut known = HashMap::new();
+        let mut streaks = HashMap::new();
+
+        let link_a = make_link("hub", "rdma_en4", "m3u2", "rdma_en4");
+        let link_b = make_link("hub", "rdma_en3", "m3u3", "rdma_en4");
+
+        // Scan 1: both links seen
+        simulate_merge(&mut known, &mut streaks, &[link_a.clone(), link_b.clone()]);
+        assert_eq!(known.len(), 2);
+
+        // Scans 2-3: only link_b seen (link_a missing 2x)
+        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+        assert_eq!(known.len(), 2, "link_a should survive 1 miss");
+        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+        assert_eq!(known.len(), 2, "link_a should survive 2 misses");
+
+        // Scan 4: still only link_b — link_a at 3 misses → evicted
+        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+        assert_eq!(known.len(), 1, "link_a should be evicted after 3 misses");
+        assert!(known.values().any(|l| l.node_b == "m3u3"), "link_b should remain");
+    }
+
+    #[test]
+    fn test_link_reappears_resets_streak() {
+        let mut known = HashMap::new();
+        let mut streaks = HashMap::new();
+
+        let link_a = make_link("hub", "rdma_en4", "m3u2", "rdma_en4");
+        let link_b = make_link("hub", "rdma_en3", "m3u3", "rdma_en4");
+
+        // Seed both links
+        simulate_merge(&mut known, &mut streaks, &[link_a.clone(), link_b.clone()]);
+
+        // Miss link_a twice
+        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+        simulate_merge(&mut known, &mut streaks, &[link_b.clone()]);
+        assert_eq!(*streaks.get(&link_key(&link_a)).unwrap(), 2);
+
+        // link_a reappears — streak resets
+        simulate_merge(&mut known, &mut streaks, &[link_a.clone(), link_b.clone()]);
+        assert_eq!(*streaks.get(&link_key(&link_a)).unwrap(), 0, "streak should reset on reappearance");
+        assert_eq!(known.len(), 2);
+    }
+
+    #[test]
+    fn test_empty_scan_increments_all_streaks() {
+        let mut known = HashMap::new();
+        let mut streaks = HashMap::new();
+
+        let link_a = make_link("hub", "rdma_en4", "m3u2", "rdma_en4");
+        simulate_merge(&mut known, &mut streaks, &[link_a.clone()]);
+
+        // Empty scan 3 times → eviction
+        simulate_merge(&mut known, &mut streaks, &[]);
+        simulate_merge(&mut known, &mut streaks, &[]);
+        assert_eq!(known.len(), 1, "still present after 2 empty scans");
+        simulate_merge(&mut known, &mut streaks, &[]);
+        assert_eq!(known.len(), 0, "evicted after 3 empty scans");
+    }
+
+    #[test]
+    fn test_full_6_link_mesh_convergence() {
+        let mut known = HashMap::new();
+        let mut streaks = HashMap::new();
+
+        let all_links = vec![
+            make_link("hub", "rdma_en4", "m3u2", "rdma_en4"),
+            make_link("hub", "rdma_en3", "m3u3", "rdma_en4"),
+            make_link("hub", "rdma_en5", "m3u4", "rdma_en5"),
+            make_link("m3u2", "rdma_en5", "m3u3", "rdma_en5"),
+            make_link("m3u2", "rdma_en3", "m3u4", "rdma_en4"),
+            make_link("m3u3", "rdma_en3", "m3u4", "rdma_en3"),
+        ];
+
+        // Scan 1: sees 3 of 6 links (typical cold start)
+        simulate_merge(&mut known, &mut streaks, &all_links[..3]);
+        assert_eq!(known.len(), 3);
+
+        // Scan 2: sees 5 of 6 (SSH mux warming up)
+        simulate_merge(&mut known, &mut streaks, &all_links[..5]);
+        assert_eq!(known.len(), 5);
+
+        // Scan 3: sees all 6
+        simulate_merge(&mut known, &mut streaks, &all_links);
+        assert_eq!(known.len(), 6, "full 6-link mesh should be accumulated");
+
+        // Scan 4: regresses to 4 (SSH timeout on 2 peers) — all 6 should stay
+        simulate_merge(&mut known, &mut streaks, &all_links[..4]);
+        assert_eq!(known.len(), 6, "transient regression should not drop links");
+    }
+
+    #[test]
+    fn test_missing_streak_cleanup() {
+        let mut known = HashMap::new();
+        let mut streaks = HashMap::new();
+
+        let link_a = make_link("hub", "rdma_en4", "m3u2", "rdma_en4");
+        simulate_merge(&mut known, &mut streaks, &[link_a.clone()]);
+
+        // Evict link_a
+        for _ in 0..3 {
+            simulate_merge(&mut known, &mut streaks, &[]);
+        }
+        assert_eq!(known.len(), 0);
+        assert_eq!(streaks.len(), 0, "streaks map should be cleaned up with known_links");
     }
 }

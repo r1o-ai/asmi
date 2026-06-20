@@ -282,6 +282,19 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         });
     }
 
+    // Restore coordinator's persisted RDMA IPs BEFORE topology scan starts.
+    // Autosetup runs later (async, can take 60s for stable topology); without
+    // this, the first scan races against IP assignment and sees 0-3 links.
+    if cluster_hub {
+        let restored = rdma_autosetup::restore_coordinator_ips();
+        if !restored.is_empty() {
+            tracing::info!(
+                count = restored.len(),
+                "coordinator IPs restored from disk (pre-topology)"
+            );
+        }
+    }
+
     // Topology cache — runs discover_topology (native first, mlx/ARP fallback) every 60s (only in cluster hub mode)
     let topology_cache: Arc<tokio::sync::RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>> =
         Arc::new(tokio::sync::RwLock::new(None));
@@ -295,35 +308,105 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
             let port = port;
             tokio::spawn(async move {
                 let mut last_hash: u64 = 0;
+                // Union-merge state: track known links and how many consecutive
+                // scans each has been missing. A link is evicted only after 3
+                // consecutive misses — prevents SSH timeout flicker.
+                let mut known_links: std::collections::HashMap<String, crate::topology::TopologyLink> =
+                    std::collections::HashMap::new();
+                let mut missing_streak: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
+                let mut last_link_count: usize = 0;
+
                 loop {
                     let nodes = topo_nodes.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::topology::discover_topology(&nodes, "jaccl")
-                    }).await;
-                    match result {
-                        Ok(Ok(report)) => {
-                            let new_hash = crate::daemon::topology_hash(&report);
-                            tracing::info!(
-                                nodes = report.nodes.len(),
-                                links = report.links.len(),
-                                jaccl_ready = report.jaccl_ready,
-                                "topology scan complete"
+                    let mut report_opt = {
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::topology::discover_topology(&nodes, "jaccl")
+                        }).await;
+                        match result {
+                            Ok(Ok(r)) => Some(r),
+                            Ok(Err(e)) => { tracing::warn!(error = %e, "topology scan failed"); None }
+                            Err(e) => { tracing::warn!(error = %e, "topology task panicked"); None }
+                        }
+                    };
+
+                    // Retry on regression: if this scan found fewer links than
+                    // the previous one, it's likely an SSH/HTTP timeout — retry
+                    // once after a short pause.
+                    if let Some(ref report) = report_opt {
+                        if report.links.len() < last_link_count && last_link_count > 0 {
+                            tracing::warn!(
+                                "topology: {} links (was {}), retrying in 3s...",
+                                report.links.len(), last_link_count
                             );
-                            *topo_cache.write().await = Some((report, std::time::Instant::now()));
-                            if new_hash != last_hash && last_hash != 0 {
-                                tracing::info!("TB5 topology changed — triggering hostfile regen");
-                                let client = reqwest::Client::new();
-                                let _ = client.post(format!("http://127.0.0.1:{port}/config/sync")).send().await;
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            let nodes2 = topo_nodes.clone();
+                            let retry = tokio::task::spawn_blocking(move || {
+                                crate::topology::discover_topology(&nodes2, "jaccl")
+                            }).await;
+                            if let Ok(Ok(retry_report)) = retry {
+                                if retry_report.links.len() > report.links.len() {
+                                    tracing::info!(
+                                        "topology retry: {} links (improved from {})",
+                                        retry_report.links.len(), report.links.len()
+                                    );
+                                    report_opt = Some(retry_report);
+                                }
                             }
-                            last_hash = new_hash;
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(error = %e, "topology scan failed");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "topology task panicked");
                         }
                     }
+
+                    if let Some(report) = report_opt {
+                        // Union-merge: add new links, track missing streaks
+                        let scan_keys: std::collections::HashSet<String> = report.links.iter()
+                            .map(crate::topology::link_key)
+                            .collect();
+
+                        for link in &report.links {
+                            let key = crate::topology::link_key(link);
+                            known_links.insert(key.clone(), link.clone());
+                            missing_streak.insert(key, 0);
+                        }
+
+                        // Increment missing streak for links not in this scan
+                        let all_keys: Vec<String> = known_links.keys().cloned().collect();
+                        for key in &all_keys {
+                            if !scan_keys.contains(key) {
+                                *missing_streak.entry(key.clone()).or_insert(0) += 1;
+                            }
+                        }
+
+                        // Evict links missing for 3+ consecutive scans
+                        known_links.retain(|k, _| {
+                            missing_streak.get(k).copied().unwrap_or(0) < 3
+                        });
+                        missing_streak.retain(|k, _| known_links.contains_key(k));
+
+                        // Build merged report with accumulated links
+                        let merged_links: Vec<crate::topology::TopologyLink> =
+                            known_links.values().cloned().collect();
+                        let merged_report = crate::topology::TopologyReport {
+                            links: merged_links,
+                            ..report
+                        };
+
+                        last_link_count = merged_report.links.len();
+                        let new_hash = crate::daemon::topology_hash(&merged_report);
+                        tracing::info!(
+                            nodes = merged_report.nodes.len(),
+                            links = merged_report.links.len(),
+                            jaccl_ready = merged_report.jaccl_ready,
+                            "topology scan complete (union-merged)"
+                        );
+                        *topo_cache.write().await = Some((merged_report, std::time::Instant::now()));
+                        if new_hash != last_hash && last_hash != 0 {
+                            tracing::info!("TB5 topology changed — triggering hostfile regen");
+                            let client = reqwest::Client::new();
+                            let _ = client.post(format!("http://127.0.0.1:{port}/config/sync")).send().await;
+                        }
+                        last_hash = new_hash;
+                    }
+
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             });
