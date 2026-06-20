@@ -729,6 +729,7 @@ async fn collect_via_ssh(
         },
         rdma: rdma_status,
         interface_ips,
+        serve_slots: Vec::new(),
     }
 }
 
