@@ -4,6 +4,8 @@ mod cli;
 mod daemon;
 mod daemon_startup;
 mod launchd;
+#[cfg(feature = "jaccl")]
+mod link_watcher;
 mod rdma_autosetup;
 mod serve;
 mod setup;

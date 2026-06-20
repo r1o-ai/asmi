@@ -518,6 +518,42 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         });
     }
 
+    // ── SCDynamicStore link watcher (cable plug/unplug detection) ──────
+    #[cfg(feature = "jaccl")]
+    {
+        let tb_ifaces: Vec<String> = {
+            let topo = app_state.topology_cache.read().await;
+            topo.as_ref()
+                .map(|(r, _)| {
+                    // Extract network interface names from RDMA device names.
+                    // TopologyLink has device_a/device_b like "rdma_en15" —
+                    // strip the "rdma_" prefix to get the network interface name.
+                    let mut ifaces = std::collections::HashSet::new();
+                    for link in &r.links {
+                        if let Some(iface) = link.device_a.strip_prefix("rdma_") {
+                            ifaces.insert(iface.to_string());
+                        }
+                        if let Some(iface) = link.device_b.strip_prefix("rdma_") {
+                            ifaces.insert(iface.to_string());
+                        }
+                    }
+                    ifaces.into_iter().collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        if !tb_ifaces.is_empty() {
+            let webhook_url = std::env::var("ASMI_ALERT_WEBHOOK").ok();
+            crate::link_watcher::spawn_link_watcher(
+                tb_ifaces,
+                app_state.events_tx.clone(),
+                app_state.jaccl_worker.clone(),
+                webhook_url,
+            );
+            tracing::info!("SCDynamicStore link watcher started");
+        }
+    }
+
     let app = daemon::build_router(app_state);
 
     // Bonjour publisher — make this node discoverable on the LAN as
