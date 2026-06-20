@@ -31,6 +31,36 @@ use tokio::sync::RwLock;
 use crate::daemon::AppState;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Connection pool events (outside #[cfg(feature = "jaccl")] so /events handler
+// can reference the type unconditionally)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Events emitted on the AppState::events_tx broadcast channel
+/// for real-time JACCL connection pool visibility.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConnectionPoolEvent {
+    /// Pool boot scan started
+    PoolBoot { known_links: usize },
+    /// Connection established to a peer (group init succeeded)
+    Establish { peer: String, device: Option<String>, port: i32 },
+    /// Heartbeat probe succeeded
+    HeartbeatOk { peer: String },
+    /// Heartbeat probe failed — group is stale
+    HeartbeatFail { peer: String, reason: String },
+    /// Stale group dropped, PDs reclaimed
+    PdReclaim { peer: String, remaining_groups: usize },
+    /// Reconnection attempt to a previously-stale peer
+    Reconnect { peer: String, success: bool, error: Option<String> },
+    /// PD budget snapshot (emitted with every heartbeat cycle)
+    PdBudget { active: i32, probe_result: i32 },
+    /// TB interface link came up (SCDynamicStore notification)
+    LinkUp { iface: String },
+    /// TB interface link went down — triggers immediate heartbeat
+    LinkDown { iface: String },
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Transfer state (shared across handlers — the transfer owns this, not the HTTP connection)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

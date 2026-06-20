@@ -61,6 +61,9 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
     // Broadcast channel for SSE streaming
     let (metrics_tx, _) = tokio::sync::broadcast::channel::<String>(16);
 
+    // Broadcast channel for typed connection pool / RDMA events (capacity 256)
+    let (events_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+
     // Init all managed MLX servers (before poll loop so we can enrich metrics)
     let ports = serve::managed_ports();
     let managers: Vec<_> = futures::future::join_all(
@@ -472,6 +475,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         port,
         started_at,
         metrics_tx: metrics_tx.clone(),
+        events_tx: events_tx.clone(),
         model_cache,
         thunderbolt_cache,
         topology_cache,

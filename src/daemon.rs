@@ -48,6 +48,9 @@ pub struct AppState {
     pub watchdog: Arc<crate::watchdog::Watchdog>,
     pub ane: crate::ane::AneState,
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
+    /// Broadcast channel for typed connection pool / RDMA events (capacity 256).
+    /// Separate from metrics_tx (which carries raw NodeSnapshot JSON).
+    pub events_tx: tokio::sync::broadcast::Sender<String>,
     /// JACCL worker — dedicated OS thread for all RDMA operations (Phase 3).
     /// Only read by jaccl-gated transfer handlers; kept unconditional so
     /// AppState has the same shape across feature combinations.
@@ -302,6 +305,43 @@ async fn stream_handler(
         futures::future::ready(match result {
             Ok(json) => Some(Ok(axum::response::sse::Event::default().data(json))),
             Err(_) => None, // lagged subscriber — skip missed messages
+        })
+    });
+
+    axum::response::sse::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// GET /events → SSE push of typed ConnectionPoolEvent messages
+async fn events_handler(
+    State(state): State<AppState>,
+) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use futures::StreamExt;
+
+    let rx = state.events_tx.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| {
+        futures::future::ready(match result {
+            Ok(json) => {
+                // Extract "type" field from the JSON (present because of #[serde(tag = "type")])
+                // and map it to an SSE `event:` header so clients can addEventListener by type.
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let event_type = parsed.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown");
+                    Some(Ok(
+                        axum::response::sse::Event::default()
+                            .event(event_type)
+                            .data(json)
+                    ))
+                } else {
+                    Some(Ok(axum::response::sse::Event::default().data(json)))
+                }
+            }
+            Err(_) => None, // lagged subscriber — skip
         })
     });
 
@@ -3964,6 +4004,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/cluster/models", get(cluster_models_handler))
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))
+        .route("/events", get(events_handler))
         .route("/jaccl/config", get(jaccl_config_handler).post(jaccl_generate_handler))
         .route("/arp", get(arp_handler))
         .route("/thunderbolt", get(thunderbolt_handler))
