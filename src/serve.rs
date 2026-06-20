@@ -507,6 +507,10 @@ struct ManagedProcess {
     load_started: Option<std::time::Instant>,
     error: Option<String>,
     stopped_at: Option<std::time::Instant>,
+    /// Cached result of verify_port_owner — refreshed on a 15s timer (Phase C).
+    port_verified_cached: bool,
+    /// When port_verified_cached was last updated.
+    port_verified_at: Option<std::time::Instant>,
 }
 
 /// Kill the existing child process (SIGTERM → 5s → SIGKILL).
@@ -636,6 +640,8 @@ impl ServeManager {
                 load_started: None,
                 error: None,
                 stopped_at: None,
+                port_verified_cached: false,
+                port_verified_at: None,
             })),
             readiness: Arc::new(HttpHealth {
                 port,
@@ -754,6 +760,22 @@ impl ServeManager {
     pub async fn model_snapshot(&self) -> (ServeState, Option<String>) {
         let s = self.inner.read().await;
         (s.state, s.model.clone())
+    }
+
+    /// Cheap snapshot for SSE broadcast — no subprocess forks.
+    pub async fn slot_snapshot(&self) -> asmi_core::ServeSlotSnapshot {
+        let s = self.inner.read().await;
+        asmi_core::ServeSlotSnapshot {
+            port: s.port.unwrap_or(19080),
+            state: s.state,
+            model: s.model.clone(),
+            engine: s.engine,
+            backend: s.backend,
+            error: s.error.clone(),
+            pid: s.pid,
+            elapsed_ms: s.load_started.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+            port_verified: s.port_verified_cached,
+        }
     }
 
     /// Get a read-only status snapshot.
@@ -1329,6 +1351,8 @@ impl ShareManager {
                 load_started: None,
                 error: None,
                 stopped_at: None,
+                port_verified_cached: false,
+                port_verified_at: None,
             })),
             readiness: Arc::new(LogMonitor {
                 log_path: SHARE_LOG_PATH.to_string(),
