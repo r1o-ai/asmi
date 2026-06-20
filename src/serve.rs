@@ -20,11 +20,15 @@ use crate::daemon::resolve_python;
 // ===========================================================================
 
 /// Default managed ports (overridable via ASMI_MLX_LM_PORT / ASMI_MLX_VLM_PORT).
+///
+/// ds4 is intentionally NOT auto-managed: it is a native engine that cannot
+/// start "bare" (no model) like the MLX servers, so a managed ds4 port lands
+/// in `error` on every boot (`cannot open model 'ds4flash.gguf'`). Load ds4 on
+/// demand via /serve/load instead of keeping a perpetually-erroring slot.
 pub fn managed_ports() -> Vec<(u16, ServeEngine)> {
     vec![
         (port_for_engine(ServeEngine::MlxLm), ServeEngine::MlxLm),
         (port_for_engine(ServeEngine::MlxVlm), ServeEngine::MlxVlm),
-        (port_for_engine(ServeEngine::Ds4), ServeEngine::Ds4),
     ]
 }
 
