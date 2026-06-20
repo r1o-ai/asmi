@@ -32,6 +32,17 @@ pub struct TopologyReport {
     pub raw_dot: String,
 }
 
+/// Stable key for a topology link — canonicalized so (A,B) == (B,A).
+/// Used by the union-merge cache to track links across scans.
+pub fn link_key(link: &TopologyLink) -> String {
+    let (a, da, b, db) = if link.node_a <= link.node_b {
+        (&link.node_a, &link.device_a, &link.node_b, &link.device_b)
+    } else {
+        (&link.node_b, &link.device_b, &link.node_a, &link.device_a)
+    };
+    format!("{a}:{da}↔{b}:{db}")
+}
+
 /// Which `mlx.distributed_config` binary to use.
 fn find_distributed_config() -> Result<String> {
     // Check common locations
@@ -61,6 +72,17 @@ fn find_distributed_config() -> Result<String> {
 /// Discover cluster topology. Tries native HTTP first (no Python/MLX dependency),
 /// falls back to mlx.distributed_config, then ARP.
 pub fn discover_topology(hosts: &[String], backend: &str) -> Result<TopologyReport> {
+    // Flush stale ARP for all known /30 RDMA IPs before scanning. Stale entries
+    // (e.g. from bridge0 proxy ARP remnants or interface reassignment) route
+    // probe traffic to the wrong interface, causing valid links to appear down.
+    // Same fix we applied to jaccl_shim.cpp.
+    for i in 0..((hosts.len() * 3).min(24)) {
+        let ip = format!("192.168.10.{}", i * 4 + 1);
+        let _ = Command::new("arp").args(["-d", &ip]).output();
+        let ip2 = format!("192.168.10.{}", i * 4 + 2);
+        let _ = Command::new("arp").args(["-d", &ip2]).output();
+    }
+
     // Primary: native HTTP + UUID cross-match (no SSH, no Python)
     let http_reachable: Vec<String> = std::thread::scope(|s| {
         let handles: Vec<_> = hosts
@@ -968,5 +990,56 @@ mod tests {
         let table = format_table(&report);
         assert!(table.contains("JACCL ready: YES"));
         assert!(table.contains("en3"));
+    }
+
+    #[test]
+    fn test_link_key_canonical_order() {
+        let l1 = TopologyLink {
+            node_a: "hub".into(), device_a: "rdma_en4".into(),
+            node_b: "m3u2".into(), device_b: "rdma_en3".into(),
+        };
+        let l2 = TopologyLink {
+            node_a: "m3u2".into(), device_a: "rdma_en3".into(),
+            node_b: "hub".into(), device_b: "rdma_en4".into(),
+        };
+        assert_eq!(link_key(&l1), link_key(&l2), "(A,B) and (B,A) must produce same key");
+    }
+
+    #[test]
+    fn test_link_key_different_links_differ() {
+        let l1 = TopologyLink {
+            node_a: "hub".into(), device_a: "rdma_en4".into(),
+            node_b: "m3u2".into(), device_b: "rdma_en4".into(),
+        };
+        let l2 = TopologyLink {
+            node_a: "hub".into(), device_a: "rdma_en3".into(),
+            node_b: "m3u3".into(), device_b: "rdma_en5".into(),
+        };
+        assert_ne!(link_key(&l1), link_key(&l2));
+    }
+
+    #[test]
+    fn test_link_key_parallel_links_same_pair_differ() {
+        let l1 = TopologyLink {
+            node_a: "hub".into(), device_a: "rdma_en4".into(),
+            node_b: "m3u2".into(), device_b: "rdma_en4".into(),
+        };
+        let l2 = TopologyLink {
+            node_a: "hub".into(), device_a: "rdma_en5".into(),
+            node_b: "m3u2".into(), device_b: "rdma_en3".into(),
+        };
+        assert_ne!(link_key(&l1), link_key(&l2), "parallel links between same pair must differ");
+    }
+
+    #[test]
+    fn test_link_key_format() {
+        let link = TopologyLink {
+            node_a: "m3u3".into(), device_a: "rdma_en5".into(),
+            node_b: "hub".into(), device_b: "rdma_en3".into(),
+        };
+        let key = link_key(&link);
+        assert!(key.starts_with("hub:"), "key should start with lexically-first node: {key}");
+        assert!(key.contains("↔"), "key should contain ↔ separator: {key}");
+        assert!(key.contains("m3u3:"), "key should contain second node: {key}");
     }
 }
