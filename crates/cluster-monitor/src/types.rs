@@ -87,6 +87,10 @@ pub struct NodeSnapshot {
     // Only includes interfaces with RDMA-relevant IPs (192.168.10.x, 169.254.x.x).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub interface_ips: BTreeMap<String, Vec<String>>,
+
+    // Lightweight serve-slot snapshots for SSE broadcast (always serialized, even empty).
+    #[serde(default)]
+    pub serve_slots: Vec<ServeSlotSnapshot>,
 }
 
 impl NodeSnapshot {
@@ -731,9 +735,10 @@ pub struct ModelServerMetadata {
 // ---------------------------------------------------------------------------
 
 /// Lifecycle state of the managed MLX server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ServeState {
+    #[default]
     Idle,
     Bare,
     Loading,
@@ -769,6 +774,12 @@ pub enum ServeEngine {
     DFlash,
     #[serde(rename = "ds4")]
     Ds4,
+    /// mflux image generation server (image-gen-server.py, default :19095).
+    #[serde(rename = "image_gen")]
+    ImageGen,
+    /// mlx-video LTX video generation server (video-gen-server.py, default :19096).
+    #[serde(rename = "video_gen")]
+    VideoGen,
 }
 
 
@@ -781,7 +792,18 @@ impl fmt::Display for ServeEngine {
             Self::MlxLmShare => write!(f, "mlx_lm_share"),
             Self::DFlash => write!(f, "dflash"),
             Self::Ds4 => write!(f, "ds4"),
+            Self::ImageGen => write!(f, "image_gen"),
+            Self::VideoGen => write!(f, "video_gen"),
         }
+    }
+}
+
+impl ServeEngine {
+    /// Media generation engines (image/video) — request-routed servers that
+    /// never pre-load a model into the HTTP process; weights load per request
+    /// in a CLI subprocess. They read their port from env, not `--port`.
+    pub fn is_media(self) -> bool {
+        matches!(self, Self::ImageGen | Self::VideoGen)
     }
 }
 
@@ -821,6 +843,30 @@ impl fmt::Display for ServeBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// Lightweight serve-slot snapshot for SSE broadcast.
+/// port_verified is cached on a 15s timer (Phase C) — not forked per tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeSlotSnapshot {
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub state: ServeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub engine: ServeEngine,
+    #[serde(default)]
+    pub backend: ServeBackend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub port_verified: bool,
 }
 
 /// Per-engine command configuration — replaces the Python ENGINES dict.
@@ -886,6 +932,22 @@ impl ServeEngine {
                 uvicorn_app: None,
                 model_flag: Some("--model"),
                 health_endpoints: &["/v1/models", "/health"],
+            },
+            // Media engines: `binary` is the vendored Python script name, resolved
+            // by serve.rs (env override → ~/.r1o/bin → ~/). Port goes via env.
+            Self::ImageGen => EngineConfig {
+                binary: "image-gen-server.py",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: None,
+                health_endpoints: &["/health"],
+            },
+            Self::VideoGen => EngineConfig {
+                binary: "video-gen-server.py",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: None,
+                health_endpoints: &["/health"],
             },
         }
     }

@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 // Typed API error — returns proper HTTP status codes instead of 200 + error JSON
 // ---------------------------------------------------------------------------
 
-enum ApiError {
+pub(crate) enum ApiError {
     BadRequest(String),
     NotFound(String),
     Conflict(String),
@@ -48,6 +48,9 @@ pub struct AppState {
     pub watchdog: Arc<crate::watchdog::Watchdog>,
     pub ane: crate::ane::AneState,
     pub egpu_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
+    /// Broadcast channel for typed connection pool / RDMA events (capacity 256).
+    /// Separate from metrics_tx (which carries raw NodeSnapshot JSON).
+    pub events_tx: tokio::sync::broadcast::Sender<String>,
     /// JACCL worker — dedicated OS thread for all RDMA operations (Phase 3).
     /// Only read by jaccl-gated transfer handlers; kept unconditional so
     /// AppState has the same shape across feature combinations.
@@ -312,6 +315,43 @@ async fn stream_handler(
     )
 }
 
+/// GET /events → SSE push of typed ConnectionPoolEvent messages
+async fn events_handler(
+    State(state): State<AppState>,
+) -> axum::response::sse::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use futures::StreamExt;
+
+    let rx = state.events_tx.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| {
+        futures::future::ready(match result {
+            Ok(json) => {
+                // Extract "type" field from the JSON (present because of #[serde(tag = "type")])
+                // and map it to an SSE `event:` header so clients can addEventListener by type.
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let event_type = parsed.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown");
+                    Some(Ok(
+                        axum::response::sse::Event::default()
+                            .event(event_type)
+                            .data(json)
+                    ))
+                } else {
+                    Some(Ok(axum::response::sse::Event::default().data(json)))
+                }
+            }
+            Err(_) => None, // lagged subscriber — skip
+        })
+    });
+
+    axum::response::sse::Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
 /// GET /jaccl/config → JACCL hostfile matrix from stored RDMA link topology.
 /// Query params: ?hosts=m3u2,m3u1 (comma-separated hostnames, optional — defaults to all)
 async fn jaccl_config_handler(
@@ -563,10 +603,11 @@ pub async fn trigger_config_sync(state: &AppState) -> serde_json::Value {
         let mut tb = state.thunderbolt_cache.write().await;
         *tb = None;
     }
-    {
-        let mut topo = state.topology_cache.write().await;
-        *topo = None;
-    }
+    // NOTE: topology_cache is NOT cleared here. The union-merge scan loop
+    // manages the cache and calls /config/sync when the hash changes; clearing
+    // the cache here would create a vicious cycle (sync clears → handler returns
+    // "not yet scanned" for 60s until next scan → scan writes → hash changes →
+    // sync clears again). The scan loop's next iteration will update the cache.
 
     let hostfile_path = std::env::var("HOME")
         .map(|h| format!("{h}/.r1o/hostfiles/auto.json"))
@@ -1394,13 +1435,26 @@ async fn serve_load_handler(
     let port = q.port.unwrap_or(crate::serve::port_for_engine(req.engine));
 
     // Get or create a manager for this port
-    {
+    let created_now = {
         let managers = state.serve_managers.read().await;
         if !managers.contains_key(&port) {
             drop(managers);
             let new_mgr = crate::serve::ServeManager::restore(port, req.engine).await;
             state.serve_managers.write().await.insert(port, new_mgr);
+            true
+        } else {
+            false
         }
+    };
+
+    // A just-created manager auto-starts bare via restore(). If the request
+    // was itself bare (no model) that IS the requested work — don't fall
+    // through to the Loading guard and 409 on our own startup.
+    if created_now && req.model_path.is_none() {
+        return Ok(Json(serde_json::json!({
+            "ok": true, "state": "loading", "engine": req.engine, "port": port,
+            "note": "slot created, starting bare",
+        })));
     }
 
     // Start peer heartbeat for JACCL distributed sessions
@@ -3947,6 +4001,8 @@ async fn prep_handler(
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        // Media generation (image/video) — proxied to gen servers, see media.rs
+        .merge(crate::media::routes())
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
         .route("/health/setup", get(setup_handler))
@@ -3963,6 +4019,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/cluster/models", get(cluster_models_handler))
         .route("/nodes", get(nodes_handler))
         .route("/stream", get(stream_handler))
+        .route("/events", get(events_handler))
         .route("/jaccl/config", get(jaccl_config_handler).post(jaccl_generate_handler))
         .route("/arp", get(arp_handler))
         .route("/thunderbolt", get(thunderbolt_handler))

@@ -177,6 +177,17 @@ pub struct NodeMap {
     /// Example: "~/venvs/hermes/bin/python3"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python_cmd: Option<String>,
+    /// Named service endpoints, e.g. "image_gen" → "http://hub:19095".
+    /// First-class field so hand-wired entries survive NodeMap::save()
+    /// (any key not in this struct is silently dropped on the next save).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub endpoints: HashMap<String, String>,
+    /// Media serve slots to auto-start with the daemon on THIS node, e.g.
+    /// ["image_gen", "video_gen"]. Opt-in per node — auto-managing these
+    /// everywhere would leave error slots on nodes without mflux/mlx-video
+    /// installed (same rationale as ds4 not being auto-managed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media_autostart: Vec<String>,
 }
 
 impl NodeMap {
