@@ -1025,11 +1025,33 @@ async fn probe_model_server(port: u16) -> Option<(u32, Option<String>)> {
 }
 
 async fn get_pid_on_port(port: u16) -> Option<u32> {
+    // Multiple processes can legitimately listen on the same port number on
+    // different addresses — e.g. `tailscale serve` publishes :19095 on the
+    // tailnet IP while the real gen server sits on 127.0.0.1. The process we
+    // would manage (and later SIGTERM!) binds loopback or wildcard; prefer
+    // that, and only fall back to whatever listener we found first.
     let output = tokio::process::Command::new("lsof")
-        .args(["-tai", "-sTCP:LISTEN", "-i", &format!(":{}", port)])
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
         .output().await.ok()?;
     let s = String::from_utf8_lossy(&output.stdout);
-    s.trim().lines().next()?.parse().ok()
+    let mut fallback: Option<u32> = None;
+    for line in s.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        let Ok(pid) = cols[1].parse::<u32>() else { continue };
+        let addr = cols[8];
+        if addr.starts_with("127.0.0.1:")
+            || addr.starts_with("*:")
+            || addr.starts_with("[::]:")
+            || addr.starts_with("[::1]:")
+        {
+            return Some(pid);
+        }
+        fallback.get_or_insert(pid);
+    }
+    fallback
 }
 
 async fn detect_port_squatter(port: u16) -> Option<asmi_core::PortSquatter> {
