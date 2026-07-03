@@ -6,6 +6,7 @@ mod daemon_startup;
 mod launchd;
 #[cfg(feature = "jaccl")]
 mod link_watcher;
+mod media;
 mod rdma_autosetup;
 mod serve;
 mod setup;
@@ -113,6 +114,71 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Generate an image on the cluster (mflux: z-image-turbo, qwen, flux2, kontext).
+    Image {
+        /// The prompt to render.
+        prompt: String,
+        /// Model key (default: server's default, z-image-turbo).
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Diffusion steps (default: per-model).
+        #[arg(long)]
+        steps: Option<u32>,
+        #[arg(long)]
+        width: Option<u32>,
+        #[arg(long)]
+        height: Option<u32>,
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Output path (default: server-generated name in cwd).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Open the result when done (macOS `open`).
+        #[arg(long)]
+        open: bool,
+    },
+    /// Generate a video on the cluster (mlx-video LTX-2.3). Async job by default.
+    Video {
+        /// The prompt to render.
+        prompt: String,
+        /// Model key (default: server's default, ltx-2.3-distilled).
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Frame count (default 97 ≈ 4s @ 24fps).
+        #[arg(long)]
+        frames: Option<u32>,
+        #[arg(long)]
+        width: Option<u32>,
+        #[arg(long)]
+        height: Option<u32>,
+        #[arg(long)]
+        fps: Option<u32>,
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Init image for image-to-video (path, or a name from image-gen).
+        #[arg(long)]
+        image: Option<String>,
+        /// Block on /generate instead of the async job flow.
+        #[arg(long)]
+        sync: bool,
+        /// Output path (default: server-generated name in cwd).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Open the result when done (macOS `open`).
+        #[arg(long)]
+        open: bool,
+    },
+    /// Media generation servers (image/video) — status and discovery.
+    Media {
+        #[command(subcommand)]
+        action: MediaAction,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum MediaAction {
+    /// Show where image/video gen servers are and what they offer.
+    Status,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -185,6 +251,19 @@ async fn main() -> Result<()> {
                 setup::run_setup(port, cluster, skip_bridge0, dry_run).await
             }
             Command::Daemon { action } => cli::run_daemon(action, args.port).await,
+            Command::Image { prompt, model, steps, width, height, seed, output, open } => {
+                media::run_image(prompt, model, steps, width, height, seed, output, open).await
+            }
+            Command::Video {
+                prompt, model, frames, width, height, fps, seed, image, sync, output, open,
+            } => {
+                media::run_video(
+                    prompt, model, frames, width, height, fps, seed, image, sync, output, open,
+                ).await
+            }
+            Command::Media { action } => match action {
+                MediaAction::Status => media::run_media_status().await,
+            },
             Command::Topology {
                 hosts,
                 format,

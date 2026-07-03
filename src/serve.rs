@@ -26,10 +26,34 @@ use crate::daemon::resolve_python;
 /// in `error` on every boot (`cannot open model 'ds4flash.gguf'`). Load ds4 on
 /// demand via /serve/load instead of keeping a perpetually-erroring slot.
 pub fn managed_ports() -> Vec<(u16, ServeEngine)> {
-    vec![
+    let mut ports = vec![
         (port_for_engine(ServeEngine::MlxLm), ServeEngine::MlxLm),
         (port_for_engine(ServeEngine::MlxVlm), ServeEngine::MlxVlm),
-    ]
+    ];
+    // Media gen slots are opt-in per node (config `media_autostart` or env
+    // ASMI_MEDIA_AUTOSTART="image_gen,video_gen") — same rationale as ds4:
+    // auto-managing them on nodes without mflux/mlx-video breeds error slots.
+    // The /health endpoint works without the toolchain, so a started slot is
+    // harmless; the opt-in is about not starting stray processes fleet-wide.
+    let mut autostart = asmi_core::NodeMap::load().media_autostart;
+    if let Ok(env_list) = std::env::var("ASMI_MEDIA_AUTOSTART") {
+        autostart.extend(env_list.split(',').map(|s| s.trim().to_string()));
+    }
+    for name in autostart {
+        let engine = match name.as_str() {
+            "image_gen" => ServeEngine::ImageGen,
+            "video_gen" => ServeEngine::VideoGen,
+            other => {
+                tracing::warn!(engine = other, "unknown media_autostart entry — skipping");
+                continue;
+            }
+        };
+        let port = port_for_engine(engine);
+        if !ports.iter().any(|(p, _)| *p == port) {
+            ports.push((port, engine));
+        }
+    }
+    ports
 }
 
 /// Resolve port for an engine: env var > default.
@@ -45,6 +69,10 @@ pub fn port_for_engine(engine: ServeEngine) -> u16 {
             .ok().and_then(|v| v.parse().ok()).unwrap_or(19080),
         ServeEngine::Ds4 => std::env::var("ASMI_DS4_PORT")
             .ok().and_then(|v| v.parse().ok()).unwrap_or(8080),
+        ServeEngine::ImageGen => std::env::var("ASMI_IMAGE_GEN_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(19095),
+        ServeEngine::VideoGen => std::env::var("ASMI_VIDEO_GEN_PORT")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(19096),
     }
 }
 
@@ -133,6 +161,38 @@ fn resolve_native_binary(binary: &str, engine: &ServeEngine) -> Result<PathBuf, 
     anyhow::bail!(
         "native binary '{}' not found for engine {:?}. Set {} or place it in ~/.r1o/bin/",
         binary, engine, env_key
+    )
+}
+
+/// Resolve a media gen server script (image-gen-server.py / video-gen-server.py).
+///
+/// Search order:
+///   1. `ASMI_IMAGE_GEN_SCRIPT` / `ASMI_VIDEO_GEN_SCRIPT` env var
+///   2. `~/.r1o/bin/<script>` (managed install location, populated by deploy)
+///   3. `~/<script>` (legacy hand-deployed location on hub)
+fn resolve_media_script(engine: ServeEngine) -> Result<PathBuf, anyhow::Error> {
+    let script = engine.config().binary; // e.g. "image-gen-server.py"
+    let env_key = match engine {
+        ServeEngine::ImageGen => "ASMI_IMAGE_GEN_SCRIPT",
+        ServeEngine::VideoGen => "ASMI_VIDEO_GEN_SCRIPT",
+        other => anyhow::bail!("resolve_media_script called for non-media engine {other}"),
+    };
+    if let Ok(p) = std::env::var(env_key) {
+        let path = PathBuf::from(&p);
+        if path.exists() {
+            return Ok(path);
+        }
+        tracing::warn!(%env_key, path = %p, "env var set but path does not exist");
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    for cand in [r1o_dir().join("bin").join(script), home.join(script)] {
+        if cand.exists() {
+            return Ok(cand);
+        }
+    }
+    anyhow::bail!(
+        "media server script '{script}' not found. Set {env_key}, or copy it from \
+         the apple-smi repo's media/ dir to ~/.r1o/bin/"
     )
 }
 
@@ -942,12 +1002,26 @@ static PROBE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock:
 /// Returns (pid, model_name) if it responds to /v1/models.
 async fn probe_model_server(port: u16) -> Option<(u32, Option<String>)> {
     let url = format!("http://127.0.0.1:{}/v1/models", port);
+    if let Some(resp) = PROBE_CLIENT.get(&url).send().await.ok().filter(|r| r.status().is_success()) {
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let model = body["data"][0]["id"].as_str().map(String::from);
+        let pid = get_pid_on_port(port).await?;
+        return Some((pid, model));
+    }
+    // Media gen dialect: launchd-owned image/video servers answer /health with
+    // {"engine": "mflux"|"mlx-video", ...}. Recognize and adopt them so a
+    // media serve slot on an occupied port doesn't land in error.
+    let url = format!("http://127.0.0.1:{}/health", port);
     let resp = PROBE_CLIENT.get(&url).send().await.ok()?;
     if !resp.status().is_success() { return None; }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let model = body["data"][0]["id"].as_str().map(String::from);
-    let pid = get_pid_on_port(port).await?;
-    Some((pid, model))
+    match body["engine"].as_str() {
+        Some("mflux") | Some("mlx-video") => {
+            let pid = get_pid_on_port(port).await?;
+            Some((pid, None))
+        }
+        _ => None,
+    }
 }
 
 async fn get_pid_on_port(port: u16) -> Option<u32> {
@@ -988,6 +1062,15 @@ async fn do_serve_load_inner(
         kill_child(&mut s).await;
         (s.port.unwrap_or(19080), req.engine)
     };
+
+    // Media gen servers never pre-load a model into the HTTP process — weights
+    // load per request in a CLI subprocess. Drop any model_path so the slot
+    // lands in Bare (= healthy, request-routed) instead of a fake Ready.
+    let mut req = req.clone();
+    if engine.is_media() {
+        req.model_path = None;
+    }
+    let req = &req;
 
     let is_bare = req.model_path.is_none();
 
@@ -1074,7 +1157,14 @@ async fn do_serve_load_inner(
     // Native binary engines (e.g. ds4) bypass Python entirely.
     let is_native = matches!(engine, ServeEngine::Ds4);
 
-    if is_native {
+    if engine.is_media() {
+        // Media gen servers are plain scripts (stdlib-only) run under the
+        // resolved python. They take no CLI flags — port/bind go via env,
+        // injected on spawn_cmd below.
+        let script = resolve_media_script(engine)?;
+        program = resolve_python().to_string();
+        cmd_args.push(script.to_string_lossy().to_string());
+    } else if is_native {
         let binary_path = resolve_native_binary(cfg.binary, &engine)?;
         program = binary_path.to_string_lossy().to_string();
 
@@ -1261,6 +1351,18 @@ async fn do_serve_load_inner(
         if let Some(n) = req.vision_cache_size {
             spawn_cmd.env("MLX_VLM_VISION_CACHE_SIZE", n.to_string());
         }
+    }
+
+    // Media gen servers read port/bind from env (no --port flag). Loopback
+    // bind is intentional: the asmi daemon proxies /media/* for the mesh.
+    match engine {
+        ServeEngine::ImageGen => {
+            spawn_cmd.env("IMAGE_GEN_PORT", port.to_string());
+        }
+        ServeEngine::VideoGen => {
+            spawn_cmd.env("VIDEO_GEN_PORT", port.to_string());
+        }
+        _ => {}
     }
 
     let mut child = spawn_cmd.spawn()?;

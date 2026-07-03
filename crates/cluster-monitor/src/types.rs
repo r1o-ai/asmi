@@ -774,6 +774,12 @@ pub enum ServeEngine {
     DFlash,
     #[serde(rename = "ds4")]
     Ds4,
+    /// mflux image generation server (image-gen-server.py, default :19095).
+    #[serde(rename = "image_gen")]
+    ImageGen,
+    /// mlx-video LTX video generation server (video-gen-server.py, default :19096).
+    #[serde(rename = "video_gen")]
+    VideoGen,
 }
 
 
@@ -786,7 +792,18 @@ impl fmt::Display for ServeEngine {
             Self::MlxLmShare => write!(f, "mlx_lm_share"),
             Self::DFlash => write!(f, "dflash"),
             Self::Ds4 => write!(f, "ds4"),
+            Self::ImageGen => write!(f, "image_gen"),
+            Self::VideoGen => write!(f, "video_gen"),
         }
+    }
+}
+
+impl ServeEngine {
+    /// Media generation engines (image/video) — request-routed servers that
+    /// never pre-load a model into the HTTP process; weights load per request
+    /// in a CLI subprocess. They read their port from env, not `--port`.
+    pub fn is_media(self) -> bool {
+        matches!(self, Self::ImageGen | Self::VideoGen)
     }
 }
 
@@ -915,6 +932,22 @@ impl ServeEngine {
                 uvicorn_app: None,
                 model_flag: Some("--model"),
                 health_endpoints: &["/v1/models", "/health"],
+            },
+            // Media engines: `binary` is the vendored Python script name, resolved
+            // by serve.rs (env override → ~/.r1o/bin → ~/). Port goes via env.
+            Self::ImageGen => EngineConfig {
+                binary: "image-gen-server.py",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: None,
+                health_endpoints: &["/health"],
+            },
+            Self::VideoGen => EngineConfig {
+                binary: "video-gen-server.py",
+                binary_args: &[],
+                uvicorn_app: None,
+                model_flag: None,
+                health_endpoints: &["/health"],
             },
         }
     }
