@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.r1o.audio-gen.plist — launchd agent for the mlx-audio TTS/STT server.
+
+  Plan: docs/plans/2026-07-04-multimodal-gen.md (Phase 4a — author only,
+  NO deploy; orchestrator installs to ~/Library/LaunchAgents/ and bootstraps).
+
+  Mirrors com.r1o.image-gen pattern (per mflux-image-gen/SKILL.md:58).
+  KeepAlive=true so launchd restarts on crash; StandardOut/Err captured to
+  /tmp/r1o-audio-gen.log for asmi daemon log scraping.
+
+  Install (hub, when orchestrator deploys):
+    cp com.r1o.audio-gen.plist.template ~/Library/LaunchAgents/com.r1o.audio-gen.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.r1o.audio-gen.plist
+    launchctl enable gui/$(id -u)/com.r1o.audio-gen
+    launchctl kickstart -k gui/$(id -u)/com.r1o.audio-gen
+
+  Verify:
+    curl http://127.0.0.1:19097/health
+    → {"status":"ok","engine":"mlx-audio","model":"qwen3-tts-12hz",...}
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.r1o.audio-gen</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/python3</string>
+		<string>/Users/ma/.r1o/bin/audio-gen-server.py</string>
+	</array>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Override defaults via env (server has built-in fallbacks). -->
+		<key>AUDIO_GEN_PORT</key>
+		<string>19097</string>
+		<key>AUDIO_GEN_BIND</key>
+		<string>127.0.0.1</string>
+		<key>AUDIO_GEN_DIR</key>
+		<string>/Users/ma/audio-gen</string>
+		<key>AUDIO_GEN_MODEL</key>
+		<string>/Users/ma/Models/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16</string>
+		<key>AUDIO_GEN_STT_MODEL</key>
+		<string>mlx-community/whisper-large-v3-turbo-asr-fp16</string>
+		<!-- Cache clamp so MLX doesn't balloon and wedge the box. -->
+		<key>MLX_CACHE_LIMIT_GB</key>
+		<string>200</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Restart on crash; surface to asmi's process-watchdog. -->
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+
+	<key>NetworkState</key>
+	<true/>
+
+	<key>StandardOutPath</key>
+	<string>/tmp/r1o-audio-gen.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/tmp/r1o-audio-gen.log</string>
+</dict>
+</plist>

@@ -15,6 +15,11 @@ Endpoints:
          "seed": int, "quantize": 4|8,     # optional
          "response": "png"|"json"}         # png (default) streams image bytes;
                                            # json returns {"path": ..., "b64": ...}
+  POST /jobs              → async job queue (Plan:2026-07-04-multimodal-gen:57).
+        Same body as /generate; returns 202 {"id":..., "status":"queued",
+        "poll":"/jobs/<id>", "busy":bool}. Worker thread renders serially.
+  GET  /jobs/<id>         → poll a job: {"status":"queued|generating|done|error",
+        "result":{...}|null, "error":str|str}
   GET  /images/<name>.png → fetch a previously generated image
 
 Config via env:
@@ -65,6 +70,30 @@ MODELS = {
 DEFAULT_MODEL = "z-image-turbo"
 GEN_LOCK = threading.Lock()
 GEN_TIMEOUT_S = 30 * 60  # qwen first-run includes HF download; be generous
+
+# Async job queue — "subagent" pattern (mirrors video-gen-server.py:76-95).
+# POST /jobs returns immediately, a worker thread generates serially under
+# GEN_LOCK, GET /jobs/<id> reports status. In-memory only (KeepAlive restart
+# clears state; the png itself survives in OUT_DIR).
+# Plan:2026-07-04-multimodal-gen:57.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def _job_worker(job_id, params):
+    """Background worker — runs one image generation under the global lock."""
+    with JOBS_LOCK:
+        JOBS[job_id]["status"] = "queued"
+    with GEN_LOCK:
+        with JOBS_LOCK:
+            JOBS[job_id]["status"] = "generating"
+            JOBS[job_id]["started"] = time.time()
+        result, err = run_generation(params)
+    with JOBS_LOCK:
+        if err or result is None:
+            JOBS[job_id].update(status="error", error=err or "generation failed")
+        else:
+            JOBS[job_id].update(status="done", result=result)
 
 
 def run_generation(params):
@@ -131,6 +160,26 @@ class Handler(BaseHTTPRequestHandler):
                              "busy": GEN_LOCK.locked()})
         elif self.path == "/models":
             self._json(200, MODELS)
+        elif self.path.startswith("/jobs/"):
+            # Plan:2026-07-04-multimodal-gen:57. Poll an async job.
+            job_id = os.path.basename(self.path)
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                return self._json(404, {"error": "unknown job", "id": job_id})
+            # Don't leak the full in-memory dict; project to the public shape.
+            payload = {"id": job_id, "status": job["status"]}
+            if "result" in job:
+                payload["result"] = {
+                    "name": job["result"]["name"],
+                    "seconds": job["result"]["seconds"],
+                    "model": job["result"]["model"],
+                }
+            if "error" in job:
+                payload["error"] = job["error"]
+            if "prompt" in job:
+                payload["prompt"] = job["prompt"]
+            return self._json(200, payload)
         elif self.path.startswith("/images/"):
             fname = os.path.basename(self.path)  # no traversal
             fpath = OUT_DIR / fname
@@ -144,9 +193,27 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "not found"})
         else:
-            self._json(404, {"error": "unknown path", "paths": ["/health", "/models", "/generate", "/images/<name>"]})
+            self._json(404, {"error": "unknown path", "paths": ["/health", "/models", "/generate", "/jobs", "/jobs/<id>", "/images/<name>"]})
 
     def do_POST(self):
+        if self.path == "/jobs":
+            # Plan:2026-07-04-multimodal-gen:57. Async enqueue — mirrors
+            # video-gen-server.py:198-214 (POST /jobs → 202 + worker spawn).
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                params = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, json.JSONDecodeError) as e:
+                return self._json(400, {"error": f"bad JSON: {e}"})
+            if not params.get("prompt"):
+                return self._json(400, {"error": "missing 'prompt'"})
+            job_id = uuid.uuid4().hex[:12]
+            with JOBS_LOCK:
+                JOBS[job_id] = {"status": "queued", "created": time.time(),
+                                "model": params.get("model", DEFAULT_MODEL),
+                                "prompt": str(params["prompt"])[:200]}
+            threading.Thread(target=_job_worker, args=(job_id, params), daemon=True).start()
+            return self._json(202, {"id": job_id, "status": "queued",
+                                    "poll": f"/jobs/{job_id}", "busy": GEN_LOCK.locked()})
         if self.path != "/generate":
             return self._json(404, {"error": "unknown path"})
         try:
