@@ -25,8 +25,15 @@ cargo install --path .
 ```bash
 # Download the latest release for your architecture
 curl -L https://github.com/r1o-ai/asmi/releases/latest/download/asmi-arm64-apple-darwin.tar.gz | tar xz
-# Re-sign after download (macOS requirement for binaries from other machines)
-codesign -f -s - asmi
+# Re-sign after download (macOS requirement for binaries from other machines).
+# Prefer a real signing identity with a FIXED identifier — macOS keys the
+# Local Network permission to the code identity, and ad-hoc signing (-s -)
+# mints a NEW identity per build, so every deploy re-prompts and leaves a
+# stale entry behind. Fleets: see deploy/codesign.sh.
+codesign -f -s "Apple Development: <your identity>" -i eu.r1o.asmi asmi
+# No signing certificate? Ad-hoc works but expect a fresh Local Network
+# prompt (and a stale Privacy entry) on every update:
+#   codesign -f -s - asmi
 # Move to a directory in your PATH
 sudo mv asmi /usr/local/bin/
 ```

@@ -7,8 +7,10 @@
 #
 # Run this on the TARGET node (not the orchestrator). Requires passwordless sudo.
 #
-# Prereqs already done: asmi binary at $HOME/.cargo/bin/asmi, codesigned,
-# +x, and tested with `asmi --version` returning 0.
+# Prereqs already done: asmi binary at $HOME/.cargo/bin/asmi, codesigned via
+# deploy/codesign.sh (stable identity eu.r1o.asmi — NEVER ad-hoc `-s -`, which
+# mints a new Local Network TCC identity per deploy), +x, and tested with
+# `asmi --version` returning 0.
 
 set -euo pipefail
 
