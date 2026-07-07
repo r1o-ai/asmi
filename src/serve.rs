@@ -1365,6 +1365,38 @@ async fn do_serve_load_inner(
         .stderr(log_stderr)
         .kill_on_drop(false); // we manage lifetime ourselves
 
+    // Native engines (ds4) need Metal shader source files at runtime. ds4
+    // looks for `metal/flash_attn.metal` relative to cwd OR from the
+    // `DS4_METAL_FLASH_ATTN_SOURCE` env var. The binary may be installed at
+    // ~/.r1o/bin/ds4-server (managed location) far from the source tree, so
+    // cwd-relative resolution fails. We search three paths for the shaders:
+    //   1. Next to the binary (in-tree dev build: ~/opensource/ds4/)
+    //   2. ~/opensource/ds4/ (the canonical ds4 source tree on this cluster)
+    //   3. ~/.r1o/ds4/ (managed shader install, future)
+    // The first hit sets both cwd and the env var. If none found, ds4 falls
+    // back to its own resolution (may still fail, but we don't mask the error).
+    if is_native {
+        let candidates: Vec<std::path::PathBuf> = {
+            let mut v = Vec::new();
+            if let Some(p) = std::path::Path::new(&final_program).parent() {
+                v.push(p.to_path_buf());
+            }
+            if let Some(home) = dirs::home_dir() {
+                v.push(home.join("opensource/ds4"));
+                v.push(home.join(".r1o/ds4"));
+            }
+            v
+        };
+        for dir in &candidates {
+            let shader = dir.join("metal").join("flash_attn.metal");
+            if shader.exists() {
+                spawn_cmd.current_dir(dir);
+                spawn_cmd.env("DS4_METAL_FLASH_ATTN_SOURCE", &shader);
+                break;
+            }
+        }
+    }
+
     // Generic env lock-in for the LOCAL process (single-node serves, and the
     // mlx.launch launcher itself). Distributed ranks get the same vars via
     // the --env forwarding above. Applied before the typed VLM fields below
