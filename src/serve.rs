@@ -1074,6 +1074,186 @@ async fn do_serve_load(inner: Arc<RwLock<ManagedProcess>>, readiness: Arc<HttpHe
     }
 }
 
+// ── Data-driven engine definitions ──────────────────────────────────────────
+// The LAUNCH MECHANISM (how to exec) is a small stable set → code. The ENGINE
+// (which mechanism + binary + which flags) is DATA → an `EngineDef` record.
+// Adding/tuning an engine = a new record, no new branch in build_serve_argv.
+// (This increment keeps `ServeEngine` as the identity + the records in-code;
+// the external `~/.asmi/engines.toml` no-recompile layer rides on top next —
+// see docs/plans/2026-07-07-asmi-data-driven-engines.md.)
+
+/// Launch mechanism — each needs distinct resolution code.
+/// `Uvicorn` is reserved (no engine uses it today — mlx_vlm moved off it; the
+/// legacy code kept the dead path too), hence allow(dead_code) on the variant.
+#[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum Invocation {
+    /// `python3 -m {binary} {binary_args…}` (mlx_lm, dflash, vllm, share).
+    PythonModule,
+    /// resolved native binary (ds4) — + the ds4 shader-cwd handling at spawn.
+    Native,
+    /// `python3 -m uvicorn {uvicorn_app} …` (reserved; no engine uses it today).
+    Uvicorn,
+    /// vendored python script, port via env, no CLI flags (image/video gen).
+    MediaScript,
+}
+
+/// A `LoadRequest` value field that maps to `[flag, VALUE]` when set. Fixed
+/// vocabulary (the request's serve knobs) — per-engine data picks which to use.
+#[derive(Clone, Copy)]
+enum ValField {
+    DraftModel, NumDraftTokens, DecodeConcurrency, PromptConcurrency,
+    PrefillStepSize, PromptCacheSize, PromptCacheBytes, CacheType, MaxTokens, CtxSize,
+}
+
+/// A `LoadRequest` bool field that maps to a bare `[flag]` when true.
+#[derive(Clone, Copy)]
+enum BoolField { Pipeline, UseMtp }
+
+/// How one request field becomes CLI args.
+enum ArgRule {
+    /// `[flag, VALUE]` iff the value field is Some.
+    Val(&'static str, ValField),
+    /// `[flag]` iff the bool field is true.
+    Bool(&'static str, BoolField),
+    /// `[flag_k, VALUE, flag_v, VALUE]` — one field under two flags (cache_type).
+    Pair(&'static str, &'static str, ValField),
+    /// ds4 native MTP nesting: `[--mtp, draft]`, then `[--mtp-draft, ndt]` ONLY
+    /// if draft_model is also set (distinct from mlx_lm's independent flags).
+    Ds4Mtp,
+}
+
+/// Per-engine command data. Union of the fields the old enum/config()/
+/// port_for_engine/build_serve_argv sites hardcoded.
+struct EngineDef {
+    invocation: Invocation,
+    binary: &'static str,
+    binary_args: &'static [&'static str],
+    uvicorn_app: Option<&'static str>,
+    model_flag: Option<&'static str>,
+    /// Always-appended args after --port/--host (e.g. ds4 `--metal`).
+    static_args: &'static [&'static str],
+    /// Conditional flags, in emission order.
+    args: &'static [ArgRule],
+}
+
+/// The engine registry (in-code for this increment). One record per engine —
+/// a faithful transcription of the previously-hardcoded per-engine logic.
+fn engine_def(engine: ServeEngine) -> EngineDef {
+    use ArgRule::*;
+    use ValField::*;
+    // The full mlx_lm optimization-flag list (mlx_lm AND mlx_lm_share share it).
+    const MLX_LM_ARGS: &[ArgRule] = &[
+        Val("--draft-model", DraftModel),
+        Val("--num-draft-tokens", NumDraftTokens),
+        Val("--decode-concurrency", DecodeConcurrency),
+        Val("--prompt-concurrency", PromptConcurrency),
+        Val("--prefill-step-size", PrefillStepSize),
+        Val("--prompt-cache-size", PromptCacheSize),
+        Val("--prompt-cache-bytes", PromptCacheBytes),
+        Bool("--pipeline", BoolField::Pipeline),
+        Bool("--mtp", BoolField::UseMtp),
+        Pair("--cache-type-k", "--cache-type-v", CacheType),
+        Val("--max-tokens", MaxTokens),
+    ];
+    match engine {
+        ServeEngine::MlxLm => EngineDef {
+            invocation: Invocation::PythonModule, binary: "mlx_lm", binary_args: &["server"],
+            uvicorn_app: None, model_flag: Some("--model"), static_args: &[], args: MLX_LM_ARGS,
+        },
+        ServeEngine::MlxLmShare => EngineDef {
+            invocation: Invocation::PythonModule, binary: "mlx_lm", binary_args: &["share"],
+            uvicorn_app: None, model_flag: Some("--model"), static_args: &[], args: MLX_LM_ARGS,
+        },
+        ServeEngine::MlxVlm => EngineDef {
+            invocation: Invocation::PythonModule, binary: "mlx_vlm", binary_args: &["server"],
+            uvicorn_app: None, model_flag: None, static_args: &[], args: &[],
+        },
+        ServeEngine::VllmMlx => EngineDef {
+            invocation: Invocation::PythonModule, binary: "vllm-mlx", binary_args: &["serve"],
+            uvicorn_app: None, model_flag: Some("--model"), static_args: &[], args: &[],
+        },
+        ServeEngine::DFlash => EngineDef {
+            invocation: Invocation::PythonModule, binary: "dflash_mlx.serve", binary_args: &[],
+            uvicorn_app: None, model_flag: Some("--model"), static_args: &[],
+            args: &[Val("--draft", DraftModel)],
+        },
+        ServeEngine::Ds4 => EngineDef {
+            invocation: Invocation::Native, binary: "ds4-server", binary_args: &[],
+            uvicorn_app: None, model_flag: Some("--model"), static_args: &["--metal"],
+            args: &[Val("-c", CtxSize), Ds4Mtp],
+        },
+        ServeEngine::ImageGen => EngineDef {
+            invocation: Invocation::MediaScript, binary: "image-gen-server.py", binary_args: &[],
+            uvicorn_app: None, model_flag: None, static_args: &[], args: &[],
+        },
+        ServeEngine::VideoGen => EngineDef {
+            invocation: Invocation::MediaScript, binary: "video-gen-server.py", binary_args: &[],
+            uvicorn_app: None, model_flag: None, static_args: &[], args: &[],
+        },
+    }
+}
+
+/// Resolve a `ValField` to its request value (stringified) if present.
+fn val_field(f: ValField, req: &LoadRequest) -> Option<String> {
+    match f {
+        ValField::DraftModel => req.draft_model.clone(),
+        ValField::NumDraftTokens => req.num_draft_tokens.map(|n| n.to_string()),
+        ValField::DecodeConcurrency => req.decode_concurrency.map(|n| n.to_string()),
+        ValField::PromptConcurrency => req.prompt_concurrency.map(|n| n.to_string()),
+        ValField::PrefillStepSize => req.prefill_step_size.map(|n| n.to_string()),
+        ValField::PromptCacheSize => req.prompt_cache_size.map(|n| n.to_string()),
+        ValField::PromptCacheBytes => req.prompt_cache_bytes.map(|n| n.to_string()),
+        ValField::CacheType => req.cache_type.clone(),
+        ValField::MaxTokens => req.max_tokens.map(|n| n.to_string()),
+        ValField::CtxSize => req.ctx_size.map(|n| n.to_string()),
+    }
+}
+
+fn bool_field(f: BoolField, req: &LoadRequest) -> bool {
+    match f {
+        BoolField::Pipeline => req.pipeline,
+        BoolField::UseMtp => req.use_mtp,
+    }
+}
+
+/// Apply an engine's `ArgRule`s to `cmd_args`, in order.
+fn apply_arg_rules(rules: &[ArgRule], req: &LoadRequest, cmd_args: &mut Vec<String>) {
+    for rule in rules {
+        match rule {
+            ArgRule::Val(flag, f) => {
+                if let Some(v) = val_field(*f, req) {
+                    cmd_args.push((*flag).into());
+                    cmd_args.push(v);
+                }
+            }
+            ArgRule::Bool(flag, f) => {
+                if bool_field(*f, req) {
+                    cmd_args.push((*flag).into());
+                }
+            }
+            ArgRule::Pair(flag_k, flag_v, f) => {
+                if let Some(v) = val_field(*f, req) {
+                    cmd_args.push((*flag_k).into());
+                    cmd_args.push(v.clone());
+                    cmd_args.push((*flag_v).into());
+                    cmd_args.push(v);
+                }
+            }
+            ArgRule::Ds4Mtp => {
+                if let Some(ref draft) = req.draft_model {
+                    cmd_args.push("--mtp".into());
+                    cmd_args.push(draft.clone());
+                    if let Some(n) = req.num_draft_tokens {
+                        cmd_args.push("--mtp-draft".into());
+                        cmd_args.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build the `(program, args)` a serve request would spawn — PURE and
 /// side-effect-free. Shared by the real spawn path (`do_serve_load_inner`) and
 /// the synchronous `dry_run` preview in the HTTP handler, so the preview can
@@ -1097,125 +1277,58 @@ pub(crate) fn build_serve_argv(
     }
     let req = &req;
 
-    let cfg = engine.config();
+    let def = engine_def(engine);
     let is_bare = req.model_path.is_none();
-    let is_native = matches!(engine, ServeEngine::Ds4);
 
     let mut cmd_args: Vec<String> = Vec::new();
     let program: String;
 
-    if engine.is_media() {
-        // Media gen servers are plain scripts (stdlib-only) run under the
-        // resolved python. They take no CLI flags — port/bind go via env on spawn.
-        let script = resolve_media_script(engine)?;
-        program = resolve_python().to_string();
-        cmd_args.push(script.to_string_lossy().to_string());
-    } else if is_native {
-        let binary_path = resolve_native_binary(cfg.binary, &engine)?;
-        program = binary_path.to_string_lossy().to_string();
-
-        // Model flag + path
-        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
-            cmd_args.push(flag.into());
-            cmd_args.push(model_path.clone());
+    // Skeleton is dictated by the MECHANISM; flags come from the engine's DATA.
+    match def.invocation {
+        Invocation::MediaScript => {
+            // Media gen servers are plain scripts (stdlib-only) under python.
+            // No CLI flags — port/bind go via env at spawn.
+            let script = resolve_media_script(engine)?;
+            program = resolve_python().to_string();
+            cmd_args.push(script.to_string_lossy().to_string());
         }
-
-        // Port binding (critical: without --port, ds4 defaults to 8000, not 8080)
-        cmd_args.extend(["--port".into(), port.to_string()]);
-        cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
-
-        // Backend: force Metal on Apple Silicon. The production GGUF quant
-        // (DeepSeek-V4-Flash Q4-imatrix) has Q4_K routed experts that CRASH on
-        // ds4's CPU path; Metal handles both Q4_K and IQ2_XXS. ds4's `--mtp`
-        // speculative path is also Metal-only. asmi is Apple-Silicon-exclusive.
-        cmd_args.push("--metal".into());
-
-        // Context window size. Without -c, ds4-server defaults to 8192 (silent
-        // truncation trap); callers pass the model's real max via ctx_size.
-        if let Some(ctx) = req.ctx_size {
-            cmd_args.extend(["-c".into(), ctx.to_string()]);
+        Invocation::Native => {
+            let binary_path = resolve_native_binary(def.binary, &engine)?;
+            program = binary_path.to_string_lossy().to_string();
+            if let (Some(flag), Some(model_path)) = (def.model_flag, &req.model_path) {
+                cmd_args.push(flag.into());
+                cmd_args.push(model_path.clone());
+            }
+            // Port binding (critical: without --port, ds4 defaults to 8000, not 8080).
+            cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
+            // static_args: e.g. ds4 `--metal` (Q4_K experts crash on the CPU path;
+            // the --mtp speculative path is Metal-only). asmi is Apple-Silicon-only.
+            cmd_args.extend(def.static_args.iter().map(|s| s.to_string()));
+            apply_arg_rules(def.args, req, &mut cmd_args);
         }
-
-        // Speculative decoding via the MTP draft head. ds4's `--mtp FILE` takes
-        // a draft GGUF, distinct from mlx_lm's boolean `--mtp`.
-        if let Some(ref draft) = req.draft_model {
-            cmd_args.extend(["--mtp".into(), draft.clone()]);
-            if let Some(n) = req.num_draft_tokens {
-                cmd_args.extend(["--mtp-draft".into(), n.to_string()]);
-            }
+        Invocation::Uvicorn => {
+            // Always via resolve_python() since launchd lacks Homebrew in PATH.
+            program = resolve_python().to_string();
+            let app = def.uvicorn_app.unwrap_or_default();
+            cmd_args.extend([
+                "-m".into(), "uvicorn".into(), app.into(),
+                "--host".into(), "0.0.0.0".into(), "--port".into(), port.to_string(),
+                "--workers".into(), "1".into(), "--no-access-log".into(),
+            ]);
         }
-    } else if let Some(uvicorn_app) = cfg.uvicorn_app {
-        // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
-        let py = resolve_python().to_string();
-        program = py;
-        cmd_args.extend([
-            "-m".into(),
-            "uvicorn".into(),
-            uvicorn_app.into(),
-            "--host".into(),
-            "0.0.0.0".into(),
-            "--port".into(),
-            port.to_string(),
-            "--workers".into(),
-            "1".into(),
-            "--no-access-log".into(),
-        ]);
-    } else {
-        // Run as python3 -m <module> (e.g. python3 -m mlx_lm.server)
-        let py = resolve_python().to_string();
-        program = py;
-        cmd_args.push("-m".into());
-        cmd_args.push(cfg.binary.to_string());
-        cmd_args.extend(cfg.binary_args.iter().map(|s| s.to_string()));
-        // Only pass --model flag when we have a model to load
-        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
-            cmd_args.push(flag.into());
-            cmd_args.push(model_path.clone());
-        }
-        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
-
-        // DFlash-specific flags (dflash_mlx.serve uses --draft for the drafter model)
-        if matches!(engine, ServeEngine::DFlash) {
-            if let Some(ref draft) = req.draft_model {
-                cmd_args.extend(["--draft".into(), draft.clone()]);
+        Invocation::PythonModule => {
+            // python3 -m <binary> <binary_args…>
+            program = resolve_python().to_string();
+            cmd_args.push("-m".into());
+            cmd_args.push(def.binary.to_string());
+            cmd_args.extend(def.binary_args.iter().map(|s| s.to_string()));
+            // Only pass the model flag when we have a model (mlx_vlm loads lazily).
+            if let (Some(flag), Some(model_path)) = (def.model_flag, &req.model_path) {
+                cmd_args.push(flag.into());
+                cmd_args.push(model_path.clone());
             }
-        }
-
-        // Optimization passthrough (mlx_lm only — these flags are mlx_lm.server-specific)
-        if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
-            if let Some(ref draft) = req.draft_model {
-                cmd_args.extend(["--draft-model".into(), draft.clone()]);
-            }
-            if let Some(n) = req.num_draft_tokens {
-                cmd_args.extend(["--num-draft-tokens".into(), n.to_string()]);
-            }
-            if let Some(n) = req.decode_concurrency {
-                cmd_args.extend(["--decode-concurrency".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prompt_concurrency {
-                cmd_args.extend(["--prompt-concurrency".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prefill_step_size {
-                cmd_args.extend(["--prefill-step-size".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prompt_cache_size {
-                cmd_args.extend(["--prompt-cache-size".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prompt_cache_bytes {
-                cmd_args.extend(["--prompt-cache-bytes".into(), n.to_string()]);
-            }
-            if req.pipeline {
-                cmd_args.push("--pipeline".into());
-            }
-            if req.use_mtp {
-                cmd_args.push("--mtp".into());
-            }
-            if let Some(ref ct) = req.cache_type {
-                cmd_args.extend(["--cache-type-k".into(), ct.clone(), "--cache-type-v".into(), ct.clone()]);
-            }
-            if let Some(n) = req.max_tokens {
-                cmd_args.extend(["--max-tokens".into(), n.to_string()]);
-            }
+            cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
+            apply_arg_rules(def.args, req, &mut cmd_args);
         }
     }
 
@@ -1231,7 +1344,7 @@ pub(crate) fn build_serve_argv(
     // Covers jaccl, jaccl-ring, and ring — mlx.launch accepts all three.
     let (final_program, final_args) = if !is_bare
         && backend.is_distributed()
-        && cfg.model_flag.is_some()
+        && def.model_flag.is_some()
     {
         let hf = req
             .hostfile
