@@ -1200,9 +1200,28 @@ async fn do_serve_load_inner(
         cmd_args.extend(["--port".into(), port.to_string()]);
         cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
 
-        // Context window size
+        // Backend: force Metal on Apple Silicon. The production GGUF quant
+        // (DeepSeek-V4-Flash Q4-imatrix) has Q4_K routed experts that CRASH on
+        // ds4's CPU path ("expected IQ2_XXS expert tensors"); Metal handles
+        // both Q4_K and IQ2_XXS. ds4's `--mtp` speculative path is also
+        // Metal-only. asmi is Apple-Silicon-exclusive, so this is unconditional.
+        cmd_args.push("--metal".into());
+
+        // Context window size. Without -c, ds4-server defaults to 8192 (silent
+        // truncation trap); callers pass the model's real max via ctx_size.
         if let Some(ctx) = req.ctx_size {
             cmd_args.extend(["-c".into(), ctx.to_string()]);
+        }
+
+        // Speculative decoding via the MTP draft head. ds4's `--mtp FILE` takes
+        // a draft GGUF (the DeepSeek-V4-Flash-MTP head), distinct from mlx_lm's
+        // boolean `--mtp`. draft_model carries the head's path; num_draft_tokens
+        // maps to `--mtp-draft N` (max speculative tokens per step).
+        if let Some(ref draft) = req.draft_model {
+            cmd_args.extend(["--mtp".into(), draft.clone()]);
+            if let Some(n) = req.num_draft_tokens {
+                cmd_args.extend(["--mtp-draft".into(), n.to_string()]);
+            }
         }
     } else if let Some(uvicorn_app) = cfg.uvicorn_app {
         // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
