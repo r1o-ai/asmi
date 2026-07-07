@@ -1268,6 +1268,255 @@ pub(crate) fn build_serve_argv(
 }
 
 #[cfg(test)]
+mod parity_tests {
+    //! Differential golden-parity harness for the data-driven-engines refactor
+    //! (plan: docs/plans/2026-07-07-asmi-data-driven-engines.md, step 1).
+    //!
+    //! `build_serve_argv_legacy` below is a FROZEN verbatim copy of the current
+    //! hardcoded per-engine logic. The refactor rewrites the production
+    //! `build_serve_argv` to be data-driven; this test asserts it stays
+    //! BYTE-IDENTICAL to the legacy oracle across every engine + code path.
+    //! Same-process, same resolver fns on both sides → exact equality with zero
+    //! cross-machine brittleness. DELETE legacy once the refactor lands + is green.
+    use super::*;
+
+    /// FROZEN 2026-07-07 — do NOT edit. The behavioral contract the refactor must preserve.
+    #[allow(dead_code)]
+    fn build_serve_argv_legacy(
+        req: &LoadRequest,
+        port: u16,
+        engine: ServeEngine,
+        backend: ServeBackend,
+    ) -> Result<(String, Vec<String>), anyhow::Error> {
+        let mut req = req.clone();
+        if let Some(ref mut path) = req.model_path {
+            if path.starts_with("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    *path = format!("{}/{}", home.display(), &path[2..]);
+                }
+            }
+        }
+        let req = &req;
+
+        let cfg = engine.config();
+        let is_bare = req.model_path.is_none();
+        let is_native = matches!(engine, ServeEngine::Ds4);
+
+        let mut cmd_args: Vec<String> = Vec::new();
+        let program: String;
+
+        if engine.is_media() {
+            let script = resolve_media_script(engine)?;
+            program = resolve_python().to_string();
+            cmd_args.push(script.to_string_lossy().to_string());
+        } else if is_native {
+            let binary_path = resolve_native_binary(cfg.binary, &engine)?;
+            program = binary_path.to_string_lossy().to_string();
+            if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
+                cmd_args.push(flag.into());
+                cmd_args.push(model_path.clone());
+            }
+            cmd_args.extend(["--port".into(), port.to_string()]);
+            cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
+            cmd_args.push("--metal".into());
+            if let Some(ctx) = req.ctx_size {
+                cmd_args.extend(["-c".into(), ctx.to_string()]);
+            }
+            if let Some(ref draft) = req.draft_model {
+                cmd_args.extend(["--mtp".into(), draft.clone()]);
+                if let Some(n) = req.num_draft_tokens {
+                    cmd_args.extend(["--mtp-draft".into(), n.to_string()]);
+                }
+            }
+        } else if let Some(uvicorn_app) = cfg.uvicorn_app {
+            let py = resolve_python().to_string();
+            program = py;
+            cmd_args.extend([
+                "-m".into(), "uvicorn".into(), uvicorn_app.into(),
+                "--host".into(), "0.0.0.0".into(), "--port".into(), port.to_string(),
+                "--workers".into(), "1".into(), "--no-access-log".into(),
+            ]);
+        } else {
+            let py = resolve_python().to_string();
+            program = py;
+            cmd_args.push("-m".into());
+            cmd_args.push(cfg.binary.to_string());
+            cmd_args.extend(cfg.binary_args.iter().map(|s| s.to_string()));
+            if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
+                cmd_args.push(flag.into());
+                cmd_args.push(model_path.clone());
+            }
+            cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
+            if matches!(engine, ServeEngine::DFlash) {
+                if let Some(ref draft) = req.draft_model {
+                    cmd_args.extend(["--draft".into(), draft.clone()]);
+                }
+            }
+            if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
+                if let Some(ref draft) = req.draft_model {
+                    cmd_args.extend(["--draft-model".into(), draft.clone()]);
+                }
+                if let Some(n) = req.num_draft_tokens {
+                    cmd_args.extend(["--num-draft-tokens".into(), n.to_string()]);
+                }
+                if let Some(n) = req.decode_concurrency {
+                    cmd_args.extend(["--decode-concurrency".into(), n.to_string()]);
+                }
+                if let Some(n) = req.prompt_concurrency {
+                    cmd_args.extend(["--prompt-concurrency".into(), n.to_string()]);
+                }
+                if let Some(n) = req.prefill_step_size {
+                    cmd_args.extend(["--prefill-step-size".into(), n.to_string()]);
+                }
+                if let Some(n) = req.prompt_cache_size {
+                    cmd_args.extend(["--prompt-cache-size".into(), n.to_string()]);
+                }
+                if let Some(n) = req.prompt_cache_bytes {
+                    cmd_args.extend(["--prompt-cache-bytes".into(), n.to_string()]);
+                }
+                if req.pipeline {
+                    cmd_args.push("--pipeline".into());
+                }
+                if req.use_mtp {
+                    cmd_args.push("--mtp".into());
+                }
+                if let Some(ref ct) = req.cache_type {
+                    cmd_args.extend(["--cache-type-k".into(), ct.clone(), "--cache-type-v".into(), ct.clone()]);
+                }
+                if let Some(n) = req.max_tokens {
+                    cmd_args.extend(["--max-tokens".into(), n.to_string()]);
+                }
+            }
+        }
+
+        if let Some(ref extra) = req.extra_args {
+            cmd_args.extend(extra.iter().cloned());
+        }
+
+        let (final_program, final_args) = if !is_bare
+            && backend.is_distributed()
+            && cfg.model_flag.is_some()
+        {
+            let hf = req.hostfile.clone()
+                .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
+            let launcher = resolve_mlx_launch();
+            let backend_str = backend.as_str();
+            let mut jaccl_args = vec![
+                "--hostfile".to_string(), hf,
+                "--backend".to_string(), backend_str.to_string(),
+                "--env".to_string(), format!("MLX_DISTRIBUTED_BACKEND={backend_str}"),
+                "--env".to_string(), "MLX_METAL_FAST_SYNCH=1".to_string(),
+            ];
+            for (k, v) in allowlisted_env(req.env.as_ref()) {
+                jaccl_args.push("--env".to_string());
+                jaccl_args.push(format!("{k}={v}"));
+            }
+            jaccl_args.push("--".to_string());
+            jaccl_args.push(program);
+            jaccl_args.extend(cmd_args);
+            (launcher, jaccl_args)
+        } else {
+            (program, cmd_args)
+        };
+
+        Ok((final_program, final_args))
+    }
+
+    /// Representative (label, engine, backend, request) cases — one per engine
+    /// plus every conditional code path (bare, full-flags, extra_args, native
+    /// ctx/mtp, distributed wrapper, media). env kept to None on the distributed
+    /// case so HashMap iteration order can't make the assertion flaky.
+    fn cases() -> Vec<(&'static str, ServeEngine, ServeBackend, LoadRequest)> {
+        let m = || Some("/m/model".to_string());
+        vec![
+            ("mlx_lm_bare", ServeEngine::MlxLm, ServeBackend::Single, LoadRequest::default()),
+            ("mlx_lm_basic", ServeEngine::MlxLm, ServeBackend::Single,
+                LoadRequest { model_path: m(), ..Default::default() }),
+            ("mlx_lm_full", ServeEngine::MlxLm, ServeBackend::Single, LoadRequest {
+                model_path: m(), draft_model: Some("/m/draft".into()), num_draft_tokens: Some(3),
+                decode_concurrency: Some(1), prompt_concurrency: Some(4), prefill_step_size: Some(2048),
+                prompt_cache_size: Some(8), prompt_cache_bytes: Some(34_359_738_368),
+                pipeline: true, use_mtp: true, cache_type: Some("q8".into()), max_tokens: Some(4096),
+                ..Default::default()
+            }),
+            ("mlx_lm_extra", ServeEngine::MlxLm, ServeBackend::Single, LoadRequest {
+                model_path: m(), extra_args: Some(vec!["--temp".into(), "0.7".into()]), ..Default::default()
+            }),
+            ("mlx_lm_jaccl", ServeEngine::MlxLm, ServeBackend::Jaccl, LoadRequest {
+                model_path: m(), hostfile: Some("/hf/hosts.json".into()), ..Default::default()
+            }),
+            ("mlx_vlm_model", ServeEngine::MlxVlm, ServeBackend::Single,
+                LoadRequest { model_path: m(), ..Default::default() }),
+            ("mlx_vlm_bare", ServeEngine::MlxVlm, ServeBackend::Single, LoadRequest::default()),
+            ("vllm_mlx", ServeEngine::VllmMlx, ServeBackend::Single,
+                LoadRequest { model_path: m(), ..Default::default() }),
+            ("mlx_lm_share", ServeEngine::MlxLmShare, ServeBackend::Single,
+                LoadRequest { model_path: m(), ..Default::default() }),
+            ("dflash", ServeEngine::DFlash, ServeBackend::Single,
+                LoadRequest { model_path: m(), draft_model: Some("/m/draft".into()), ..Default::default() }),
+            ("ds4_full", ServeEngine::Ds4, ServeBackend::Single, LoadRequest {
+                model_path: m(), ctx_size: Some(262_144), draft_model: Some("/m/draft".into()),
+                num_draft_tokens: Some(3), ..Default::default()
+            }),
+            ("ds4_extra", ServeEngine::Ds4, ServeBackend::Single, LoadRequest {
+                model_path: m(), extra_args: Some(vec!["--foo".into(), "bar".into()]), ..Default::default()
+            }),
+            ("image_gen", ServeEngine::ImageGen, ServeBackend::Single, LoadRequest::default()),
+            ("video_gen", ServeEngine::VideoGen, ServeBackend::Single, LoadRequest::default()),
+
+            // ── Adversarial cases — the per-engine QUIRKS a naive data model
+            // would get wrong. These are the ones that make the parity gate real.
+            // (a) ds4 mtp is NESTED: --mtp-draft only if draft_model ALSO set. So
+            // num_draft_tokens WITHOUT draft_model → ds4 emits NOTHING for mtp.
+            ("ds4_ndt_no_draft", ServeEngine::Ds4, ServeBackend::Single, LoadRequest {
+                model_path: m(), num_draft_tokens: Some(5), ..Default::default()
+            }),
+            // (b) ds4 draft WITHOUT num_draft_tokens → `--mtp <file>` only, no --mtp-draft.
+            ("ds4_draft_no_ndt", ServeEngine::Ds4, ServeBackend::Single, LoadRequest {
+                model_path: m(), draft_model: Some("/m/draft".into()), ..Default::default()
+            }),
+            // (c) mlx_lm is INDEPENDENT (asymmetric vs ds4): num_draft_tokens
+            // WITHOUT draft_model → `--num-draft-tokens N` IS emitted.
+            ("mlx_lm_ndt_no_draft", ServeEngine::MlxLm, ServeBackend::Single, LoadRequest {
+                model_path: m(), num_draft_tokens: Some(5), ..Default::default()
+            }),
+            // (d) cache_type: ONE field → TWO flags (--cache-type-k + --cache-type-v).
+            ("mlx_lm_cache_type_only", ServeEngine::MlxLm, ServeBackend::Single, LoadRequest {
+                model_path: m(), cache_type: Some("q4".into()), ..Default::default()
+            }),
+            // (e) extra_args + distributed: extra_args join cmd_args BEFORE the
+            // jaccl wrapper → they must land AFTER `--` (to the inner program).
+            ("mlx_lm_jaccl_extra", ServeEngine::MlxLm, ServeBackend::Jaccl, LoadRequest {
+                model_path: m(), hostfile: Some("/hf/hosts.json".into()),
+                extra_args: Some(vec!["--temp".into(), "0.5".into()]), ..Default::default()
+            }),
+            // (f) model_flag:None (mlx_vlm) + distributed + non-bare → must NOT
+            // wrap (guard requires model_flag.is_some()).
+            ("mlx_vlm_jaccl_noswrap", ServeEngine::MlxVlm, ServeBackend::Jaccl, LoadRequest {
+                model_path: m(), hostfile: Some("/hf/hosts.json".into()), ..Default::default()
+            }),
+        ]
+    }
+
+    /// Baseline: production == frozen legacy for every case. Trivially green now
+    /// (identical code); becomes the real gate once build_serve_argv goes
+    /// data-driven. `{:?}` on the Result compares Ok values AND Err messages,
+    /// so media-script-absent machines still assert equal.
+    #[test]
+    fn production_matches_legacy_oracle() {
+        // Fixed port for all cases — build_serve_argv uses it verbatim on both
+        // sides (fixed-port pinning lives in the caller, not here), so parity
+        // holds regardless of the value.
+        const PORT: u16 = 19080;
+        for (label, engine, backend, req) in cases() {
+            let prod = format!("{:?}", build_serve_argv(&req, PORT, engine, backend));
+            let legacy = format!("{:?}", build_serve_argv_legacy(&req, PORT, engine, backend));
+            assert_eq!(prod, legacy, "build_serve_argv parity mismatch for case '{label}'");
+        }
+    }
+}
+
+#[cfg(test)]
 mod build_serve_argv_tests {
     use super::*;
 
