@@ -1254,6 +1254,73 @@ fn apply_arg_rules(rules: &[ArgRule], req: &LoadRequest, cmd_args: &mut Vec<Stri
     }
 }
 
+/// Reserved flags asmi sets itself (port/bind/model/metal). A custom or
+/// override engine's args (and caller `extra_args`) must NOT override these —
+/// doing so desyncs the port asmi injects+tracks, the bind host, or the loaded
+/// model, breaking asmi's own invariants.
+///
+/// NORMALIZED match (the load-bearing detail): argparse accepts `--flag`,
+/// `--flag=value`, AND glued short `-mFOO`, so a plain equality check misses the
+/// `=`-joined / glued forms — the exact bypass the r1o deploy-preview review
+/// caught (`--port=9999` sails past `tokens.contains("--port")`). We split on the
+/// first `=` and also treat any `-m…` token as the reserved short model flag.
+///
+/// This is the asmi-SIDE enforcement (the web-side `shell-split.ts` guard is only
+/// a UX guardrail — a direct POST /serve/load bypasses it). It is what makes the
+/// arbitrary-flag template layer safe. Applied to override/custom engine args +
+/// `extra_args`; built-ins are trusted + parity-frozen.
+// Wired into the load/assembly path in the next increment (alongside the
+// pre-rollout live-profile grep for the verbatim→rejector behavior change).
+#[allow(dead_code)]
+pub(crate) fn assert_safe_engine_args(args: &[String]) -> Result<(), anyhow::Error> {
+    const RESERVED_LONG: &[&str] = &["--port", "--host", "--model", "--metal"];
+    for tok in args {
+        let head = tok.split('=').next().unwrap_or(tok.as_str());
+        if RESERVED_LONG.contains(&head) {
+            anyhow::bail!(
+                "engine arg '{head}' is reserved by asmi (it sets port/host/model/metal) and cannot be overridden"
+            );
+        }
+        // Short model flag `-m`, including glued (`-mFOO`) and `-m=x` forms.
+        // `--model`/`--metal` start with `--m` (second char '-'), not `-m`.
+        if tok.starts_with("-m") {
+            anyhow::bail!("engine arg '{tok}' overrides the reserved model flag (-m)");
+        }
+        if tok.contains("..") {
+            anyhow::bail!("engine arg '{tok}' contains a path traversal ('..')");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod engine_arg_guard_tests {
+    use super::assert_safe_engine_args;
+    fn v(xs: &[&str]) -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn allows_tuning_flags() {
+        assert!(assert_safe_engine_args(&v(&["--temp", "0.7"])).is_ok());
+        assert!(assert_safe_engine_args(&v(&["--num-draft-tokens", "3"])).is_ok());
+        assert!(assert_safe_engine_args(&v(&["--rope-scale", "1.5"])).is_ok());
+    }
+    #[test]
+    fn blocks_reserved_space_and_equals_and_glued_forms() {
+        // The =-joined / glued bypass a token-equality denylist misses.
+        for bad in [
+            &["--port", "9999"][..], &["--port=9999"][..], &["--host=0.0.0.0"][..],
+            &["--model=/m/other"][..], &["--metal"][..], &["-mfoo"][..],
+            &["-m", "/m/other"][..], &["-m=/m/other"][..],
+        ] {
+            assert!(assert_safe_engine_args(&v(bad)).is_err(), "should block {bad:?}");
+        }
+    }
+    #[test]
+    fn blocks_path_traversal() {
+        assert!(assert_safe_engine_args(&v(&["--adapter", "../../etc/x"])).is_err());
+    }
+}
+
 /// Build the `(program, args)` a serve request would spawn — PURE and
 /// side-effect-free. Shared by the real spawn path (`do_serve_load_inner`) and
 /// the synchronous `dry_run` preview in the HTTP handler, so the preview can
