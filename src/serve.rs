@@ -1074,6 +1074,249 @@ async fn do_serve_load(inner: Arc<RwLock<ManagedProcess>>, readiness: Arc<HttpHe
     }
 }
 
+/// Build the `(program, args)` a serve request would spawn — PURE and
+/// side-effect-free. Shared by the real spawn path (`do_serve_load_inner`) and
+/// the synchronous `dry_run` preview in the HTTP handler, so the preview can
+/// never drift from what actually runs. Appends `req.extra_args` last. Expands
+/// `~` in the model path internally (idempotent), so callers may pass a raw or
+/// already-expanded request.
+pub(crate) fn build_serve_argv(
+    req: &LoadRequest,
+    port: u16,
+    engine: ServeEngine,
+    backend: ServeBackend,
+) -> Result<(String, Vec<String>), anyhow::Error> {
+    // Expand ~ in model path (no shell to do it for us). Idempotent.
+    let mut req = req.clone();
+    if let Some(ref mut path) = req.model_path {
+        if path.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                *path = format!("{}/{}", home.display(), &path[2..]);
+            }
+        }
+    }
+    let req = &req;
+
+    let cfg = engine.config();
+    let is_bare = req.model_path.is_none();
+    let is_native = matches!(engine, ServeEngine::Ds4);
+
+    let mut cmd_args: Vec<String> = Vec::new();
+    let program: String;
+
+    if engine.is_media() {
+        // Media gen servers are plain scripts (stdlib-only) run under the
+        // resolved python. They take no CLI flags — port/bind go via env on spawn.
+        let script = resolve_media_script(engine)?;
+        program = resolve_python().to_string();
+        cmd_args.push(script.to_string_lossy().to_string());
+    } else if is_native {
+        let binary_path = resolve_native_binary(cfg.binary, &engine)?;
+        program = binary_path.to_string_lossy().to_string();
+
+        // Model flag + path
+        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
+            cmd_args.push(flag.into());
+            cmd_args.push(model_path.clone());
+        }
+
+        // Port binding (critical: without --port, ds4 defaults to 8000, not 8080)
+        cmd_args.extend(["--port".into(), port.to_string()]);
+        cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
+
+        // Backend: force Metal on Apple Silicon. The production GGUF quant
+        // (DeepSeek-V4-Flash Q4-imatrix) has Q4_K routed experts that CRASH on
+        // ds4's CPU path; Metal handles both Q4_K and IQ2_XXS. ds4's `--mtp`
+        // speculative path is also Metal-only. asmi is Apple-Silicon-exclusive.
+        cmd_args.push("--metal".into());
+
+        // Context window size. Without -c, ds4-server defaults to 8192 (silent
+        // truncation trap); callers pass the model's real max via ctx_size.
+        if let Some(ctx) = req.ctx_size {
+            cmd_args.extend(["-c".into(), ctx.to_string()]);
+        }
+
+        // Speculative decoding via the MTP draft head. ds4's `--mtp FILE` takes
+        // a draft GGUF, distinct from mlx_lm's boolean `--mtp`.
+        if let Some(ref draft) = req.draft_model {
+            cmd_args.extend(["--mtp".into(), draft.clone()]);
+            if let Some(n) = req.num_draft_tokens {
+                cmd_args.extend(["--mtp-draft".into(), n.to_string()]);
+            }
+        }
+    } else if let Some(uvicorn_app) = cfg.uvicorn_app {
+        // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
+        let py = resolve_python().to_string();
+        program = py;
+        cmd_args.extend([
+            "-m".into(),
+            "uvicorn".into(),
+            uvicorn_app.into(),
+            "--host".into(),
+            "0.0.0.0".into(),
+            "--port".into(),
+            port.to_string(),
+            "--workers".into(),
+            "1".into(),
+            "--no-access-log".into(),
+        ]);
+    } else {
+        // Run as python3 -m <module> (e.g. python3 -m mlx_lm.server)
+        let py = resolve_python().to_string();
+        program = py;
+        cmd_args.push("-m".into());
+        cmd_args.push(cfg.binary.to_string());
+        cmd_args.extend(cfg.binary_args.iter().map(|s| s.to_string()));
+        // Only pass --model flag when we have a model to load
+        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
+            cmd_args.push(flag.into());
+            cmd_args.push(model_path.clone());
+        }
+        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
+
+        // DFlash-specific flags (dflash_mlx.serve uses --draft for the drafter model)
+        if matches!(engine, ServeEngine::DFlash) {
+            if let Some(ref draft) = req.draft_model {
+                cmd_args.extend(["--draft".into(), draft.clone()]);
+            }
+        }
+
+        // Optimization passthrough (mlx_lm only — these flags are mlx_lm.server-specific)
+        if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
+            if let Some(ref draft) = req.draft_model {
+                cmd_args.extend(["--draft-model".into(), draft.clone()]);
+            }
+            if let Some(n) = req.num_draft_tokens {
+                cmd_args.extend(["--num-draft-tokens".into(), n.to_string()]);
+            }
+            if let Some(n) = req.decode_concurrency {
+                cmd_args.extend(["--decode-concurrency".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prompt_concurrency {
+                cmd_args.extend(["--prompt-concurrency".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prefill_step_size {
+                cmd_args.extend(["--prefill-step-size".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prompt_cache_size {
+                cmd_args.extend(["--prompt-cache-size".into(), n.to_string()]);
+            }
+            if let Some(n) = req.prompt_cache_bytes {
+                cmd_args.extend(["--prompt-cache-bytes".into(), n.to_string()]);
+            }
+            if req.pipeline {
+                cmd_args.push("--pipeline".into());
+            }
+            if req.use_mtp {
+                cmd_args.push("--mtp".into());
+            }
+            if let Some(ref ct) = req.cache_type {
+                cmd_args.extend(["--cache-type-k".into(), ct.clone(), "--cache-type-v".into(), ct.clone()]);
+            }
+            if let Some(n) = req.max_tokens {
+                cmd_args.extend(["--max-tokens".into(), n.to_string()]);
+            }
+        }
+    }
+
+    // Generic passthrough: caller-supplied extra flags, appended LAST so they
+    // override earlier ones. Pre-tokenized — asmi does not re-parse (no quoting
+    // drift). For distributed runs these ride after `--`, i.e. to the inner
+    // program, because the wrapper below wraps `program` + `cmd_args` wholesale.
+    if let Some(ref extra) = req.extra_args {
+        cmd_args.extend(extra.iter().cloned());
+    }
+
+    // Distributed wrapper (only for engines with model_flag and non-bare).
+    // Covers jaccl, jaccl-ring, and ring — mlx.launch accepts all three.
+    let (final_program, final_args) = if !is_bare
+        && backend.is_distributed()
+        && cfg.model_flag.is_some()
+    {
+        let hf = req
+            .hostfile
+            .clone()
+            .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
+        let launcher = resolve_mlx_launch();
+        let backend_str = backend.as_str();
+        let mut jaccl_args = vec![
+            "--hostfile".to_string(),
+            hf,
+            "--backend".to_string(),
+            backend_str.to_string(),
+            // MLX_DISTRIBUTED_BACKEND is read by the _mlx_backend_fix.pth rank
+            // hook and passed to mx.distributed.init() — without it the
+            // backend-selection race can hang rank 0.
+            "--env".to_string(),
+            format!("MLX_DISTRIBUTED_BACKEND={backend_str}"),
+            "--env".to_string(),
+            "MLX_METAL_FAST_SYNCH=1".to_string(),
+        ];
+        for (k, v) in allowlisted_env(req.env.as_ref()) {
+            jaccl_args.push("--env".to_string());
+            jaccl_args.push(format!("{k}={v}"));
+        }
+        jaccl_args.push("--".to_string());
+        jaccl_args.push(program);
+        jaccl_args.extend(cmd_args);
+        (launcher, jaccl_args)
+    } else {
+        (program, cmd_args)
+    };
+
+    Ok((final_program, final_args))
+}
+
+#[cfg(test)]
+mod build_serve_argv_tests {
+    use super::*;
+
+    #[test]
+    fn mlx_lm_has_model_port_and_appends_extra_args_last() {
+        let req = LoadRequest {
+            model_path: Some("/Users/ma/Models/Qwen3.6-27B-mlx-4bit".to_string()),
+            engine: ServeEngine::MlxLm,
+            extra_args: Some(vec!["--temp".into(), "0.7".into()]),
+            ..Default::default()
+        };
+        let (_program, args) =
+            build_serve_argv(&req, 19080, ServeEngine::MlxLm, ServeBackend::Single).unwrap();
+        // asmi invokes the mlx_lm SUBCOMMAND form (`python -m mlx_lm server`),
+        // NOT the module form (`-m mlx_lm.server`) the web config assumes — the
+        // exact reason the preview must come from asmi, not a web reconstruction.
+        assert!(
+            args.windows(3).any(|w| w[0] == "-m" && w[1] == "mlx_lm" && w[2] == "server"),
+            "expected `-m mlx_lm server`; got {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "/Users/ma/Models/Qwen3.6-27B-mlx-4bit"),
+            "expected --model <path>; got {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--port" && w[1] == "19080"),
+            "expected --port 19080; got {args:?}"
+        );
+        // Generic passthrough must be appended LAST (Single backend = no wrapper).
+        assert_eq!(
+            &args[args.len() - 2..],
+            &["--temp".to_string(), "0.7".to_string()],
+            "extra_args must be last; got {args:?}"
+        );
+    }
+
+    #[test]
+    fn bare_request_omits_model_flag() {
+        let req = LoadRequest { engine: ServeEngine::MlxLm, ..Default::default() };
+        let (_p, args) =
+            build_serve_argv(&req, 19080, ServeEngine::MlxLm, ServeBackend::Single).unwrap();
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "bare start must omit --model; got {args:?}"
+        );
+    }
+}
+
 async fn do_serve_load_inner(
     inner: &Arc<RwLock<ManagedProcess>>,
     readiness: &Arc<HttpHealth>,
@@ -1171,174 +1414,11 @@ async fn do_serve_load_inner(
         resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await
     };
 
-    // Build command
-    let cfg = engine.config();
-    let mut cmd_args: Vec<String> = Vec::new();
-    let program: String;
-
-    // Native binary engines (e.g. ds4) bypass Python entirely.
+    // Build the exact (program, args) via the shared builder — the SAME code the
+    // dry-run preview uses, so preview and reality can't drift. Also appends
+    // req.extra_args. `is_native` is still needed below (ds4 shader cwd).
     let is_native = matches!(engine, ServeEngine::Ds4);
-
-    if engine.is_media() {
-        // Media gen servers are plain scripts (stdlib-only) run under the
-        // resolved python. They take no CLI flags — port/bind go via env,
-        // injected on spawn_cmd below.
-        let script = resolve_media_script(engine)?;
-        program = resolve_python().to_string();
-        cmd_args.push(script.to_string_lossy().to_string());
-    } else if is_native {
-        let binary_path = resolve_native_binary(cfg.binary, &engine)?;
-        program = binary_path.to_string_lossy().to_string();
-
-        // Model flag + path
-        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
-            cmd_args.push(flag.into());
-            cmd_args.push(model_path.clone());
-        }
-
-        // Port binding (critical: without --port, ds4 defaults to 8000, not 8080)
-        cmd_args.extend(["--port".into(), port.to_string()]);
-        cmd_args.extend(["--host".into(), "0.0.0.0".into()]);
-
-        // Backend: force Metal on Apple Silicon. The production GGUF quant
-        // (DeepSeek-V4-Flash Q4-imatrix) has Q4_K routed experts that CRASH on
-        // ds4's CPU path ("expected IQ2_XXS expert tensors"); Metal handles
-        // both Q4_K and IQ2_XXS. ds4's `--mtp` speculative path is also
-        // Metal-only. asmi is Apple-Silicon-exclusive, so this is unconditional.
-        cmd_args.push("--metal".into());
-
-        // Context window size. Without -c, ds4-server defaults to 8192 (silent
-        // truncation trap); callers pass the model's real max via ctx_size.
-        if let Some(ctx) = req.ctx_size {
-            cmd_args.extend(["-c".into(), ctx.to_string()]);
-        }
-
-        // Speculative decoding via the MTP draft head. ds4's `--mtp FILE` takes
-        // a draft GGUF (the DeepSeek-V4-Flash-MTP head), distinct from mlx_lm's
-        // boolean `--mtp`. draft_model carries the head's path; num_draft_tokens
-        // maps to `--mtp-draft N` (max speculative tokens per step).
-        if let Some(ref draft) = req.draft_model {
-            cmd_args.extend(["--mtp".into(), draft.clone()]);
-            if let Some(n) = req.num_draft_tokens {
-                cmd_args.extend(["--mtp-draft".into(), n.to_string()]);
-            }
-        }
-    } else if let Some(uvicorn_app) = cfg.uvicorn_app {
-        // Always invoke via resolve_python() since launchd doesn't have Homebrew in PATH.
-        let py = resolve_python().to_string();
-        // Uvicorn-wrapped engines (avoids reload=True bugs in mlx_vlm)
-        program = py;
-        cmd_args.extend([
-            "-m".into(),
-            "uvicorn".into(),
-            uvicorn_app.into(),
-            "--host".into(),
-            "0.0.0.0".into(),
-            "--port".into(),
-            port.to_string(),
-            "--workers".into(),
-            "1".into(),
-            "--no-access-log".into(),
-        ]);
-    } else {
-        // Run as python3 -m <module> (e.g. python3 -m mlx_lm.server)
-        let py = resolve_python().to_string();
-        program = py;
-        cmd_args.push("-m".into());
-        cmd_args.push(cfg.binary.to_string());
-        cmd_args.extend(cfg.binary_args.iter().map(|s| s.to_string()));
-        // Only pass --model flag when we have a model to load
-        if let (Some(flag), Some(model_path)) = (cfg.model_flag, &req.model_path) {
-            cmd_args.push(flag.into());
-            cmd_args.push(model_path.clone());
-        }
-        cmd_args.extend(["--port".into(), port.to_string(), "--host".into(), "0.0.0.0".into()]);
-
-        // DFlash-specific flags (dflash_mlx.serve uses --draft for the drafter model)
-        if matches!(engine, ServeEngine::DFlash) {
-            if let Some(ref draft) = req.draft_model {
-                cmd_args.extend(["--draft".into(), draft.clone()]);
-            }
-        }
-
-        // Optimization passthrough (mlx_lm only — these flags are mlx_lm.server-specific)
-        if matches!(engine, ServeEngine::MlxLm | ServeEngine::MlxLmShare) {
-            if let Some(ref draft) = req.draft_model {
-                cmd_args.extend(["--draft-model".into(), draft.clone()]);
-            }
-            if let Some(n) = req.num_draft_tokens {
-                cmd_args.extend(["--num-draft-tokens".into(), n.to_string()]);
-            }
-            if let Some(n) = req.decode_concurrency {
-                cmd_args.extend(["--decode-concurrency".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prompt_concurrency {
-                cmd_args.extend(["--prompt-concurrency".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prefill_step_size {
-                cmd_args.extend(["--prefill-step-size".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prompt_cache_size {
-                cmd_args.extend(["--prompt-cache-size".into(), n.to_string()]);
-            }
-            if let Some(n) = req.prompt_cache_bytes {
-                cmd_args.extend(["--prompt-cache-bytes".into(), n.to_string()]);
-            }
-            if req.pipeline {
-                cmd_args.push("--pipeline".into());
-            }
-            if req.use_mtp {
-                cmd_args.push("--mtp".into());
-            }
-            if let Some(ref ct) = req.cache_type {
-                cmd_args.extend(["--cache-type-k".into(), ct.clone(), "--cache-type-v".into(), ct.clone()]);
-            }
-            if let Some(n) = req.max_tokens {
-                cmd_args.extend(["--max-tokens".into(), n.to_string()]);
-            }
-        }
-    }
-
-    // Distributed wrapper (only for engines with model_flag and non-bare).
-    // Covers jaccl, jaccl-ring, and ring — mlx.launch accepts all three.
-    let (final_program, final_args) = if !is_bare
-        && backend.is_distributed()
-        && cfg.model_flag.is_some()
-    {
-        let hf = req
-            .hostfile
-            .clone()
-            .unwrap_or_else(|| default_hostfile().to_string_lossy().to_string());
-        let launcher = resolve_mlx_launch();
-        let backend_str = backend.as_str();
-        let mut jaccl_args = vec![
-            "--hostfile".to_string(),
-            hf,
-            "--backend".to_string(),
-            backend_str.to_string(),
-            // Env lock-in: mlx.launch exports each --env pair on EVERY rank
-            // before exec (shlex-quoted, launch.py make_launch_script), so the
-            // runtime env no longer depends on per-node login-shell state.
-            // MLX_DISTRIBUTED_BACKEND is read by the _mlx_backend_fix.pth rank
-            // hook and passed to mx.distributed.init() — without it the
-            // backend-selection race can hang rank 0 (upstream rejected the
-            // env var in mlx PR #3440; the hook is our local carry).
-            "--env".to_string(),
-            format!("MLX_DISTRIBUTED_BACKEND={backend_str}"),
-            "--env".to_string(),
-            "MLX_METAL_FAST_SYNCH=1".to_string(),
-        ];
-        for (k, v) in allowlisted_env(req.env.as_ref()) {
-            jaccl_args.push("--env".to_string());
-            jaccl_args.push(format!("{k}={v}"));
-        }
-        jaccl_args.push("--".to_string());
-        jaccl_args.push(program);
-        jaccl_args.extend(cmd_args);
-        (launcher, jaccl_args)
-    } else {
-        (program, cmd_args)
-    };
+    let (final_program, final_args) = build_serve_argv(&req, port, engine, backend)?;
 
     // Spawn — truncate log so read_log_tail reads only this run's output
     let log_path = format!("/tmp/r1o-mlx-server-{port}.log");

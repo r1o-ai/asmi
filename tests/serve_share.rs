@@ -471,6 +471,8 @@ async fn test_load_request_json_round_trip_with_all_fields() {
             "MLX_DISTRIBUTED_BACKEND".to_string(),
             "jaccl".to_string(),
         )])),
+        dry_run: true,
+        extra_args: Some(vec!["--reasoning-effort".to_string(), "high".to_string()]),
     };
 
     let json_str = serde_json::to_string(&original).expect("should serialize");
@@ -490,6 +492,8 @@ async fn test_load_request_json_round_trip_with_all_fields() {
     assert_eq!(deserialized.vision_cache_size, original.vision_cache_size);
     assert_eq!(deserialized.ctx_size, original.ctx_size);
     assert_eq!(deserialized.env, original.env);
+    assert_eq!(deserialized.dry_run, original.dry_run);
+    assert_eq!(deserialized.extra_args, original.extra_args);
 }
 
 #[tokio::test]

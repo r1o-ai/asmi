@@ -1095,6 +1095,20 @@ pub struct LoadRequest {
     /// serve.rs `allowlisted_env`); disallowed keys are dropped with a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<std::collections::HashMap<String, String>>,
+
+    /// Return the command that WOULD be spawned, without spawning it. A generic
+    /// preview capability (like `kubectl --dry-run`): no side effects, does not
+    /// touch the port or manager. The handler answers synchronously with
+    /// `{ program, args, command }`.
+    #[serde(default)]
+    pub dry_run: bool,
+
+    /// Extra CLI args appended verbatim to the spawned server command. A generic
+    /// passthrough for engine flags asmi does not model as first-class fields —
+    /// pre-tokenized by the caller (asmi does NOT re-parse, so there is no
+    /// quoting drift). Appended last, so they override earlier flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_args: Option<Vec<String>>,
 }
 
 fn default_backend_str() -> String {
@@ -1124,6 +1138,8 @@ impl Default for LoadRequest {
             vision_cache_size: None,
             ctx_size: None,
             env: None,
+            dry_run: false,
+            extra_args: None,
         }
     }
 }

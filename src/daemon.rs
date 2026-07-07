@@ -1434,6 +1434,38 @@ async fn serve_load_handler(
     // Infer port: explicit ?port= > engine default (from env or built-in)
     let port = q.port.unwrap_or(crate::serve::port_for_engine(req.engine));
 
+    // Dry-run: return the EXACT command asmi would spawn, without creating a
+    // manager, touching the port, or loading. Generic preview (like
+    // `kubectl --dry-run`) built from the same build_serve_argv the real spawn
+    // path uses, so the preview can never drift from reality.
+    if req.dry_run {
+        let engine = req.engine;
+        let backend =
+            crate::serve::resolve_backend_validated(&req.backend, req.hostfile.as_deref()).await;
+        let (program, args) = crate::serve::build_serve_argv(&req, port, engine, backend)
+            .map_err(|e| ApiError::BadRequest(format!("dry_run failed: {e}")))?;
+        // Shell-ish display string; `args` is the authoritative form.
+        let command = std::iter::once(program.clone())
+            .chain(args.iter().cloned())
+            .map(|a| {
+                if a.is_empty() || a.contains(char::is_whitespace) {
+                    format!("\"{a}\"")
+                } else {
+                    a
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Ok(Json(serde_json::json!({
+            "dry_run": true,
+            "program": program,
+            "args": args,
+            "command": command,
+            "engine": engine,
+            "port": port,
+        })));
+    }
+
     // Get or create a manager for this port
     let created_now = {
         let managers = state.serve_managers.read().await;

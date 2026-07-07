@@ -514,6 +514,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             chip_model: None,
             serial_number: None,
+            serve_slots: vec![],
             model_name: None,
             cpu_watts: 0.0,
             gpu_watts: 0.0,
