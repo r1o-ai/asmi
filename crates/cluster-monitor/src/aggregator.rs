@@ -189,6 +189,14 @@ impl ClusterState {
         self.total_nodes = self.scan_results.iter().filter(|r| r.ssh_ok).count();
     }
 
+    /// Drop scan_results + snapshots whose hostname is not in `canonical`
+    /// (NodeMap.nodes) and are offline / ssh_ok=false.
+    ///
+    /// Stub for A1 failing specs — real body lands in A2.
+    pub fn prune_non_canonical_offline(&mut self, _canonical: &HashSet<String>) {
+        // intentional no-op until A2
+    }
+
     /// Mark a node as offline (sets online=false in its snapshot).
     pub fn mark_offline(&mut self, hostname: &str) {
         if let Some(snap) = self.snapshots.get_mut(hostname) {
@@ -270,6 +278,7 @@ mod tests {
             top_tasks: vec![],
             rdma: None,
             interface_ips: std::collections::BTreeMap::new(),
+            serve_slots: vec![],
         }
     }
 
@@ -516,6 +525,105 @@ mod tests {
         assert_eq!(state.total_nodes, 3);
         // All unique entries preserved
         assert_eq!(state.scan_results.len(), 4);
+    }
+
+    /// RC4: a later offline scan must overwrite a prior ssh_ok=true entry.
+    /// Without the fix, merge_scan keeps the old success forever (ghost poll tax).
+    #[test]
+    fn merge_scan_overwrites_prior_ssh_ok_with_failure() {
+        let mut state = ClusterState::new(60);
+        state.update_scan(vec![ScanResult {
+            hostname: "mac-studio".to_string(),
+            reachable: true,
+            ssh_ok: true,
+            chip: Some("Apple M2 Ultra".to_string()),
+            ram_gb: Some(192),
+            gpu_cores: None,
+            rdma: None,
+            mlx_servers: vec![],
+            latency_ms: None,
+            link_speed: None,
+        }]);
+        assert_eq!(state.total_nodes, 1);
+
+        state.merge_scan(vec![ScanResult {
+            hostname: "mac-studio".to_string(),
+            reachable: false,
+            ssh_ok: false,
+            chip: None,
+            ram_gb: None,
+            gpu_cores: None,
+            rdma: None,
+            mlx_servers: vec![],
+            latency_ms: None,
+            link_speed: None,
+        }]);
+
+        let stored = state
+            .scan_results
+            .iter()
+            .find(|r| r.hostname.eq_ignore_ascii_case("mac-studio"))
+            .expect("host must remain in scan_results until prune");
+        assert!(
+            !stored.ssh_ok,
+            "later offline scan must replace prior ssh_ok=true (RC4 sticky merge)"
+        );
+        assert_eq!(state.total_nodes, 0);
+    }
+
+    /// Ghost hostnames not in NodeMap.nodes that are offline must be dropped
+    /// from scan_results and snapshots so /cluster and poll lists shrink.
+    #[test]
+    fn prune_non_canonical_offline_removes_ghost() {
+        let mut state = ClusterState::new(60);
+        state.update_scan(vec![
+            ScanResult {
+                hostname: "hub".to_string(),
+                reachable: true,
+                ssh_ok: true,
+                chip: Some("Apple M3 Ultra".to_string()),
+                ram_gb: Some(512),
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+            ScanResult {
+                hostname: "mac-studio".to_string(),
+                reachable: false,
+                ssh_ok: false,
+                chip: None,
+                ram_gb: None,
+                gpu_cores: None,
+                rdma: None,
+                mlx_servers: vec![],
+                latency_ms: None,
+                link_speed: None,
+            },
+        ]);
+        state.update_node(mock_snapshot("hub", true));
+        state.update_node(mock_snapshot("mac-studio", false));
+
+        let mut canonical = HashSet::new();
+        canonical.insert("hub".to_string());
+        state.prune_non_canonical_offline(&canonical);
+
+        assert!(
+            state
+                .scan_results
+                .iter()
+                .all(|r| r.hostname.eq_ignore_ascii_case("hub")),
+            "offline ghost mac-studio must leave scan_results"
+        );
+        assert!(
+            !state.snapshots.contains_key("mac-studio"),
+            "offline ghost mac-studio must leave snapshots"
+        );
+        assert!(
+            state.snapshots.contains_key("hub"),
+            "canonical online hub must remain"
+        );
     }
 
     #[test]
