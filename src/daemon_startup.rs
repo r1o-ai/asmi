@@ -314,8 +314,16 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
     // Topology cache — runs discover_topology (native first, mlx/ARP fallback) every 60s (only in cluster hub mode)
     let topology_cache: Arc<tokio::sync::RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>> =
         Arc::new(tokio::sync::RwLock::new(None));
+    // RC2: attempt meta so failed scans stamp freshness/error without freezing age.
+    // Seed scan_ok=false until first successful scan; last_attempt = now.
+    let topology_meta: Arc<tokio::sync::RwLock<crate::topology::TopologyScanMeta>> =
+        Arc::new(tokio::sync::RwLock::new(crate::topology::TopologyScanMeta::failure(
+            std::time::Instant::now(),
+            "topology not yet scanned",
+        )));
     if cluster_hub {
         let topo_cache = Arc::clone(&topology_cache);
+        let topo_meta = Arc::clone(&topology_meta);
         let topo_nodes: Vec<String> = {
             let nm = asmi_core::NodeMap::load();
             nm.nodes.clone()
@@ -345,8 +353,23 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                         }).await;
                         match result {
                             Ok(Ok(r)) => Some(r),
-                            Ok(Err(e)) => { tracing::warn!(error = %e, "topology scan failed"); None }
-                            Err(e) => { tracing::warn!(error = %e, "topology task panicked"); None }
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "topology scan failed");
+                                let now = std::time::Instant::now();
+                                *topo_meta.write().await =
+                                    crate::topology::TopologyScanMeta::failure(now, e.to_string());
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "topology task panicked");
+                                let now = std::time::Instant::now();
+                                *topo_meta.write().await =
+                                    crate::topology::TopologyScanMeta::failure(
+                                        now,
+                                        format!("topology task panicked: {e}"),
+                                    );
+                                None
+                            }
                         }
                     };
 
@@ -418,13 +441,19 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
                             jaccl_ready = merged_report.jaccl_ready,
                             "topology scan complete (union-merged)"
                         );
-                        *topo_cache.write().await = Some((merged_report, std::time::Instant::now()));
+                        let now = std::time::Instant::now();
+                        *topo_cache.write().await = Some((merged_report, now));
+                        *topo_meta.write().await = crate::topology::TopologyScanMeta::success(now);
                         if new_hash != last_hash && last_hash != 0 {
                             tracing::info!("TB5 topology changed — triggering hostfile regen");
                             let client = reqwest::Client::new();
                             let _ = client.post(format!("http://127.0.0.1:{port}/config/sync")).send().await;
                         }
                         last_hash = new_hash;
+                    } else {
+                        // Failure path already stamped meta above when discover_topology
+                        // returned Err. Keep last good links in topo_cache (do not wipe).
+                        tracing::warn!("topology scan failed — stamped attempt meta (scan_ok=false)");
                     }
 
                     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -479,6 +508,7 @@ pub async fn run_serve(port: u16, bind: String, interval: u64, cluster_hub: bool
         model_cache,
         thunderbolt_cache,
         topology_cache,
+        topology_meta,
         runtime,
         serve_managers,
         share_manager,

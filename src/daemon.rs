@@ -41,6 +41,10 @@ pub struct AppState {
     pub model_cache: Arc<RwLock<Option<(Vec<asmi_core::LocalModel>, std::time::Instant)>>>,
     pub thunderbolt_cache: Arc<RwLock<Option<(serde_json::Value, std::time::Instant)>>>,
     pub topology_cache: Arc<RwLock<Option<(crate::topology::TopologyReport, std::time::Instant)>>>,
+    /// Scan attempt freshness independent of last-good report (RC2).
+    /// `last_attempt` advances on every success *and* failure so /topology
+    /// age does not freeze for hours after a single early success.
+    pub topology_meta: Arc<RwLock<crate::topology::TopologyScanMeta>>,
     pub runtime: Arc<RuntimeInfo>,
     pub serve_managers: Arc<RwLock<HashMap<u16, crate::serve::ServeManager>>>,
     pub share_manager: crate::serve::ShareManager,
@@ -215,10 +219,11 @@ async fn cluster_full_handler(State(state): State<AppState>) -> Json<serde_json:
         None => serde_json::json!([]),
     };
 
-    // 2. Topology — from cached topology scan
+    // 2. Topology — from cached topology scan + attempt meta (RC2)
     let topo_json = {
         let cache = state.topology_cache.read().await;
-        cache.as_ref().map(|(report, scanned_at)| {
+        let meta = state.topology_meta.read().await;
+        cache.as_ref().map(|(report, _scanned_at)| {
             serde_json::json!({
                 "links": report.links,
                 "nodes": report.nodes,
@@ -226,7 +231,9 @@ async fn cluster_full_handler(State(state): State<AppState>) -> Json<serde_json:
                 "jaccl_ready": report.jaccl_ready,
                 "jaccl_ready_subsets": report.jaccl_ready_subsets,
                 "mesh_complete": report.mesh_complete,
-                "scan_age_seconds": scanned_at.elapsed().as_secs(),
+                "scan_age_seconds": meta.scan_age_seconds(),
+                "scan_ok": meta.scan_ok,
+                "last_error": meta.last_error,
             })
         })
     };
@@ -360,7 +367,8 @@ async fn jaccl_config_handler(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Prefer live topology cache over stale NodeMap rdma_links
     let topo_cache = state.topology_cache.read().await;
-    if let Some((report, scanned_at)) = topo_cache.as_ref() {
+    let topo_meta = state.topology_meta.read().await;
+    if let Some((report, _scanned_at)) = topo_cache.as_ref() {
         if report.links.is_empty() {
             return Err(ApiError::NotFound("Topology scanned but no RDMA links found.".into()));
         }
@@ -440,11 +448,13 @@ async fn jaccl_config_handler(
             "links_total": links.len(),
             "mesh_complete": report.mesh_complete,
             "jaccl_ready": report.jaccl_ready,
-            "scan_age_seconds": scanned_at.elapsed().as_secs(),
+            "scan_age_seconds": topo_meta.scan_age_seconds(),
+            "scan_ok": topo_meta.scan_ok,
             "local_hostname": state.hostname,
         })));
     }
     drop(topo_cache);
+    drop(topo_meta);
 
     // Fallback: use stale NodeMap rdma_links (pre-topology scan)
     let nm = state.node_map.read().await;
@@ -1185,19 +1195,48 @@ async fn thunderbolt_handler(State(state): State<AppState>) -> Json<serde_json::
 }
 
 /// GET /topology → cached topology report (JSON). Refreshed by background loop.
+/// Exposes `scan_ok` / `last_error` / `scan_age_seconds` from attempt meta so
+/// failed scans do not freeze age on the last successful Instant (RC2).
 async fn topology_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let cache = state.topology_cache.read().await;
+    let meta = state.topology_meta.read().await;
     match cache.as_ref() {
-        Some((report, scanned_at)) => {
+        Some((report, _scanned_at)) => {
             let mut val = serde_json::to_value(report)
                 .map_err(|e| ApiError::Internal(format!("serialize: {e}")))?;
             if let Some(obj) = val.as_object_mut() {
-                obj.insert("scan_age_seconds".to_string(),
-                    serde_json::json!(scanned_at.elapsed().as_secs()));
+                obj.insert(
+                    "scan_age_seconds".to_string(),
+                    serde_json::json!(meta.scan_age_seconds()),
+                );
+                obj.insert("scan_ok".to_string(), serde_json::json!(meta.scan_ok));
+                obj.insert(
+                    "last_error".to_string(),
+                    serde_json::to_value(&meta.last_error).unwrap_or(serde_json::Value::Null),
+                );
             }
             Ok(Json(val))
         }
-        None => Err(ApiError::NotFound("topology not yet scanned — check back in ~60s".into())),
+        None => {
+            // No successful scan yet, but attempts may have failed — surface meta.
+            if !meta.scan_ok && meta.last_error.is_some() {
+                return Ok(Json(serde_json::json!({
+                    "nodes": [],
+                    "links": [],
+                    "mesh_complete": false,
+                    "missing_links": [],
+                    "jaccl_ready": false,
+                    "jaccl_ready_subsets": [],
+                    "raw_dot": "",
+                    "scan_age_seconds": meta.scan_age_seconds(),
+                    "scan_ok": false,
+                    "last_error": meta.last_error,
+                })));
+            }
+            Err(ApiError::NotFound(
+                "topology not yet scanned — check back in ~60s".into(),
+            ))
+        }
     }
 }
 
@@ -1213,8 +1252,9 @@ async fn topology_dot_handler(State(state): State<AppState>) -> Result<String, A
 /// GET /topology/validate → mesh completeness check + JACCL readiness.
 async fn topology_validate_handler(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let cache = state.topology_cache.read().await;
+    let meta = state.topology_meta.read().await;
     match cache.as_ref() {
-        Some((report, scanned_at)) => {
+        Some((report, _scanned_at)) => {
             Ok(Json(serde_json::json!({
                 "nodes": report.nodes,
                 "link_count": report.links.len(),
@@ -1223,7 +1263,9 @@ async fn topology_validate_handler(State(state): State<AppState>) -> Result<Json
                 "missing_links": report.missing_links,
                 "jaccl_ready": report.jaccl_ready,
                 "jaccl_ready_subsets": report.jaccl_ready_subsets,
-                "scan_age_seconds": scanned_at.elapsed().as_secs(),
+                "scan_age_seconds": meta.scan_age_seconds(),
+                "scan_ok": meta.scan_ok,
+                "last_error": meta.last_error,
             })))
         }
         None => Err(ApiError::NotFound("topology not yet scanned".into())),
@@ -3080,7 +3122,8 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
     // 5. Also include topology cache status if available
     let topology = {
         let cache = state.topology_cache.read().await;
-        cache.as_ref().map(|(report, scanned_at)| {
+        let meta = state.topology_meta.read().await;
+        cache.as_ref().map(|(report, _scanned_at)| {
             serde_json::json!({
                 "mesh_complete": report.mesh_complete,
                 "nodes": report.nodes,
@@ -3088,7 +3131,9 @@ async fn rdma_check_handler(State(state): State<AppState>) -> Json<serde_json::V
                 "missing_links": report.missing_links,
                 "jaccl_ready": report.jaccl_ready,
                 "jaccl_ready_subsets": report.jaccl_ready_subsets,
-                "scan_age_secs": scanned_at.elapsed().as_secs(),
+                "scan_age_secs": meta.scan_age_seconds(),
+                "scan_ok": meta.scan_ok,
+                "last_error": meta.last_error,
             })
         })
     };
@@ -3641,14 +3686,17 @@ let skip_offline = known_offline.contains(&name);
     // Get topology from local cache for mesh-level summary
     let mesh_topology = {
         let cache = state.topology_cache.read().await;
-        cache.as_ref().map(|(report, scanned_at)| {
+        let meta = state.topology_meta.read().await;
+        cache.as_ref().map(|(report, _scanned_at)| {
             serde_json::json!({
                 "mesh_complete": report.mesh_complete,
                 "link_count": report.links.len(),
                 "expected_links": report.nodes.len() * (report.nodes.len() - 1) / 2,
                 "missing_links": report.missing_links,
                 "jaccl_ready": report.jaccl_ready,
-                "scan_age_secs": scanned_at.elapsed().as_secs(),
+                "scan_age_secs": meta.scan_age_seconds(),
+                "scan_ok": meta.scan_ok,
+                "last_error": meta.last_error,
             })
         })
     };
