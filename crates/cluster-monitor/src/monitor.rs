@@ -122,6 +122,7 @@ impl ClusterMonitor {
             let config = self.config.clone();
             let state = Arc::clone(&self.state);
             let epoch = Arc::clone(&self.epoch);
+            let node_map = Arc::clone(&self.node_map);
             let events = events.clone();
             let mut rx = shutdown_rx.clone();
 
@@ -132,7 +133,7 @@ impl ClusterMonitor {
                 }
 
                 // Phase 2: Full discovery scan (ARP, Tailscale, TB, etc.)
-                run_scan(&config, &state, &epoch, &events).await;
+                run_scan(&config, &state, &epoch, &events, &node_map).await;
 
                 // Phase 3+: Periodic re-scan
                 loop {
@@ -142,7 +143,7 @@ impl ClusterMonitor {
                             break;
                         }
                         _ = tokio::time::sleep(config.scan_interval) => {
-                            run_scan(&config, &state, &epoch, &events).await;
+                            run_scan(&config, &state, &epoch, &events, &node_map).await;
                         }
                     }
                 }
@@ -264,9 +265,16 @@ async fn poll_metrics(
 
     let snapshots = futures::future::join_all(futs).await;
 
+    let canonical: std::collections::HashSet<String> = {
+        let nm = node_map.read().await;
+        nm.nodes.iter().cloned().collect()
+    };
+
     {
         let mut s = state.write().await;
         s.update_nodes(snapshots);
+        // Drop offline ghosts not in NodeMap so /cluster membership shrinks.
+        s.prune_non_canonical_offline(&canonical);
     }
 
     epoch.send_modify(|v| *v += 1);
@@ -294,20 +302,28 @@ async fn run_seed_scan(
 }
 
 /// Run a full cluster scan (discover + probe). Merges results into
-/// existing state so seed-probed nodes aren't lost.
+/// existing state so seed-probed nodes aren't lost, then prunes offline
+/// hostnames that are not in NodeMap.nodes (ghost GC, RC4).
 async fn run_scan(
     config: &ClusterConfig,
     state: &Arc<RwLock<ClusterState>>,
     epoch: &Arc<tokio::sync::watch::Sender<u64>>,
     events: &EventSink,
+    node_map: &Arc<RwLock<NodeMap>>,
 ) {
     info!("starting cluster scan");
     let results = scan_cluster(config, events).await;
     info!(count = results.len(), "cluster scan complete");
 
+    let canonical: std::collections::HashSet<String> = {
+        let nm = node_map.read().await;
+        nm.nodes.iter().cloned().collect()
+    };
+
     {
         let mut s = state.write().await;
         s.merge_scan(results);
+        s.prune_non_canonical_offline(&canonical);
     }
 
     epoch.send_modify(|v| *v += 1);

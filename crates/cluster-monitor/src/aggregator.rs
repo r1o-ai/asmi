@@ -169,7 +169,8 @@ impl ClusterState {
     }
 
     /// Merge new scan results into existing ones without replacing.
-    /// New SSH-reachable nodes are added; existing entries are updated.
+    /// Always applies the newer result for a hostname so offline updates
+    /// replace prior success and poll lists can shrink (RC4).
     pub fn merge_scan(&mut self, results: Vec<ScanResult>) {
         let mut by_host: std::collections::HashMap<String, ScanResult> = self
             .scan_results
@@ -177,12 +178,11 @@ impl ClusterState {
             .map(|r| (r.hostname.to_lowercase(), r))
             .collect();
 
+        // Always apply the newer scan result for a hostname.
+        // Offline updates must replace prior success so poll lists shrink.
         for r in results {
             let key = r.hostname.to_lowercase();
-            // Prefer the newer result if it reached the node
-            if r.ssh_ok || !by_host.contains_key(&key) {
-                by_host.insert(key, r);
-            }
+            by_host.insert(key, r);
         }
 
         self.scan_results = by_host.into_values().collect();
@@ -191,10 +191,18 @@ impl ClusterState {
 
     /// Drop scan_results + snapshots whose hostname is not in `canonical`
     /// (NodeMap.nodes) and are offline / ssh_ok=false.
-    ///
-    /// Stub for A1 failing specs — real body lands in A2.
-    pub fn prune_non_canonical_offline(&mut self, _canonical: &HashSet<String>) {
-        // intentional no-op until A2
+    pub fn prune_non_canonical_offline(&mut self, canonical: &HashSet<String>) {
+        let canon: HashSet<String> = canonical.iter().map(|s| s.to_lowercase()).collect();
+        self.scan_results.retain(|r| {
+            let h = r.hostname.to_lowercase();
+            canon.contains(&h) || r.ssh_ok
+        });
+        self.snapshots.retain(|h, snap| {
+            let hl = h.to_lowercase();
+            canon.contains(&hl) || snap.online
+        });
+        self.total_nodes = self.scan_results.iter().filter(|r| r.ssh_ok).count();
+        self.recalculate();
     }
 
     /// Mark a node as offline (sets online=false in its snapshot).
