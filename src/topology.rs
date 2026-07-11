@@ -489,39 +489,61 @@ fn reported_is(host: &str, reported: &str) -> bool {
     asmi_core::aggregator::canonicalize_hostname(reported, &real) == host.to_lowercase()
 }
 
+/// Shared blocking HTTP client for topology peer probes (RC1: same stack as
+/// metrics, not shell `curl` / SecureTransport). Short timeouts; reused across
+/// candidates in a single process via OnceLock.
+fn topology_http_client() -> &'static reqwest::blocking::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .no_proxy()
+            .build()
+            .expect("topology reqwest blocking client")
+    })
+}
+
 fn fetch_thunderbolt(host: &str) -> Option<serde_json::Value> {
+    let client = topology_http_client();
     for candidate in host_candidates(host) {
         let url = format!("http://{}:9090/thunderbolt", candidate);
-        let output = match Command::new("curl")
-            .args(["-s", "--connect-timeout", "3", "--max-time", "5", &url])
-            .output()
+        let v = match client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<serde_json::Value>())
         {
-            Ok(o) if o.status.success() => o,
-            _ => continue,
+            Ok(v) => v,
+            Err(_) => continue,
         };
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-            let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
-            if reported_is(host, reported) {
-                return Some(v);
-            }
+        let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
+        if reported_is(host, reported) {
+            return Some(v);
         }
     }
     None
 }
 
 fn is_host_reachable_http(host: &str) -> bool {
+    let client = topology_http_client();
     for candidate in host_candidates(host) {
         let url = format!("http://{}:9090/health", candidate);
-        let output = match Command::new("curl")
-            .args(["-s", "--connect-timeout", "2", "--max-time", "3", &url])
-            .output()
+        let v = match client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<serde_json::Value>())
         {
-            Ok(o) if o.status.success() => o,
-            _ => continue,
+            Ok(v) => v,
+            Err(_) => continue,
         };
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-            let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
-            if reported_is(host, reported) { return true; }
+        let reported = v.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
+        if reported_is(host, reported) {
+            return true;
         }
     }
     false
