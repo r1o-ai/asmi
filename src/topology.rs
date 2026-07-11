@@ -43,6 +43,61 @@ pub fn link_key(link: &TopologyLink) -> String {
     format!("{a}:{da}↔{b}:{db}")
 }
 
+/// Freshness / success metadata for the topology scan loop (RC2).
+///
+/// `last_attempt` advances on every scan try (success or failure) so
+/// `/topology` does not report a frozen multi-hour age after a single early
+/// success while later attempts keep failing.
+#[derive(Debug, Clone)]
+pub struct TopologyScanMeta {
+    pub scan_ok: bool,
+    pub last_error: Option<String>,
+    pub last_attempt: std::time::Instant,
+}
+
+impl TopologyScanMeta {
+    pub fn success(now: std::time::Instant) -> Self {
+        Self {
+            scan_ok: true,
+            last_error: None,
+            last_attempt: now,
+        }
+    }
+
+    pub fn failure(now: std::time::Instant, err: impl Into<String>) -> Self {
+        Self {
+            scan_ok: false,
+            last_error: Some(err.into()),
+            last_attempt: now,
+        }
+    }
+
+    /// Age for `/topology` JSON — always relative to last attempt, not only last success.
+    pub fn scan_age_seconds(&self) -> u64 {
+        self.last_attempt.elapsed().as_secs()
+    }
+}
+
+/// Apply a scan outcome to optional last-good report + meta.
+/// On failure keep last good links; only stamp meta (RC2 preferred path).
+pub fn apply_topology_scan_outcome(
+    last_good: &mut Option<(TopologyReport, std::time::Instant)>,
+    meta: &mut TopologyScanMeta,
+    outcome: Result<TopologyReport, String>,
+    now: std::time::Instant,
+) {
+    match outcome {
+        Ok(report) => {
+            *last_good = Some((report, now));
+            *meta = TopologyScanMeta::success(now);
+        }
+        Err(e) => {
+            // Keep last good links; refresh attempt/error only.
+            *meta = TopologyScanMeta::failure(now, e);
+        }
+    }
+}
+
 /// Which `mlx.distributed_config` binary to use.
 fn find_distributed_config() -> Result<String> {
     // Check common locations
@@ -1041,5 +1096,77 @@ mod tests {
         assert!(key.starts_with("hub:"), "key should start with lexically-first node: {key}");
         assert!(key.contains("↔"), "key should contain ↔ separator: {key}");
         assert!(key.contains("m3u3:"), "key should contain second node: {key}");
+    }
+
+    fn sample_report(links: usize) -> TopologyReport {
+        let mut ls = Vec::new();
+        for i in 0..links {
+            ls.push(TopologyLink {
+                node_a: "hub".into(),
+                device_a: format!("rdma_en{i}"),
+                node_b: "m3u2".into(),
+                device_b: format!("rdma_en{}", i + 1),
+            });
+        }
+        TopologyReport {
+            nodes: vec!["hub".into(), "m3u2".into()],
+            links: ls,
+            mesh_complete: false,
+            missing_links: vec![],
+            jaccl_ready: false,
+            jaccl_ready_subsets: vec![],
+            raw_dot: String::new(),
+        }
+    }
+
+    /// RC2: scan failure must stamp scan_ok=false + last_error and advance
+    /// last_attempt, while preserving last-good links.
+    #[test]
+    fn topology_scan_failure_stamps_meta_keeps_links() {
+        let t0 = std::time::Instant::now();
+        let mut last_good: Option<(TopologyReport, std::time::Instant)> = None;
+        let mut meta = TopologyScanMeta::success(t0);
+
+        apply_topology_scan_outcome(
+            &mut last_good,
+            &mut meta,
+            Ok(sample_report(2)),
+            t0,
+        );
+        assert!(meta.scan_ok);
+        assert!(meta.last_error.is_none());
+        assert_eq!(last_good.as_ref().unwrap().0.links.len(), 2);
+
+        // Simulate a later failure without advancing Instant in test wall-clock;
+        // Instant is opaque so we only assert meta fields and link retention.
+        apply_topology_scan_outcome(
+            &mut last_good,
+            &mut meta,
+            Err("all peers unreachable".into()),
+            t0, // same Instant is fine for field asserts; daemon uses Instant::now()
+        );
+
+        assert!(!meta.scan_ok, "failure must set scan_ok=false");
+        assert_eq!(
+            meta.last_error.as_deref(),
+            Some("all peers unreachable"),
+            "last_error must surface for /topology"
+        );
+        assert_eq!(
+            last_good.as_ref().unwrap().0.links.len(),
+            2,
+            "preferred path keeps last good links on failure"
+        );
+    }
+
+    #[test]
+    fn topology_scan_success_clears_error() {
+        let t0 = std::time::Instant::now();
+        let mut last_good = None;
+        let mut meta = TopologyScanMeta::failure(t0, "prior");
+        apply_topology_scan_outcome(&mut last_good, &mut meta, Ok(sample_report(1)), t0);
+        assert!(meta.scan_ok);
+        assert!(meta.last_error.is_none());
+        assert_eq!(last_good.as_ref().unwrap().0.links.len(), 1);
     }
 }

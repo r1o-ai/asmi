@@ -536,6 +536,7 @@ mod tests {
             top_tasks: vec![],
             rdma: None,
             interface_ips: Default::default(),
+            serve_slots: vec![],
         }
     }
 
